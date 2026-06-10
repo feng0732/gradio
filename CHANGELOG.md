@@ -1,5 +1,18 @@
 # gradio
 
+## 6.18.0
+
+### Features
+
+- [#13502](https://github.com/gradio-app/gradio/pull/13502) [`429faeb`](https://github.com/gradio-app/gradio/commit/429faeb643fb1afc1722c0f63fafa11603f2c87f) - Ensure every component dispatches a `change` event when its value changes.  Thanks @abidlabs!
+- [#13507](https://github.com/gradio-app/gradio/pull/13507) [`a9550d8`](https://github.com/gradio-app/gradio/commit/a9550d863e2487eb0012d872e589d04dc60fb3c9) - Warn when a `<script>` tag is included in the content of a `gr.HTML` component.  Thanks @abidlabs!
+
+### Fixes
+
+- [#13484](https://github.com/gradio-app/gradio/pull/13484) [`87f42b9`](https://github.com/gradio-app/gradio/commit/87f42b9135004f416bfc71798c55eebf8120ef9c) - workflow: preserve dropdown, radio and checkbox inputs.  Thanks @hannahblair!
+- [#13500](https://github.com/gradio-app/gradio/pull/13500) [`751a397`](https://github.com/gradio-app/gradio/commit/751a397ce519732526863ee84e311f7f64195f9d) - Close iterator on terminal error in JS client.  Thanks @hysts!
+- [#13514](https://github.com/gradio-app/gradio/pull/13514) [`4549d87`](https://github.com/gradio-app/gradio/commit/4549d87e37c09187cc33fb182b96bba03a43a334) - Accept permanent redirects (301, 308) in `networking.url_ok`.  Thanks @abidlabs!
+
 ## 6.17.3
 
 ### Features
