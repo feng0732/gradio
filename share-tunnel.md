@@ -542,6 +542,141 @@ self.share_url = urlunparse(
 | `share_server_tls_certificate` 处理 | 均为 None，两条路径一致 | 均为 None，两条路径一致 |
 | frpc 是否启用 TLS | 均不启用，两条路径一致 | 均不启用，两条路径一致 |
 
+### 7.7 环境变量的模块级缓存行为
+
+> **代码事实**，见 [networking.py#L20](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L20-L20)
+
+```python
+GRADIO_SHARE_SERVER_ADDRESS = os.getenv("GRADIO_SHARE_SERVER_ADDRESS")
+```
+
+这行代码位于模块顶层，不在任何函数内部。Python 在**首次 import `gradio.networking` 时**执行此行，将 `os.getenv()` 的返回值赋给模块级变量 `GRADIO_SHARE_SERVER_ADDRESS`，此后该值被**固定缓存**在模块对象上。
+
+#### 7.7.1 缓存的求值时机
+
+`blocks.py` 通过以下方式引用 networking 模块：
+
+> **代码事实**，见 [blocks.py#L37](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L37-L37)
+
+```python
+from gradio import (
+    networking,
+    ...
+)
+```
+
+这意味着当 `gradio.blocks` 模块被首次导入时，`gradio.networking` 也随之被导入，`GRADIO_SHARE_SERVER_ADDRESS` 的值在此时被求值并缓存。
+
+**代码可见事实**：
+- `os.getenv()` 只在模块加载时调用一次
+- 后续 `setup_tunnel()` 中引用的是模块级变量 `GRADIO_SHARE_SERVER_ADDRESS`，不是重新调用 `os.getenv()`
+- 即使在 `launch()` 调用之间用 `os.environ["GRADIO_SHARE_SERVER_ADDRESS"] = "new:port"` 修改了环境变量，`GRADIO_SHARE_SERVER_ADDRESS` 的值**不会改变**
+
+#### 7.7.2 缓存值 vs 实时入参的行为对比
+
+| 维度 | 环境变量 `GRADIO_SHARE_SERVER_ADDRESS` | 显式传参 `share_server_address=` |
+|------|--------------------------------------|-------------------------------|
+| **求值时机** | 模块导入时（一次性） | 每次 `launch()` 调用时 |
+| **值的来源** | `os.getenv()` 在 import 时的返回值 | 调用方传入的参数值 |
+| **多次 launch 之间能否改变** | ❌ 不能（缓存已固定） | ✅ 能（每次调用可传不同值） |
+| **运行中修改环境变量是否生效** | ❌ 不生效（`os.getenv` 不会被重新调用） | 不适用（值由调用方直接控制） |
+| **跨 Blocks 实例是否共享** | ✅ 是（同一进程共享同一模块变量） | ❌ 否（每个实例可传不同值） |
+
+> **边界补充（代码事实）**：以上对比讨论的是**真正进入 `networking.setup_tunnel()` 时**，两条配置链的值来源差异。`blocks.py` 在创建分享链接前还额外有一层 `if self.share_url is None` 判断；如果同一个 `Blocks` 实例已经生成过 `share_url`，后续再次 `launch()` 时不会重新调用 `setup_tunnel()`，因此也不会重新消费新的环境变量缓存值或新的显式传参值。
+
+#### 7.7.3 具体场景推演
+
+**场景 1：进程启动前设置环境变量**
+
+```bash
+GRADIO_SHARE_SERVER_ADDRESS=custom.frp.io:7000 python app.py
+```
+
+```
+1. Python 启动，os.environ 中已有 GRADIO_SHARE_SERVER_ADDRESS="custom.frp.io:7000"
+2. import gradio → networking.py 被导入
+3. GRADIO_SHARE_SERVER_ADDRESS = os.getenv(...) = "custom.frp.io:7000"  ← 缓存
+4. 后续所有 launch() 调用均使用此缓存值
+```
+
+结果：✅ 正常工作，环境变量值在 import 前已设置。
+
+**场景 2：代码运行中设置环境变量**
+
+```python
+import gradio as gr
+
+os.environ["GRADIO_SHARE_SERVER_ADDRESS"] = "custom.frp.io:7000"
+demo = gr.Blocks()
+demo.launch(share=True)
+```
+
+```
+1. import gradio → networking.py 被导入
+2. GRADIO_SHARE_SERVER_ADDRESS = os.getenv(...) = None  ← 缓存为 None
+3. os.environ["GRADIO_SHARE_SERVER_ADDRESS"] = "custom.frp.io:7000"  ← 太晚了
+4. launch() → setup_tunnel() → GRADIO_SHARE_SERVER_ADDRESS 仍为 None
+5. 走路径 A（官方 API 发现），环境变量设置未生效
+```
+
+结果：❌ 环境变量不生效，因为 import 时值为 None，缓存后不再重新读取。
+
+**场景 3：同一进程多次 launch，环境变量不变**
+
+```python
+import gradio as gr  # 此时 GRADIO_SHARE_SERVER_ADDRESS 已缓存
+
+demo1 = gr.Blocks()
+demo1.launch(share=True)  # 第一次 launch，使用缓存值
+
+demo2 = gr.Blocks()
+demo2.launch(share=True)  # 第二次 launch，使用同一个缓存值
+```
+
+结果：两次 launch 使用相同的 `GRADIO_SHARE_SERVER_ADDRESS` 缓存值。
+
+**场景 4：同一进程中，不同 Blocks 实例分别显式传参**
+
+```python
+import gradio as gr
+
+demo1 = gr.Blocks()
+demo1.launch(share=True, share_server_address="server1:7000")
+
+demo2 = gr.Blocks()
+demo2.launch(share=True, share_server_address="server2:7000")
+```
+
+结果：两个不同实例各自使用自己这次传入的参数值，互不影响。
+
+**场景 5：同一 Blocks 实例重复 launch**
+
+> **代码事实**，见 [blocks.py#L3121-L3132](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L3121-L3132)
+
+```python
+if self.share_url is None:
+    share_url = networking.setup_tunnel(...)
+    self.share_url = urlunparse(...)
+```
+
+```
+1. 第一次 launch()：self.share_url is None → 调用 setup_tunnel()，生成并缓存 share_url
+2. 第二次 launch()：self.share_url 已非 None → 跳过 setup_tunnel()
+3. 因此第二次 launch() 里即使传了新的 share_server_address=，也不会重新建 tunnel
+```
+
+结果：显式传参的“实时性”成立于**这次 launch 真的会重新进入 `setup_tunnel()`** 的前提下；如果实例级 `share_url` 已缓存，`launch()` 本身也会短路。
+
+#### 7.7.4 为什么是模块级缓存而非函数内读取
+
+> **代码事实**：这是当前代码的实际写法。Python 模块级变量的求值时机由语言规范决定，不依赖于 Gradio 的设计意图。
+
+可能的解释（非代码事实）：
+- 模块级缓存避免了每次 `setup_tunnel()` 调用都执行 `os.getenv()`，但实际性能差异可忽略
+- 这更可能是代码组织习惯，而非刻意的性能优化
+
+**与显式传参的本质区别**：显式传参是**实时入参**，值在每次函数调用时由调用方决定；环境变量缓存是**一次性快照**，值在模块加载时固定，此后不可变。这是两种根本不同的配置传递模式，在行为边界上有明确差异。
+
 ---
 
 ## 八、frpc 二进制下载的代码事实
@@ -566,18 +701,24 @@ self.share_url = urlunparse(
 │                          代码事实（本仓库可见）                                         │
 ├────────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                        │
-│  服务器选择                                                                            │
+│  服务器选择（含求值时机）                                                                │
 │  ┌──────────────────────────────────────────────────────────────────────────────┐     │
 │  │ 优先级 1: launch(share_server_address="host:port")                            │     │
+│  │   → 求值时机: 每次 launch() 调用（实时入参）                                 │     │
 │  │   → blocks.py self.share_server_address = "host:port"                       │     │
 │  │   → share_server_protocol 默认 "http"                                       │     │
+│  │   → 多次 launch 可传不同值，互不影响                                         │     │
 │  │                                                                              │     │
 │  │ 优先级 2: 环境变量 GRADIO_SHARE_SERVER_ADDRESS                               │     │
+│  │   → 求值时机: import gradio.networking 时（一次性缓存）⚠️                     │     │
 │  │   → blocks.py self.share_server_address = None  (⚠️ 无感知)                  │     │
 │  │   → share_server_protocol 默认 "https" (⚠️ 错判为官方服务器)                   │     │
-│  │   → networking.py 内部覆盖为环境变量值                                        │     │
+│  │   → networking.py 内部覆盖为缓存值                                           │     │
+│  │   → import 后修改 os.environ 不生效 ⚠️                                       │     │
+│  │   → 多次 launch 共享同一缓存值                                               │     │
 │  │                                                                              │     │
 │  │ 优先级 3: 官方 API 动态发现                                                   │     │
+│  │   → 求值时机: 每次 setup_tunnel() 调用（实时请求）                           │     │
 │  │   → blocks.py self.share_server_address = None                               │     │
 │  │   → share_server_protocol 默认 "https"                                       │     │
 │  │   → networking.py 请求 api.gradio.app 获取 host/port/ca                       │     │
@@ -708,5 +849,11 @@ self.share_url = urlunparse(
 | 显式传参优先级高于环境变量 | ✅ 可见 | [networking.py#L30-L34](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L30-L34) |
 | 自定义服务器路径（环境变量或显式传参）不获取证书 | ✅ 可见 | [networking.py#L55-L57](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L55-L57) |
 | 环境变量路径下默认协议为 https 但无 TLS 证书 | ✅ 可见 | 综合 [blocks.py#L2966-L2968](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L2966-L2968) 与 [networking.py#L55-L57](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L55-L57) |
+| `GRADIO_SHARE_SERVER_ADDRESS` 是模块级变量，import 时一次性求值 | ✅ 可见 | [networking.py#L20](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L20-L20) |
+| `setup_tunnel()` 引用的是缓存值而非重新调用 `os.getenv()` | ✅ 可见 | [networking.py#L30-L31](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L30-L31) |
+| import 后修改 `os.environ` 不会影响缓存的 `GRADIO_SHARE_SERVER_ADDRESS` | ✅ 可见 | Python 模块级变量求值规范，代码中无重新读取逻辑 |
+| `blocks.py` 通过 `from gradio import networking` 引入模块（触发缓存求值） | ✅ 可见 | [blocks.py#L37](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L37-L37) |
+| 显式传参 `share_server_address=` 是每次 `launch()` 调用时的实时入参 | ✅ 可见 | [blocks.py#L2633](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L2633-L2633) 函数签名 |
+| 同一 `Blocks` 实例若已有 `share_url`，后续 `launch()` 不会重新调用 `setup_tunnel()` | ✅ 可见 | [blocks.py#L3121-L3132](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L3121-L3132) |
 
 图例：✅ 直接可见 | ⚠️ 间接推断（基于代码逻辑的必要前提） | ❌ 完全不可见
