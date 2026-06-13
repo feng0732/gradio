@@ -648,16 +648,118 @@ SSE v2/v3 协议下：
 - **前端** `apply_diff_stream` 维护 `pending_diff_streams`，逐步合并 diff 还原完整数据
 - 最后一次（`final=True`）发送完整数据，确保一致性
 
-### 7.4 停止生成
+### 7.4 停止生成：完整的取消链路
 
-文件：[chat_interface.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/chat_interface.py#L810-L861)
+用户点击 Stop 按钮到生成器真正关闭，涉及**前端 → 后端 → 队列 → 迭代器**四个层级的联动：
 
-用户点击 Stop 按钮时：
-1. `textbox.stop` 事件触发，取消 `submit_event` 和 `retry_event`
-2. Queue 的 `clean_events` 将事件的 `alive` 置为 `False`
-3. `process_events` 循环检测到 `not awake_events` 后退出
-4. `reset_iterators` 关闭并清理生成器迭代器
-5. 前端 `DependencyManager.cancel()` 调用 `submission.cancel()`，向后端发送 `/cancel` 和 `/reset`
+#### 第 1 层：前端事件注册
+
+文件：[chat_interface.py:810-861](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/chat_interface.py#L810-L861)
+
+```python
+def _setup_stop_events(self, event_triggers, events_to_cancel, after_success):
+    # 当流式事件开始执行（submit_event.then）时，把 textbox 的 stop_btn 展示出来
+    for event_to_cancel in events_to_cancel:
+        event_to_cancel.then(
+            lambda: textbox_component(submit_btn=original_submit_btn, stop_btn=False),
+            None, [self.textbox], queue=False,
+        )
+
+    # 核心：textbox.stop 事件注册 cancels 指向 submit_event + retry_event
+    self.textbox.stop(
+        None, None, None,
+        cancels=events_to_cancel,  # type: ignore
+        api_visibility="undocumented",
+    )
+```
+
+`textbox.stop` 不执行任何 fn（`fn=None`），但声明了 `cancels`。由 `set_cancel_events`（[events.py:32-82](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/events.py#L32-L82)）会注册一个**取消事件监听器**，在前端 dispatch 时调用 `this.cancel(dep.cancels)`。
+
+#### 第 2 层：前端 DependencyManager 发起 /cancel + /reset
+
+文件：[dependency.ts:811-827](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/core/src/dependency.ts#L811-L827)
+
+```typescript
+async cancel(ids: number[] | undefined): Promise<void> {
+    for (const id of ids) {
+        const submission = this.submissions.get(id);
+        if (submission) {
+            await submission.cancel();          // ← 发起 /cancel 和 /reset 请求
+            this.loading_stati.update({ status: "complete", ... });
+            this.submissions.delete(id);
+            // 触发后续链（比如失败回调）
+            failure.forEach(dep_id => this.dispatch({ type: "fn", fn_index: dep_id }));
+            all.forEach(dep_id => this.dispatch({ type: "fn", fn_index: dep_id }));
+        }
+    }
+}
+```
+
+#### 第 3 层：submit.cancel() 真正发起两个 HTTP 请求
+
+文件：[submit.ts:110-139](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/client/js/src/utils/submit.ts#L110-L139)
+
+```typescript
+async function cancel(): Promise<void> {
+    cancel_request = { event_id, session_hash, fn_index };
+    await fetch(`${config.root}${api_prefix}/${CANCEL_URL}`, {  // POST /cancel
+        method: "POST", body: JSON.stringify(cancel_request)
+    });
+    await fetch(`${config.root}${api_prefix}/${RESET_URL}`, {   // POST /reset
+        method: "POST", body: JSON.stringify(reset_request)
+    });
+}
+```
+
+#### 第 4 层：后端 /cancel 路由关闭生成器
+
+文件：[routes.py:1401-1429](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/routes.py#L1401-L1429)
+
+```python
+@router.post("/cancel")
+async def cancel_event(body: CancelBody):
+    await cancel_tasks({f"{body.session_hash}_{body.fn_index}"})  # 取消 Python asyncio task
+    await blocks._queue.remove_from_queue(body.event_id)          # 从队列中移除
+    if session_open and event_running:
+        # 向 SSE 流中注入一个 ProcessCompletedMessage，强制前端断开
+        blocks._queue.pending_messages_per_session[...].put_nowait(
+            ProcessCompletedMessage(output={}, success=True, event_id=body.event_id)
+        )
+    if body.event_id in app.iterators:
+        async with app.lock:
+            await safe_aclose_iterator(app.iterators[body.event_id])  # ← 真正关闭生成器
+            del app.iterators[body.event_id]
+            app.iterators_to_reset.add(body.event_id)                  # ← 标记竞态
+```
+
+> **注意**：`POST /reset`（[routes.py:1189-1193](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/routes.py#L1189-L1193)）实际上是**空操作**——所有取消/重置逻辑都在 `/cancel` 中完成，保留 `/reset` 仅为兼容。
+
+#### 第 5 层：Queue 内部兜底清理
+
+文件：[queueing.py:1082-1097](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/queueing.py#L1082-L1097)
+
+```python
+async def reset_iterators(self, event_id: str):
+    if event_id not in app.iterators:
+        return
+    async with app.lock:
+        await safe_aclose_iterator(app.iterators[event_id])
+        del app.iterators[event_id]
+        app.iterators_to_reset.add(event_id)
+```
+
+Queue 的 `process_events` 在任务取消/完成/失败后，也会调用 `reset_iterators` 做一次兜底清理，防止 `/cancel` 的清理因网络等原因遗漏。
+
+#### safe_aclose_iterator 真正调用 aclose
+
+文件：[utils.py:2003-2009](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/utils.py#L2003-L2009)
+
+```python
+async def safe_aclose_iterator(iterator):
+    await iterator.aclose()
+```
+
+对于同步生成器包装的 `SyncToAsyncIterator`，其 `aclose()` 方法会处理"generator already executing"重试逻辑。调用 `aclose()` 后，生成器内部会抛出 `GeneratorExit` 异常，退出 `async for` / `async with aclosing` 块，真正终止执行。
 
 ### 7.5 连接模式：SSE vs Stream
 
@@ -739,25 +841,203 @@ history_ = deepcopy(history) + [ {assistant:"我是AI助手"} ]
 
 随着流式输出，thinking 消息可能先处于 `status="pending"`（显示 spinner），当标签闭合后变为 `status="done"`（折叠收起）。此时 history 的消息结构会**短暂增长**（因为思考内容尚未闭合时被视为 pending 段，闭合后拆分为独立的 thinking 消息）。
 
+### 7.7 思考内容拆分的准确阶段：后端 postprocess，非前端渲染
+
+关于 `_extract_thinking_blocks` 思考内容拆分的时机，必须明确它发生在**后端 process_api 的输出后处理阶段**，在返回给前端之前完成，而不是前端渲染阶段。
+
+#### 完整的调用链
+
+```
+用户生成器 yield (response, history_)
+  │
+  ▼
+process_api() 的 postprocess_data()  [blocks.py:1943]
+  │
+  ▼
+for i, block in enumerate(block_fn.outputs):
+    │
+    ▼
+    anyio.to_thread.run_sync(block.postprocess, prediction_value)  [blocks.py:2040-2041]
+      │
+      ▼
+      Chatbot.postprocess(value)  [chatbot.py:692-711]
+        │
+        ▼
+        for message in value:
+            │
+            ▼
+            Chatbot._postprocess(message)  [chatbot.py:544-639]
+              │
+              ▼
+              content_postprocessed 完成文本/文件/组件拆分
+              │
+              ▼
+              if self.reasoning_tags:
+                  for content_item in content_postprocessed:
+                      if content_item.type == "text":
+                          segments = self._extract_thinking_blocks(  [chatbot.py:641]
+                              content_item.text, self.reasoning_tags
+                          )
+                          for text, is_thinking, status in segments:
+                              if is_thinking:
+                                  messages.append(Message(
+                                      role=..., metadata={title:"Reasoning", status}
+                                  ))
+                              else:
+                                  messages.append(Message(...))
+```
+
+#### 调用位置具体代码
+
+**入口 1：Chatbot.postprocess**（[chatbot.py:692-711](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/components/chatbot.py#L692-L711)）
+
+```python
+def postprocess(self, value):
+    processed_messages = []
+    for message in value:
+        processed_message = self._postprocess(message)  # ← 对每条消息调用
+        if processed_message is not None:
+            processed_messages.extend(processed_message)  # ← thinking 拆分后可能是多条
+    return ChatbotDataMessages(root=processed_messages)
+```
+
+**入口 2：Chatbot._postprocess**（[chatbot.py:589-639](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/components/chatbot.py#L589-L639)）
+
+```python
+messages: list[Message] = []
+if self.reasoning_tags:
+    for content_item in content_postprocessed:
+        if content_item.type == "text":
+            segments = self._extract_thinking_blocks(content_item.text, self.reasoning_tags)
+            for text, is_thinking, status in segments:
+                if is_thinking:
+                    messages.append(Message(
+                        role=role, content=[TextMessage(text=text)],
+                        metadata={"title": "Reasoning", "status": status},
+                    ))
+                else:
+                    messages.append(Message(role=role, content=[TextMessage(text=text)], ...))
+```
+
+#### 关键结论
+
+| 问题 | 答案 |
+|------|------|
+| 拆分发生在后端还是前端？ | **后端**。在 `Chatbot.postprocess` 中完成 |
+| 在 yield 之后还是之前？ | **yield 之后**。用户 `_stream_fn` yield 的是原始 `history`，然后 `process_api` 才调用 `postprocess_data` 执行拆分 |
+| 拆分后消息数会变吗？ | **会**。原本 1 条文本消息可能被拆成 N 条（thinking 段 + 正文段），且在流式过程中，thinking 标签未闭合时可能拆出 1 条 pending 的 thinking 消息，闭合后再拆出 1 条 done 的 thinking 消息 |
+| 前端是否参与拆分？ | **不**。前端直接从后端接收已拆分完成的 `NormalisedMessage[]`，只负责按 metadata.status 渲染手风琴 UI |
+| 拆分结果影响 diff 吗？ | **影响**。`handle_streaming_diffs` 的 diff 是对拆分**之后**的 `ChatbotDataMessages(root=[...])` 结构计算，因此每次 thinking 段数变化时 diff 可能包含"append 新 message"操作 |
+
+### 7.8 聊天历史回写到下一次输入的具体时机
+
+ChatInterface 维护着两个并行的状态：
+- `self.chatbot`：**UI 展示层**，用户可见的组件 value
+- `self.chatbot_state`：**内部持久层**，作为下一次 `_stream_fn` 的输入来源
+
+两者并不总是同步——它们之间的回写有精确的时机。
+
+#### 事件链中涉及 chatbot_state 的三处位置
+
+```python
+# 构造时初始值 [chat_interface.py:379]
+self.chatbot_state = State(self.chatbot.value if self.chatbot.value else [])
+
+# submit_fn 的 inputs [chat_interface.py:568]
+submit_fn_kwargs = {
+    "inputs": [self.saved_input, self.chatbot_state] + self.additional_inputs,
+    #                        ^^^^^^^^^^^^^^^^^  ← 下一次流式处理的 history 来自这里
+    "outputs": [self.null_component, self.chatbot] + self.additional_outputs,
+}
+
+# 流式完成后的同步 [chat_interface.py:559-565, 608]
+synchronize_chat_state_kwargs = {
+    "fn": lambda x: (x, x),
+    "inputs": [self.chatbot],
+    "outputs": [self.chatbot_state, self.chatbot_value],
+    #                       ^^^^^^^^^^^^^^  ← 把 chatbot 的最新值写回 chatbot_state
+    "queue": False,
+}
+submit_event.then(**synchronize_chat_state_kwargs)
+```
+
+#### 时序详解：一次完整对话的 state 流转
+
+```
+时刻 T0：用户还没发送消息
+  chatbot       = [历史A, 历史B, 历史C, 历史D]
+  chatbot_state = [历史A, 历史B, 历史C, 历史D]   ← 两者一致
+
+时刻 T1：用户按下回车 → textbox.submit
+  步骤 1：_clear_and_save_textbox → 保存 savedInput="你好"
+
+  步骤 2：user_submit.then(_append_message_to_history, queue=False)
+          inputs:  [saved_input, chatbot]
+          outputs: [chatbot]
+    chatbot       = [历史A..D, {user:"你好"}]      ← UI 立刻更新
+    chatbot_state = [历史A..D]                     ← 还没同步！
+
+  步骤 3：submit_fn_kwargs（_stream_fn）开始排队执行
+          inputs:  [saved_input, chatbot_state]
+                                            ↑
+                                     此时仍然是 [历史A..D]（不含"你好"）
+                                     这就是为什么 _stream_fn 内部第 961 行要
+                                     `history = self._append_message_to_history(message, history, "user")`
+                                     自己手动把用户消息加上！
+
+时刻 T2..Tn：_stream_fn 流式 yield（共 4 次）
+  outputs: [null_component, chatbot]
+    chatbot       = [历史A..D, {user:"你好"}, {assistant:"我"}]          ← 第 1 次 yield
+    chatbot       = [历史A..D, {user:"你好"}, {assistant:"我是"}]        ← 第 2 次 yield
+    chatbot       = [历史A..D, {user:"你好"}, {assistant:"我是AI"}]     ← 第 3 次 yield
+    chatbot       = [历史A..D, {user:"你好"}, {assistant:"我是AI助手"}] ← 第 4 次 yield
+    chatbot_state = [历史A..D]                     ← 整个流式过程中始终未变！
+                          ↑
+              因为 _stream_fn 的 outputs 不包含 chatbot_state，
+              只更新 chatbot。同步要等 .then 链。
+
+时刻 Tn+1：submit_event 完成（生成器耗尽，ProcessCompletedMessage）
+  .then(**synchronize_chat_state_kwargs) 被触发
+    fn: lambda x: (x, x)
+    inputs:  [chatbot]       = [历史A..D, {user:"你好"}, {assistant:"我是AI助手"}]
+    outputs: [chatbot_state, chatbot_value]
+  → chatbot_state = [历史A..D, {user:"你好"}, {assistant:"我是AI助手"}]   ← 回写完成！
+  → chatbot_value = 同上
+
+  后续 .then：恢复 textbox 交互、保存对话
+```
+
+#### 关键结论
+
+| 问题 | 答案 |
+|------|------|
+| chatbot_state 何时回写？ | **前一次流式事件完全完成之后**，即 `.then(**synchronize_chat_state_kwargs)` 被触发时 |
+| `.then` 在每次 yield 触发吗？ | **不**。`.then` 对应 `EventListener("then", trigger_after=dep_index)`（[events.py:116-128](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/events.py#L116-L128)），只有前一个依赖**完整结束**（前端收到 `status.stage === "complete"`，`break submit_loop` 后）才由 `DependencyManager` 的 `all.forEach(dep_id => dispatch(...))`（[dependency.ts:613-620](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/core/src/dependency.ts#L613-L620)）触发 |
+| 流式过程中 chatbot_state 是什么？ | **旧值**（上一次同步完成时的值）。因此 `_stream_fn` 必须自己在内部 `history = _append_message_to_history(message, history, "user")` 补上用户消息 |
+| 用户点击 Stop 取消时，回写会发生吗？ | **会**。取消后 `DependencyManager.cancel()` 仍然调用 `all.forEach(dep_id => dispatch(...))`（[dependency.ts:839-844](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/core/src/dependency.ts#L839-L844)），此时 `chatbot` 保留的是最后一次 yield 的部分值，因此 `chatbot_state` 会被同步为已生成的部分回复 |
+| chatbot_value 有什么用？ | 提供给外部代码修改 chatbot 值的入口。`self.chatbot_value.change(...)` 链会把外部修改同步回 chatbot 和 chatbot_state（[chat_interface.py:803-808](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/chat_interface.py#L803-L808)） |
+
 ---
 
 ## 8. 涉及的关键文件索引
 
 | 层次 | 文件 | 核心职责 |
 |------|------|---------|
-| 高层接口 | [chat_interface.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/chat_interface.py) | ChatInterface 封装，事件链注册，_stream_fn 生成器包装，_append_message_to_history |
-| 组件定义 | [chatbot.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/components/chatbot.py) | ChatMessage/MessageDict 数据模型，postprocess 逻辑，_extract_thinking_blocks |
-| 后端核心 | [blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/blocks.py) | process_api / call_function / handle_streaming_diffs |
+| 高层接口 | [chat_interface.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/chat_interface.py) | ChatInterface 封装，事件链注册，_stream_fn，_append_message_to_history，_setup_stop_events，chatbot_state 同步 |
+| 组件定义 | [chatbot.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/components/chatbot.py) | ChatMessage/MessageDict 数据模型，postprocess / _postprocess，_extract_thinking_blocks |
+| 后端核心 | [blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/blocks.py) | process_api / call_function / handle_streaming_diffs / postprocess_data |
 | 路由工具 | [route_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/route_utils.py) | call_process_api / restore_session_state：iterator 的保存与恢复入口 |
 | 队列调度 | [queueing.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/queueing.py) | Queue.process_events 循环，reset_iterators 清理 iterator |
-| 路由层 | [routes.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/routes.py) | /queue/data SSE 端点，/queue/join 入队，/reset iterator 清理 |
+| 路由层 | [routes.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/routes.py) | /queue/data SSE 端点，/queue/join 入队，/cancel iterator 真正关闭，/reset（空操作） |
+| 事件系统 | [events.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/events.py) | Dependency 类、EventListener .then()/.success()/.failure() 定义，set_cancel_events |
+| 工具函数 | [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/utils.py) | safe_aclose_iterator 真正调用 iterator.aclose() |
 | 消息定义 | [server_messages.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/server_messages.py) | ServerMessage 类型体系 |
 | 函数配置 | [block_function.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/block_function.py) | BlockFunction：connection 类型、time_limit 等 |
 | JS Client | [client.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/client/js/src/client.ts) | stream() / EventSource 管理 |
-| 提交逻辑 | [submit.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/client/js/src/utils/submit.ts) | submit() 异步迭代器，handle_message 分发 |
+| 提交逻辑 | [submit.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/client/js/src/utils/submit.ts) | submit() 异步迭代器，cancel() 发起 /cancel 和 /reset 请求，handle_message 分发 |
 | SSE 流 | [stream.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/client/js/src/utils/stream.ts) | open_stream / apply_diff_stream / readable_stream |
 | 消息解析 | [api_info.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/client/js/src/helpers/api_info.ts) | handle_message()：后端 msg → 前端 type 映射 |
-| 依赖管理 | [dependency.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/core/src/dependency.ts) | DependencyManager：事件循环、handle_data 状态更新 |
+| 依赖管理 | [dependency.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/core/src/dependency.ts) | DependencyManager：事件循环、handle_data、cancel() 触发 /cancel、all.forEach dispatch 触发 .then 链 |
 | 加载状态 | [stores.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/core/src/stores.ts) | LoadingStatus 状态机 |
 | Chatbot UI | [ChatBot.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/ChatBot.svelte) | 消息列表渲染（#each 索引 key）、自动滚动 |
 | Chatbot 工具 | [utils.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/utils.ts) | group_messages（按 role 合并气泡）、is_last_bot_message |
