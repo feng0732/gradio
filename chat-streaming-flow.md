@@ -1140,6 +1140,294 @@ submit_event.then(**synchronize_chat_state_kwargs)
 | 用户点击 Stop 取消时，回写会发生吗？ | **会**。取消后 `DependencyManager.cancel()` 仍然调用 `all.forEach(dep_id => dispatch(...))`（[dependency.ts:839-844](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/core/src/dependency.ts#L839-L844)），此时 `chatbot` 保留的是最后一次 yield 的部分值，因此 `chatbot_state` 会被同步为已生成的部分回复 |
 | chatbot_value 有什么用？ | 提供给外部代码修改 chatbot 值的入口。`self.chatbot_value.change(...)` 链会把外部修改同步回 chatbot 和 chatbot_state（[chat_interface.py:803-808](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/chat_interface.py#L803-L808)） |
 
+### 7.9 前端接收到的消息格式：从 ChatbotDataMessages 到 NormalisedMessage
+
+后端序列化（ChatbotDataMessages）→ 前端反序列化（Message[]）→ 标准化（NormalisedMessage[]），共有三层数据格式。
+
+#### 层 1：后端 JSON（ChatbotDataMessages.model_dump()）
+
+类型定义：[chatbot.py:142-181](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/components/chatbot.py#L142-L181)
+
+后端 `Chatbot.postprocess` 返回的 `ChatbotDataMessages` 经过 `orjson.dumps()` 序列化为 JSON。结构如下：
+
+```json
+{
+  "root": [
+    {
+      "role": "user",
+      "metadata": null,
+      "content": [
+        {"type": "text", "text": "你好"}
+      ],
+      "options": null
+    },
+    {
+      "role": "assistant",
+      "metadata": {
+        "title": "Reasoning",
+        "status": "done",
+        "duration": 1.23
+      },
+      "content": [
+        {"type": "text", "text": "用户询问了关于流式聊天的问题..."},
+        {"type": "file", "file": {"path": "/file=...", "url": "...", ...}, "alt_text": null}
+      ],
+      "options": null
+    },
+    {
+      "role": "assistant",
+      "metadata": null,
+      "content": [
+        {"type": "text", "text": "我是AI助手"},
+        {"type": "component", "component": "image", "value": "...", "constructor_args": {...}, "props": {...}}
+      ],
+      "options": [
+        {"value": "选项1"},
+        {"value": "选项2", "label": "自定义标签"}
+      ]
+    }
+  ]
+}
+```
+
+字段解释：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `root[].role` | `"user"` / `"assistant"` / `"system"` | 消息角色，决定气泡对齐方向和 role 分组 |
+| `root[].metadata` | `MetadataDict \| null` | 非 null 时作为"思考消息"渲染手风琴。核心字段：`title`（标题）、`status`（`"pending"` 显示 spinner，`"done"` 折叠）、`duration`（耗时秒数）、`log`（补充说明文字）、`id`/`parent_id`（嵌套思考树） |
+| `root[].content` | `Array<TextMessage \| FileMessage \| ComponentMessage>` | 消息内容数组，同一条消息内可混合文本、文件、组件 |
+| `root[].content[].type` | `"text"` / `"file"` / `"component"` | 内容类型标记 |
+| `root[].options` | `Array<{value, label?}> \| null` | 消息底部可点击的快捷回复按钮 |
+
+#### 层 2：前端 props（Message[] 接口）
+
+类型定义：[types.ts:56-62](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/types.ts#L56-L62)
+
+前端 chatbot/Index.svelte 接收的 props.value 是后端 JSON 反序列化后的对象，直接匹配 `Message[]` 接口：
+
+```typescript
+interface Message {
+    role: "system" | "user" | "assistant";
+    metadata: Metadata;           // 后端 null 反序列化为 undefined，前端会变成空对象
+    content: (Text | File | Component)[];
+    index: number | [number, number];  // 后续 normalise 时才填充
+    options?: Option[];
+}
+```
+
+#### 层 3：标准化 NormalisedMessage[]
+
+文件：[utils.ts:150-225](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/utils.ts#L150-L225)
+
+`ChatBot.svelte` 在渲染前通过 `normalise_messages(value)` 转换为扁平的 `NormalisedMessage[]`，这是真正被 `#each groupedMessages` 遍历的格式：
+
+```typescript
+export type NormalisedMessage = TextMessage | ComponentMessage;
+
+interface TextMessage {
+    type: "text";
+    content: string;                             // 纯文本字符串（已从 Text.text 扁平化取出）
+    index: number | [number, number];            // [原消息index, 内容index]
+    options?: Option[];
+    role: MessageRole;
+    metadata: Metadata;
+}
+```
+
+`normalise_messages` 做的事情：
+1. 遍历每条原始 `Message`
+2. 如果是 `Text.type === "text"`：拆成一条 `TextMessage`（扁平 content 字符串）
+3. 如果是 `File.type === "file"`：拆成一条 `ComponentMessage`（file 作为 component 类型）
+4. 如果是 `Component.type === "component"`：拆成一条 `ComponentMessage`
+5. 逐条记录 `index`（便于选中时回传给后端）
+6. 同时把 `message.metadata` 透传到每条拆出来的 `NormalisedMessage.metadata`
+
+**重要**：`NormalisedMessage[]` 仍然保留 `metadata` 字段，所以一条 Message 拆成多条时，所有子消息都会带同一个 `metadata`——因此在 `Message.svelte` 中，同一个气泡里可能出现"多个 Thought 手风琴"，但因为它们的 metadata.title 相同，视觉上是一组（但 `message.model_dump` 中拆分后每条 assistant 消息的 metadata 是分别设置的——thinking 消息有 metadata，正文消息 metadata 为 null）。
+
+> 实际上 `_extract_thinking_blocks` 拆分时，thinking 消息和正文消息是**两条独立的 Message**（在 ChatbotDataMessages.root 层面就已经是 2 个对象了），各自有独立的 metadata——thinking 那条有 `{title:"Reasoning", status:"pending"|"done"}`，正文那条 metadata 为 null。因此经过 normalise 后也是两条独立的 NormalisedMessage，各自带自己的 metadata。
+
+#### reasoning_tags 场景下一次 yield 的完整消息示例
+
+配置 `reasoning_tags=[("<thinking>", "</thinking>")]`，yield 内容为 `"<thinking>正在分析</thinking>我是"`：
+
+**ChatbotDataMessages.root（2 条 Message）：**
+```json
+[
+  {
+    "role": "assistant",
+    "metadata": {"title": "Reasoning", "status": "done"},
+    "content": [{"type": "text", "text": "正在分析"}]
+  },
+  {
+    "role": "assistant",
+    "metadata": null,
+    "content": [{"type": "text", "text": "我是"}]
+  }
+]
+```
+
+**normalise 后的 NormalisedMessage[]（2 条）：**
+```typescript
+[
+  {type:"text", content:"正在分析", index:4, role:"assistant", metadata:{title:"Reasoning", status:"done"}},
+  {type:"text", content:"我是",        index:5, role:"assistant", metadata:null}
+]
+```
+
+**group_messages 后（groupedMessages）：**
+```typescript
+[
+  [...],  // 之前的其他气泡（user 消息等）
+  [       // ← 同一个气泡，因为连续 2 条都是 assistant
+    {type:"text", content:"正在分析", metadata:{title:"Reasoning", status:"done"}},
+    {type:"text", content:"我是", metadata:null}
+  ]
+]
+```
+
+### 7.10 两种加载动画的分工：Thought Spinner vs 全局 Pending 气泡
+
+聊天界面中存在**两种完全独立**的"加载中"视觉元素，分别由不同组件负责、在不同时机触发：
+
+| 维度 | Thought Spinner（思考中的小圆点） | 全局 Pending 气泡（气泡级动画） |
+|------|--------------------------------|------------------------------|
+| **显示位置** | 在气泡内部，Thought 手风琴的标题栏右侧，紧贴"Reasoning"文字 | 在整条气泡下方（独立一行），或整条消息末尾追加一个新气泡 |
+| **触发条件** | 单条 NormalisedMessage 的 `metadata.status === "pending"` | `loading_status.status === "pending"` 或 `"generating"`（全局事件状态），配合各种消息判断 |
+| **组件实现** | [Thought.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/Thought.svelte#L122-L124) 的 `<span class="loading-spinner"></span>` | [Pending.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/Pending.svelte) 整体组件 |
+| **触发来源** | reasoning_tags 拆分时，thinking 段的标签尚未闭合（_extract_thinking_blocks 产出 `status:"pending"`） | ChatInterface.submit 事件的前后端调度状态（尚未开始= pending，正在生成 = generating） |
+
+#### Thought Spinner 详细链路
+
+**后端产生**（[chatbot.py:641-700](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/components/chatbot.py#L641-L700)）：
+
+`_extract_thinking_blocks` 扫描文本中的 `<thinking>` 标签：
+- 遇到 `<thinking>` 但未找到匹配 `</thinking>` → 产生 `(segment, is_thinking=True, status="pending")`
+- 找到成对的 `<thinking>...</thinking>` → 产生 `(segment, is_thinking=True, status="done")`
+
+这些 segments 被 `_postprocess` 包装成独立的 Message 对象：
+
+```python
+if is_thinking:
+    messages.append(Message(
+        role=role,
+        content=[TextMessage(text=text)],
+        metadata={"title": "Reasoning", "status": status},  # ← status 在这里！
+    ))
+```
+
+**前端渲染**（[Thought.svelte:64-68, 122-124](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/Thought.svelte#L64-L124)）：
+
+```svelte
+<script>
+let expanded = $state(false);
+$effect(() => {
+    if (!user_expanded_toggled) {
+        expanded = thought_node?.metadata?.status !== "done";
+    }                    // ↑ pending 时手风琴展开，done 时手风琴默认折叠
+});
+</script>
+
+<div class="title" ...>
+    <span class="arrow">...下拉箭头...</span>
+    <Markdown message={thought_node.metadata?.title || ""} />  <!-- "Reasoning" 标题 -->
+    {#if thought_node.metadata?.status === "pending"}
+        <span class="loading-spinner"></span>    <!-- ← CSS 脉动动画圆点 -->
+    {/if}
+    ... duration / log 显示 ...
+</div>
+```
+
+CSS（[Thought.svelte:277-290](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/Thought.svelte#L277-L290)）：
+```css
+.loading-spinner {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background-color: currentColor;
+    animation: pulse 1.5s ease-in-out infinite;  /* 呼吸/脉动动画 */
+}
+```
+
+**整体调用链**：
+```
+Chatbot.postprocess → _extract_thinking_blocks(status="pending")
+  → Message(metadata={status:"pending"})
+    → ChatbotDataMessages.root[...]
+      → 前端 SSE 接收
+        → normalise_messages 透传 metadata
+          → group_messages 合并到气泡
+            → Message.svelte 的 {#each messages} 循环
+              → message.metadata.title 为真值
+                → <Thought thought={message}>
+                  → metadata.status === "pending"
+                    → <span.loading-spinner> 显示
+```
+
+#### 全局 Pending 气泡详细链路
+
+**状态来源**（全局 `loading_status` store）：
+
+文件：[chatbot/Index.svelte:87-88](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/Index.svelte#L87-L88)
+
+```svelte
+<ChatBot
+    pending_message={gradio.shared.loading_status?.status === "pending"}
+    generating={gradio.shared.loading_status?.status === "generating"}
+    ...
+/>
+```
+
+`loading_status` 由 DependencyManager 管理（[stores.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/core/src/stores.ts)），在 submit_loop 中被更新：
+- 事件入队 → `status = "pending"`
+- 开始处理/流式输出中 → `status = "generating"`
+- 完成/错误/取消 → `status = "complete"` 或 `"error"`
+
+**ChatBot.svelte 中的三处触发条件**（[ChatBot.svelte:353-358](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/ChatBot.svelte#L353-L358)）：
+
+```svelte
+{#each groupedMessages as messages, i}
+    <Message ... generating={generating} />
+    <!-- 条件 A：气泡行末尾追加 -->
+    {#if show_progress !== "hidden"
+        && generating
+        && messages[messages.length - 1].role === "assistant"
+        && messages[messages.length - 1].metadata?.status === "done"
+    }
+        <Pending {layout} {avatar_images} />
+    {/if}
+{/each}
+
+<!-- 条件 B：整个消息列表末尾追加（pending 阶段还没有 assistant 消息时） -->
+{#if show_progress !== "hidden" && pending_message}
+    <Pending {layout} {avatar_images} />
+{:else if options}
+    ... 选项按钮 ...
+{/if}
+```
+
+三种 Pending 气泡场景：
+
+| 场景 | 触发条件 | 显示位置 | 说明 |
+|------|---------|---------|------|
+| **pending 阶段** | `pending_message=true`（事件已入队，还没 yield 任何数据） | 整个消息列表**最末尾** | 用户刚点发送，AI 还没产出回复时显示 |
+| **generating + thinking 已结束** | `generating=true && 最后一条是 assistant && 其 metadata.status === "done"` | **最后一个 Message 气泡下方**（在同一个 #each 循环内） | thinking 段已闭合但正文还在流式输出时，在气泡下方显示脉动圆点 |
+| **reasoning_tags 未启用** | 所有流式场景（没有 metadata.status 判断因为根本没有 metadata） | 与上面相同 | 无 thinking 拆分时，最后一条 assistant metadata 为 null（`== "done"` 为假？实际上 `null === "done"` 是 false。实际情况：未配置 reasoning_tags 时走的是条件 B（pending_message），或者在 Message.svelte 内部由 ButtonPanel 的 generating 控制？需要核实） |
+
+> 实际说明：当 `generating=true` 但没有 reasoning_tags 时，`metadata?.status` 为 `null`，条件 A 的判断 `metadata.status === "done"` 为**假**，因此 Pending 气泡不会在每个气泡行显示。此时全局生成指示器通常由 `StatusTracker` 组件（[chatbot/Index.svelte:49-58](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/Index.svelte#L49-L58)）在 ChatBot 组件外部（整个聊天框顶部或底部）显示进度条/进度点，而 Pending.svelte 只在 `pending_message=true` 的**早期 pending 阶段**显示为一个"空白助理气泡 + 三个脉动圆点"。
+
+**Pending.svelte 内部结构**（[Pending.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/Pending.svelte)）：
+- 整体结构和正常消息气泡完全一致（avatar + 容器），只是 content 区域不是文本，而是三个 `<span class="pending-dot">` 通过 CSS keyframes 做 `pulse` 脉动动画，依次延迟触发形成"打字中"效果。
+
+#### 关键区分结论
+
+| 问题 | Thought Spinner | 全局 Pending 气泡 |
+|------|----------------|-----------------|
+| 依赖 reasoning_tags 吗？ | **是**。没有 reasoning_tags 就没有 metadata，永远不会显示 | **否**。所有流式场景下 pending/generating 阶段都可能显示 |
+| 是单条消息级别的吗？ | **是**。跟某一条 NormalisedMessage 绑定（该消息的 metadata.status） | **否**。全局 loading_status store，跟事件绑定 |
+| 可以同时存在多个吗？ | **可以**。如果当前气泡中有多条 Thinking 消息且都 pending，则每个都显示自己的 spinner | **通常只一个**。全局状态统一，不会重复出现 |
+| 消失时机？ | `metadata.status` 从 `"pending"` → `"done"` | `loading_status.status` 从 `"pending"`/`"generating"` → `"complete"` / `"error"` |
+| 组件文件？ | Thought.svelte（`<span.loading-spinner>`） | Pending.svelte（整个气泡组件） |
+
 ---
 
 ## 8. 涉及的关键文件索引
@@ -1164,5 +1452,9 @@ submit_event.then(**synchronize_chat_state_kwargs)
 | 加载状态 | [stores.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/core/src/stores.ts) | LoadingStatus 状态机 |
 | Chatbot UI | [ChatBot.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/ChatBot.svelte) | 消息列表渲染（#each 索引 key）、自动滚动 |
 | Chatbot 工具 | [utils.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/utils.ts) | group_messages（按 role 合并气泡）、is_last_bot_message |
-| 单条气泡 | [Message.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/Message.svelte) | 单条消息气泡组件，接收 messages prop 的响应式更新 |
-| 等待动画 | [Pending.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/Pending.svelte) | 生成中脉动动画 |
+| 单条气泡 | [Message.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/Message.svelte) | 单条消息气泡组件，遍历 messages prop，按 metadata.title 决定渲染 Thought 还是 MessageContent |
+| 思考手风琴 | [Thought.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/Thought.svelte) | 思考内容的手风琴折叠组件，metadata.status=pending 时显示 loading-spinner |
+| Chatbot 包装层 | [Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/Index.svelte) | loading_status → generating / pending_message prop 的桥梁，包裹 StatusTracker |
+| 前端类型 | [types.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/types.ts) | Message、NormalisedMessage、Metadata 等前端 TS 类型定义 |
+| 前端工具 | [utils.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/utils.ts) | normalise_messages（类型扁平化）、group_messages（按 role 分组气泡） |
+| 等待动画 | [Pending.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/Pending.svelte) | 全局生成气泡：空白助理气泡 + 三个脉动圆点，用于 pending 阶段 |
