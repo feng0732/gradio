@@ -182,7 +182,7 @@ def routes_safe_join(directory: DeveloperPath, path: UserProvidedPath) -> str:
     return str(fullpath)
 ```
 
-### 3.3 `/static/`、`/assets/`、`favicon` 调用链
+### 3.3 `/static/` 与 `/assets/` 调用链
 
 以 `/static/{path:path}` 为例（`gradio/routes.py` L977-L979）：
 
@@ -203,9 +203,74 @@ routes_safe_join(directory, path)
 
 **关键纠正**：`InvalidPathError → 403` 的转换发生在 `routes_safe_join` **内部**（L1133-L1134），并非在外层的 `file_response`。`file_response` 只是透传 `routes_safe_join` 的返回值给 `FileResponse` 构造函数。
 
-`/assets/` 和 `favicon` 路由走完全相同的调用链，只是根目录不同。
+`/assets/` 路由走完全相同的调用链，只是根目录不同（`BUILD_PATH_LIB`）。
 
-### 3.4 `/custom_component/...` 调用链（两段 `safe_join` 分支）
+### 3.4 `/favicon.ico` 调用链（两条分支）
+
+**路由定义**：`gradio/routes.py` L1050-L1053
+
+```python
+@app.get("/favicon.ico")
+async def _():
+    favicon_path = app.get_blocks().favicon_path
+    return favicon(favicon_path)
+```
+
+**`favicon()` 函数**：`gradio/route_utils.py` L1183-L1187
+
+```python
+def favicon(favicon_path: str | Path | None = None):
+    if favicon_path is None:
+        return file_response(STATIC_PATH_LIB, UserProvidedPath("img/logo.svg"))  # 分支 A
+    else:
+        return FileResponse(favicon_path)                                         # 分支 B
+```
+
+#### 分支 A：默认 favicon（`favicon_path is None`）
+
+```
+请求 /favicon.ico（未设置自定义图标）
+     ↓
+favicon(None)
+     ↓
+file_response(STATIC_PATH_LIB, UserProvidedPath("img/logo.svg"))
+     ↓  return FileResponse(routes_safe_join(...))
+routes_safe_join(STATIC_PATH_LIB, "img/logo.svg")
+     ├─ safe_join → 合法路径
+     ├─ 路径是目录？否
+     ├─ 路径存在？是 → 返回绝对路径
+     └─ 若 safe_join 异常 → 403（同 3.3 节）
+        若文件不存在 → routes_safe_join 内部转 404
+FileResponse(绝对路径) → 200
+```
+
+与 `/static/` 调用链**相同**，走 `routes_safe_join` 的完整安全检查。
+
+#### 分支 B：自定义 favicon（`favicon_path` 已设置）
+
+```
+请求 /favicon.ico（已设置 Blocks(favicon_path="/custom/path/icon.png")）
+     ↓
+favicon("/custom/path/icon.png")
+     ↓
+FileResponse("/custom/path/icon.png")   ← 直接构造，无任何路径检查
+     ↓
+Starlette 读取文件 → 200（如文件存在）
+     或抛出未处理异常 → 500（如文件不存在/不可读）
+```
+
+**与普通静态资源的本质区别**：
+- 自定义 `favicon_path` 是**开发者通过 Python API 传入**的可信路径，不是用户输入
+- **不经过** `safe_join` / `routes_safe_join`，无路径穿越检查
+- **不经过** `is_allowed_file` 白名单校验
+- 文件不存在时，FastAPI/Starlette 的 `FileResponse` 底层会抛出未捕获的 `FileNotFoundError`，最终表现为 **500 而非 404**
+- 因此自定义 favicon 与 `/static/`、`/assets/` **不是同一条调用链**
+
+> **`/pwa_icon` 补充**：`gradio/routes.py` L1795-L1817 路由的行为略有不同：
+> - `favicon_path is None` → 明确抛 `HTTPException(404)`（而非 500）
+> - `favicon_path` 已设置 → 同样直接 `FileResponse(favicon_path)`，无路径检查；不存在则 500
+
+### 3.5 `/custom_component/...` 调用链（两段 `safe_join` 分支）
 
 **定义位置**: `gradio/routes.py` L981-L1023
 
@@ -248,9 +313,13 @@ custom_component_path(...)
 > `safe_join` / `routes_safe_join` 仅用于以下已知根目录的静态资源路由：
 > - `/static/{path:path}` — 库内置静态资源（根目录: `STATIC_PATH_LIB`）
 > - `/assets/{path:path}` — 前端构建产物（根目录: `BUILD_PATH_LIB`）
-> - `/favicon.ico` — favicon
+> - `/favicon.ico`（**仅默认分支**）— 未设置自定义图标时，从 `STATIC_PATH_LIB/img/logo.svg` 返回
 > - `/custom_component/...` — 自定义组件资源（两段 safe_join）
 > - `deep_links` 状态文件读取
+>
+> **不经过 safe_join 的 favicon 相关路由**：
+> - `/favicon.ico`（自定义分支）— `FileResponse(favicon_path)` 直接返回
+> - `/pwa_icon` / `/pwa_icon/{size}` — 同样直接 `FileResponse(favicon_path)`，无路径检查
 
 ---
 
@@ -455,6 +524,10 @@ payload.url = f"{url_prefix}{payload.path}"
 | `/file=` + `upload_dir` 下的 HTML 文件 | 下载路由 | `reason == "created"` → 不在 `XSS_SAFE_MIMETYPES` → `attachment` | 200 强制下载（`application/octet-stream`） | `test_response_attachment_format` L322-L324 |
 | `/file=` + `upload_dir` 下的上传文件（非安全 MIME） | 下载路由 | `created_paths` 匹配 → 但不在安全 MIME 列表 | 200 强制下载 | 同上 |
 | `/static/..%2findex.html` | 静态资源路由 | `static_resource → file_response → routes_safe_join` 调用链中，`routes_safe_join` 内部捕获 `InvalidPathError` → 转 403 | 403 拒绝 | `test_static_files_served_safely` L62-L67 |
+| `/favicon.ico` 未设置自定义（默认分支） | favicon 路由分支 A | `favicon(None) → file_response(STATIC_PATH_LIB, "img/logo.svg") → routes_safe_join`，同静态资源调用链 | 存在 → 200；穿越 → 403；不存在 → 404 | `route_utils.py` L1183-L1185 |
+| `/favicon.ico` 已设置自定义 favicon（自定义分支） | favicon 路由分支 B | `favicon(path) → FileResponse(path)` **直接构造，无 safe_join 无白名单** | 文件存在 → 200；文件不存在/不可读 → **500**（`FileNotFoundError` 未被捕获） | `route_utils.py` L1186-L1187 |
+| `/pwa_icon` 未设置自定义 favicon | pwa_icon 路由 | 路由函数内显式判断 `favicon_path is None` → 抛 404 | 404 Not Found | `routes.py` L1799-L1801 |
+| `/pwa_icon` 已设置自定义 favicon | pwa_icon 路由 | 同 favicon 分支 B，直接 `FileResponse(favicon_path)` 无检查 | 存在 → 200；不存在 → 500 | `routes.py` L1803-L1804 |
 | `/custom_component/{id}/client/templates/../../etc/passwd` | 自定义组件路由（第 1 段） | 路由函数内**手动** `try/except` 捕获 `utils.safe_join` 的 `InvalidPathError` → 转 404 "Component not found" | 404 Not Found | `routes.py` L1010-L1018 |
 | `/custom_component/{id}/client/{type}/{穿越路径}` 第 1 段通过但第 2 段触发 | 自定义组件路由（第 2 段） | 第 1 段通过后调用 `routes_safe_join`，其内部捕获 `InvalidPathError` → 转 403 | 403 拒绝 | `routes.py` L1020-L1023 + `route_utils.py` L1133-L1134 |
 | `ssrf_protected_download("http://169.254.169.254/...")` | SSRF 保护下载 | `safehttpx` 内部 IP 拦截 | 抛出异常拒绝下载 | — |
