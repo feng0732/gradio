@@ -131,7 +131,7 @@ def __extract_metadata(df: Styler, hidden_cols=None) -> dict[str, list[list]]:
 
 ---
 
-## 三、metadata 与 display_value 的保留关系
+## 三、metadata 来源边界与 display_value 保留关系
 
 ### 3.1 三层数据模型
 
@@ -143,7 +143,222 @@ def __extract_metadata(df: Styler, hidden_cols=None) -> dict[str, list[list]]:
 | L2 类型转换值 | `row_data` | `GradioRow[]` | `values` + `cast_value_to_type` | 展示、排序、过滤 | ✅ 是（派生自 values） |
 | L3 格式化显示值 | `display_value` | `string[][] \| null` | 后端 `metadata.display_value` | 非编辑模式展示 | ❌ 否（编辑后丢失） |
 
-### 3.2 display_value 的使用优先级
+### 3.2 metadata 的四大来源场景
+
+**`get_metadata()` 方法**是所有 metadata 的入口 ([dataframe.py#L436-L459](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L436-L459)):
+
+```python
+@staticmethod
+def get_metadata(value):
+    from pandas.io.formats.style import Styler
+
+    if isinstance(value, Styler):
+        return Dataframe.__extract_metadata(
+            value, [int(c) for c in getattr(value, "hidden_columns", [])]
+        )
+    elif isinstance(value, dict):
+        return value.get("metadata", None)  # ← dict 直接取 metadata 键
+    return None
+```
+
+四种输入场景的 metadata 来源与结果：
+
+| 场景 | 输入类型 | metadata 来源 | metadata 结果 | display_value 状态 |
+|------|----------|--------------|--------------|-------------------|
+| 场景 1 | pandas Styler | `__extract_metadata()` 生成 | `{"display_value": [[...]], "styling": [[...]]}` | ✅ 有值 |
+| 场景 2 | Python dict | `value.get("metadata", None)` | dict 中的 metadata（如有） | ✅ 有值（若 dict 提供） |
+| 场景 3 | DataFrame/list/numpy/polars/str/csv | 不匹配任何条件，返回 `None` | `None` | ❌ null |
+| 场景 4 | 前端编辑回传 | `push_change()` 硬编码 `metadata: null` | `null` | ❌ null |
+
+---
+
+### 3.3 场景 1：Styler 输入的 metadata 路径
+
+**调用链**：
+
+```
+用户传入 Styler 对象
+    ↓
+postprocess(value)
+    ↓
+get_metadata(value)  → isinstance(value, Styler) == True
+    ↓
+__extract_metadata(value, hidden_columns)
+    ↓
+df._compute()._translate(None, None)  → 调用 pandas Styler 内部渲染
+    ↓
+提取 style_data["body"] 中每格的 display_value 和 styling
+    ↓
+返回 {"display_value": string[][], "styling": string[][]}
+    ↓
+DataframeData(metadata=...)
+    ↓
+前端 props.value.metadata.display_value → Table 的 display_value prop
+```
+
+**`__extract_metadata()` 详细流程** ([dataframe.py#L609-L639](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L609-L639)):
+
+```python
+@staticmethod
+def __extract_metadata(df: Styler, hidden_cols=None) -> dict:
+    style_data = df._compute()._translate(None, None)
+    cell_styles = style_data.get("cellstyle", [])
+    # 1. 构建 cell_id → CSS 样式字符串 的映射
+    style_dict = {}
+    for style in cell_styles:
+        for selector in style.get("selectors", []):
+            style_dict[selector] = "; ".join(
+                f"{prop}: {v}" for prop, v in style.get("props", [])
+            )
+    
+    metadata = {"display_value": [], "styling": []}
+    
+    # 2. 遍历 body 行，提取 display_value 和样式
+    for row in style_data["body"]:
+        row_display = []
+        row_styling = []
+        cells = [cell for cell in row if cell["type"] == "td"]
+        # 过滤隐藏列，保持列索引正确
+        cells = [cell for col_idx, cell in enumerate(cells)
+                 if col_idx not in hidden_cols_set]
+        for cell in cells:
+            row_display.append(cell["display_value"])   # 格式化显示值
+            row_styling.append(style_dict.get(cell["id"], ""))
+        metadata["display_value"].append(row_display)
+        metadata["styling"].append(row_styling)
+    return metadata
+```
+
+**对 display_value 的影响**：
+- Styler 的 `display_value` 是 pandas 格式化后的字符串（如 `"1.23%"`、`"¥100.00"` 等）
+- 非编辑模式下优先显示这些格式化值，而非原始数值
+- 编辑模式下切换为原始值（`values` 中的实际数据）
+- 编辑后 metadata 丢失，重新显示 `values` 中的值
+
+---
+
+### 3.4 场景 2：dict 输入携带 metadata 的路径
+
+**dict 输入格式**（也是 DataframeData 的结构）：
+
+```python
+{
+    "headers": ["列A", "列B", "列C"],
+    "data": [[1, 2, 3], [4, 5, 6]],
+    "metadata": {                          # ← 可选，直接传递
+        "display_value": [["1%", "2%", "3%"], ["4%", "5%", "6%"]],
+        "styling": [["color:red", "", ""], ["", "color:blue", ""]]
+    }
+}
+```
+
+**完整调用链**：
+
+```
+用户传入 dict（含 metadata 键）
+    ↓
+postprocess(value)
+    ↓
+get_headers(value)  → value.get("headers", [])     [dataframe.py#L379-L380]
+    ↓
+get_cell_data(value) → value.get("data", [[]])     [dataframe.py#L403-L404]
+    ↓
+is_empty(value)     → len(value["data"]) == 0      [dataframe.py#L344-L347]
+    ↓
+get_metadata(value) → value.get("metadata", None)  [dataframe.py#L457-L458]
+    ↓
+DataframeData(headers=..., data=..., metadata=...)
+    ↓
+前端 props.value.metadata.display_value / styling
+```
+
+**关键代码位置**：
+- headers 提取: [dataframe.py#L379-L380](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L379-L380)
+- data 提取: [dataframe.py#L403-L404](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L403-L404)
+- metadata 提取: [dataframe.py#L457-L458](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L457-L458)
+- 空值判断: [dataframe.py#L344-L347](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L344-L347)
+
+**对 display_value 的影响**：
+- dict 提供了 `metadata.display_value` 时，前端行为与 Styler 完全一致
+- 非编辑模式显示格式化值，编辑模式显示原始值
+- 编辑后 metadata 同样丢失
+
+---
+
+### 3.5 场景 3：普通数据输入（DataFrame/list/numpy/polars/str）
+
+**调用链**：
+
+```
+用户传入 DataFrame / list / numpy / polars / csv路径
+    ↓
+postprocess(value)
+    ↓
+get_metadata(value)
+    ↓  不是 Styler，也不是 dict
+返回 None
+    ↓
+DataframeData(metadata=None)
+    ↓
+前端 display_value = props.value?.metadata?.display_value ?? null
+    ↓
+display_value = null
+```
+
+**对 display_value 的影响**：
+- `display_value` 始终为 `null`
+- 所有单元格（无论是否编辑）都直接显示 `values` 中的原始值
+- 不存在编辑前/后的显示差异
+
+---
+
+### 3.6 场景 4：编辑回传 metadata: null
+
+**前端 `push_change()` 硬编码丢弃 metadata** ([Table.svelte#L363-L374](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L363-L374)):
+
+```typescript
+function push_change(new_values?, new_headers?): void {
+    onchange?.({
+        data: new_values ?? values,
+        headers: (new_headers ?? resolved_headers) as string[],
+        metadata: null  // ← 硬编码为 null，丢弃所有 metadata
+    });
+    // ...
+}
+```
+
+**触发 push_change 的所有操作**都会丢弃 metadata：
+
+| 操作 | 代码位置 | metadata 状态 |
+|------|----------|--------------|
+| 单元格文本编辑提交 | [Table.svelte#L470](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L470) | null |
+| 布尔列全选切换 | [Table.svelte#L633](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L633) | null |
+| 添加行 | [Table.svelte#L567](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L567) | null |
+| 添加列 | [Table.svelte#L585](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L585) | null |
+| 删除行 | [Table.svelte#L592](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L592) | null |
+| 删除列 | [Table.svelte#L608](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L608) | null |
+| Delete/Backspace 清空单元格 | [Table.svelte#L794](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L794) | null |
+| 应用筛选条件 | [Table.svelte#L659](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L659) | null |
+| 文件上传导入 | [Table.svelte#L853](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L853) | null |
+
+**对 display_value 的影响**：
+- 一旦用户执行任何上述操作，前端 props.value.metadata 变为 `null`
+- display_value 随之变为 `null`，所有单元格切换为显示 `values` 原始值
+- Styler 或 dict 提供的格式化显示效果全部消失
+
+---
+
+### 3.7 四大场景对 display_value 影响对比
+
+| 场景 | metadata | display_value | 非编辑模式显示 | 编辑模式显示 | 编辑后状态 |
+|------|----------|--------------|---------------|-------------|-----------|
+| Styler 输入 | 有（自动生成） | string[][] | 格式化值（display_value） | 原始值（values） | metadata 丢失，全部显示原始值 |
+| dict 输入带 metadata | 有（用户提供） | string[][] | 格式化值（display_value） | 原始值（values） | metadata 丢失，全部显示原始值 |
+| dict 输入不带 metadata | None | null | 原始值（values） | 原始值（values） | 无变化，始终显示原始值 |
+| DataFrame/list/numpy/polars | None | null | 原始值（values） | 原始值（values） | 无变化，始终显示原始值 |
+| 编辑回传后（任何场景） | null | null | 原始值（values） | 原始值（values） | 已丢失，等后端重新计算 |
+
+### 3.8 display_value 的使用优先级
 
 **EditableCell 中的显示逻辑** ([EditableCell.svelte#L90-L92](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/EditableCell.svelte#L90-L92)):
 
@@ -163,36 +378,22 @@ function get_display_value(row: number, col: number): string {
 }
 ```
 
-> **显示优先级规则**：
-> 1. **编辑模式（editable=true）**：始终使用 `value`（原始值）
-> 2. **展示模式（editable=false）**：优先使用 `display_value`（存在时），否则回退到 `value`
-> 3. **空字符串支持**（v0.17.7+，PR #11033）：通过 `!== undefined` 判断，允许 display_value 为空字符串
+**显示优先级规则**（从高到低）：
+1. **编辑模式（editable=true）**：始终使用 `value`（row_data 中的类型转换值）
+2. **展示模式 + display_value 非 undefined**：使用 `display_value`（metadata 中的格式化值）
+3. **展示模式 + display_value 为 null/undefined**：使用 `values`（原始值，转字符串）
+4. **空字符串支持**（v0.17.7+，PR #11033）：通过 `!== undefined` 判断，允许 display_value 为空字符串
 
-### 3.3 编辑后 metadata 的丢失
+### 3.9 metadata 生命周期
 
-**`push_change()` 中 metadata 被设为 null** ([Table.svelte#L363-L374](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L363-L374)):
+| 阶段 | metadata 状态 | 原因 | display_value 效果 |
+|------|------------|------|-------------------|
+| 初始加载（Styler/dict） | 有 | 后端 postprocess 生成/提取 | 非编辑模式显示格式化值 |
+| 初始加载（普通数据） | None | get_metadata 返回 None | 始终显示原始值 |
+| 任何编辑操作后 | null | push_change 设为 null | 全部显示原始值 |
+| 下一轮后端返回 | 重新生成/提取 | 后端重新 postprocess | 恢复格式化显示 |
 
-```typescript
-function push_change(new_values?, new_headers?): void {
-    onchange?.({
-        data: new_values ?? values,
-        headers: (new_headers ?? resolved_headers) as string[],
-        metadata: null  // ← 每次回传时 metadata 始终为 null
-    });
-    // ...
-}
-```
-
-**metadata 生命周期**：
-
-| 阶段 | metadata 状态 | 原因 |
-|------|------------|------|
-| 初始加载 | 有（仅 Styler 时） | 后端 postprocess 生成 |
-| 单元格编辑后 | 丢失 | push_change 设为 null |
-| 增删行列后 | 丢失 | push_change 设为 null |
-| 下一轮后端返回 | 恢复 | 后端重新 postprocess 生成 |
-
-> **设计意图**：metadata 是后端根据完整数据计算的派生数据（样式、格式化等），前端无法维护，因此编辑后直接丢弃，等待后端重新计算。
+> **设计意图**：metadata 是后端根据完整数据计算的派生数据（样式、格式化等），前端无法在数据变更后正确维护 metadata，因此编辑后直接丢弃，等待后端根据新数据重新计算。
 
 ---
 
