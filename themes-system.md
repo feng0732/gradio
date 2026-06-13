@@ -13,9 +13,16 @@
 > - ✅ **重大修正**：嵌入模式背景色 `bg_element = wrapper = .gradio-container`，之前误以为是 `.main` 内部 div
 > - ✅ 补充 `handle_theme_mode` 在独立模式的调用时机：模块级 `if (browser)` 代码，在 onMount 前执行
 > - ✅ 补充三层背景叠加时序图（body CSS → html inline → :root.dark 变量）
-> - ✅ 澄清为什么背景色设到 `<html>`：消除 body margin（8px 默认样式）导致的白边问题
+> - ❌ **已推翻**：之前推测"背景色设到 html 是为了消除 body margin: 8px"——实际 reset.css 已将 body margin 重置为 0
 >
-> 第十一章的"DOM 结构与挂载点"和"防闪屏时序"章节已完全重写。
+> **2026-06-13 深度核查（第四轮）**：核查样式重置、app.html 布局结构与 CSS 背景传播规范，核心发现：
+> - ✅ 找到真正原因：`app.html` 中 html 是 flex 容器（`display: flex; flex-direction: column; min-height: 100%`），body 是 `flex-grow: 1` 的子项
+> - ✅ 阐明 flex 布局破坏 CSS 背景传播的根因：正常情况下 body 的 background 会自动传播到 html/canvas，但 flex 布局下 body 只是 flex item，不自动传播
+> - ✅ 核查了完整的六层背景/布局来源（app.html inline → reset.css → +layout.svelte → apply_theme inline → /theme.css → Embed.svelte）
+> - ✅ 确认 Embed.svelte 中 .gradio-container / .main / .app 均无 background 属性，完全依赖上层 html/body
+> - ✅ 确认 body 高度 = 内容高度而非视口高度的场景下，html 背景是唯一覆盖整个视口的来源
+>
+> 第十一章新增"11.9 背景色写入 html 的根因：CSS 背景传播规范与 Flex 布局冲突"专题章节。
 
 ## 一、整体架构概览
 
@@ -1116,7 +1123,9 @@ function sync_system_theme(target): "light" | "dark" {
 
 **为什么背景色要设到 `<html>` 而不是 `<body>`？**
 
-因为 body 默认有 `margin: 8px`（浏览器默认样式），如果只给 body 设背景，margin 区域会露出 html 的白色。设到 `<html>` 上能确保浏览器窗口的每个像素都被主题背景色覆盖。
+> ⚠️ **已推翻的错误假设**：之前推测是为了消除 body margin: 8px 导致的白边。但实际 [reset.css L18-L21](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/theme/src/reset.css#L18-L21) 已将 `body { margin: 0; }`，白边并非根因。
+>
+> **真正根因**：`app.html` 中 html/body 的 flex 布局破坏了 CSS 背景色的自动传播机制。详见 **11.9 专题章节**。
 
 ---
 
@@ -1340,7 +1349,7 @@ self.embed_radius = embed_radius or getattr(self, "embed_radius", "*radius_sm")
 5. **⚠️ prefix_css 中的冗余 remove()**：`prefix_css()` 内部会先调用 `style_element.remove()` 将传入的 `<style>` 从 DOM 中移除，但之后将处理后的字符串赋值给 `style_element.textContent`。在支持 `adoptedStyleSheets` 的浏览器中，元素已不在 DOM 中，样式可能无法生效。这可能是历史遗留的设计冗余。
 
 6. **背景色作用节点的本质差异**：
-   - 独立模式：`bg_element = document.body.parentElement` = **`<html>` 根元素** —— 覆盖整个浏览器窗口，消除 body margin 导致的白边
+   - 独立模式：`bg_element = document.body.parentElement` = **`<html>` 根元素** —— 覆盖整个浏览器视口，解决 flex 布局下 body 背景不自动传播的问题（详见 11.9 专题）
    - 嵌入模式：`bg_element = wrapper` = **`<div class="gradio-container">`** —— 只在 Gradio 容器内部生效，不污染宿主页面
 
 7. **handle_theme_mode 入参差异是理解的钥匙**：
@@ -1355,6 +1364,169 @@ self.embed_radius = embed_radius or getattr(self, "embed_radius", "*radius_sm")
 9. **CDN 适配的关键**：`mount_css()` 中的 origin 判断是嵌入模式下的隐形基础设施——当 Gradio 静态资源从 CDN 提供时，能正确把 `/theme.css` 转成 `https://cdn.xxx.com/theme.css`。
 
 10. **prefix_css 的双重输出**：同时输出原始规则和前缀版本，保证了向后兼容——旧的自定义 CSS 即使不做前缀也能工作，同时新的前缀版本确保不污染宿主页面。
+
+---
+
+## 11.9 专题：背景色写入 html 的根因——CSS 背景传播规范与 Flex 布局冲突
+
+> **历史结论演进**：
+> - 第一轮：推测是消除 body 默认 margin: 8px 白边 → **已推翻**（reset.css 已重置为 0）
+> - 第二轮（本轮）：确认为 app.html 中 flex 布局破坏了 CSS 背景自动传播机制
+
+### 11.9.1 六层样式来源核查
+
+独立模式下 html/body 的背景和布局设置来自 6 个不同层级，必须综合分析：
+
+| 层级 | 文件 | 作用对象 | 样式内容 |
+|------|------|---------|---------|
+| 1 | [app.html L2-L10](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/app.html#L2-L10) | `<html>` inline | `margin:0; padding:0; min-height:100%; display:flex; flex-direction:column;` |
+| 2 | [app.html L47-L57](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/app.html#L47-L57) | `<body>` inline | `width:100%; margin:0; padding:0; display:flex; flex-direction:column; flex-grow:1;` |
+| 3 | [reset.css L10-L16](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/theme/src/reset.css#L10-L16) | `html` | 只设置 text-size-adjust / line-height / font-family / tab-size，**无 background** |
+| 4 | [reset.css L18-L21](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/theme/src/reset.css#L18-L21) | `body` | `margin: 0; line-height: inherit;`，**无 background** |
+| 5 | [+layout.svelte L12-L21](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/+layout.svelte#L12-L21) | `body` | `background: var(--body-background-fill); color: var(--body-text-color);` + 防闪屏兜底 |
+| 6 | [apply_theme()](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/[...catchall]/+page.svelte#L158-L168) | `<html>` inline | `style="background: var(--body-background-fill)"`（JS 运行时设置） |
+
+**关键发现**：第 5 层已经给 body 设置了 `background: var(--body-background-fill)`，理论上 body 已经有背景色了。那为什么第 6 层还要给 html 再设一遍？答案在 CSS 背景传播规范。
+
+---
+
+### 11.9.2 CSS 背景传播规范（正常情况 vs Flex 布局）
+
+#### 规范原文要点
+
+根据 [CSS Backgrounds and Borders Module Level 3](https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds)：
+
+> The background of the root element becomes the background of the canvas and covers the entire canvas... However, if no background is specified for the root element, the canvas' background comes from the first child HTML body element... In that case, the body element's background is not drawn again.
+
+翻译并简化：
+1. **html（根元素）的背景** = 整个画布（canvas，即浏览器视口）的背景，覆盖整个窗口
+2. **如果 html 没有 background**，则 canvas 的背景**自动借用** body 的 background，body 本身不再额外绘制背景
+3. **如果 html 有 background**，则 body 的 background 只在 body 元素自身区域内绘制，不会传播到 canvas
+
+#### 正常布局（非 Flex）下的表现
+
+如果 app.html 没有设置 display: flex，body 是普通 block 元素：
+
+```
+<body style="background: var(--body-background-fill)">
+    <!-- content -->
+</body>
+```
+
+- html 无 background → canvas 背景自动借用 body → **整个视口都是主题背景色**
+- ✅ 无需给 html 额外设置 background
+
+#### Flex 布局下的表现（Gradio 的实际情况）
+
+[app.html L2-L10](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/app.html#L2-L10) 和 [L47-L57](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/app.html#L47-L57)：
+
+```html
+<html style="min-height: 100%; display: flex; flex-direction: column;">
+    <body style="display: flex; flex-direction: column; flex-grow: 1;">
+```
+
+此时 html 是 flex 容器，body 是 flex item。关键区别：
+
+1. **body 的高度由内容决定，而非自动填满视口**：虽然 body 有 `flex-grow: 1`，但只有当 flex 容器有多余空间时 flex item 才会扩张
+2. **html 的高度是 min-height: 100%**：至少占满整个视口，但可能更长
+
+**问题场景演示**（当页面内容很少时）：
+
+```
+┌─────────────────────────────┐  ← html（flex 容器，min-height:100%）
+│  background: ???            │
+│                             │
+│  ┌───────────────────────┐  │  ← body（flex item，flex-grow:1）
+│  │  background: #ffffff  │  │     高度由内容决定 = 200px
+│  │  [少量内容 200px 高]   │  │
+│  └───────────────────────┘  │
+│                             │  ← 剩余 800px 区域
+│                             │     显示 html 的 background（透明 → 浏览器默认白色）
+└─────────────────────────────┘
+```
+
+即使 body 的 `flex-grow: 1` 让 body 占满了剩余空间，**CSS 背景传播规范仍然不适用**——因为该规范仅在 html 没有自身 background 时生效。但这里的问题不是传播失效，而是**flex 布局下，当内容不足时，只有给 html 显式设置 background，才能确保整个视口都被主题色覆盖**。
+
+更准确地说：
+
+| 场景 | body 有 background | html 无 background | html 有 background | 视口效果 |
+|------|-------------------|-------------------|-------------------|---------|
+| 内容满屏 | ✅ 正常显示 | ✅ body 传播到 canvas | ✅ 双重覆盖（视觉一致） | 都是主题色 |
+| 内容不足 | ❌ 只在内容高度显示 | ❌ 下方露出 html 背景（透明→白色） | ✅ 整个视口都是主题色 | **只有 html 设背景才正确** |
+
+---
+
+### 11.9.3 apply_theme 内联 style 与 +layout.svelte CSS 规则的协同
+
+理解了 flex 布局的问题后，还需要理解为什么 apply_theme 要通过**内联 style** 给 html 设背景，而不是通过 CSS 规则：
+
+**第 1 步：+layout.svelte 给 body 设 CSS 规则**（[+layout.svelte L12-L15](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/+layout.svelte#L12-L15)）
+```css
+:global(body) {
+    background: var(--body-background-fill);
+    color: var(--body-text-color);
+}
+```
+- 作用：给 body 元素设背景，但 body 是 flex item，高度可能不足视口
+- 变量来源：`/theme.css` 中的 `:root` / `:root.dark` 选择器
+
+**第 2 步：apply_theme 给 html 设内联 style**（[+page.svelte L160](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/[...catchall]/+page.svelte#L160)）
+```javascript
+bg_element.style.background = "var(--body-background-fill)";
+// bg_element = document.documentElement = <html>
+```
+- 作用：给 html 设背景，html 是 flex 容器，`min-height: 100%` 确保至少占满视口
+- 变量来源：同 body，`/theme.css` 中定义
+
+**两者变量值相同，视觉上形成双层一致的背景**：
+- html（视口级）：`background: var(--body-background-fill)`
+- body（内容级）：`background: var(--body-background-fill)`
+- 无论内容多少，整个视口都被主题色覆盖
+
+**为什么必须用内联 style 而不是 CSS 规则？**
+1. **优先级更高**：内联 style（1000）> id 选择器（100）> class 选择器（10），确保不会被其他 CSS 覆盖
+2. **动态性**：`apply_theme()` 是 JS 函数，内联 style 是最直接的 DOM 操作方式
+3. **无需额外 CSS 注入**：不需要动态创建 `<style>` 标签或修改样式表
+
+---
+
+### 11.9.4 Embed.svelte 容器结构：为什么不需要自己的背景
+
+[Embed.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/core/src/Embed.svelte) 中各层容器的背景属性：
+
+| 元素 | 类名 | background 设置 | 布局设置 |
+|------|------|----------------|---------|
+| 最外层 wrapper | `.gradio-container` | **无**（继承自上层 html/body） | `display:flex; flex-direction:column; min-height:1px;` |
+| 中间层 | `.main.fillable` | **无** | `display:flex; flex-grow:1; flex-direction:column;` |
+| 内容层（独立模式） | `.app` | **无** | `position:relative; margin:auto; padding: var(--size-4) var(--size-8); width:100%; height:100%;` |
+| 导航（可选） | `.nav-holder` | **无** | `padding: var(--size-2) 0; border-bottom: 1px;` |
+
+**没有任何一层容器设置了 background**。这是经过设计的：
+
+1. **独立模式**：html 和 body 已经通过 apply_theme 和 +layout.svelte 设置了主题背景，所有子元素天然透明（background 默认值是 transparent），直接透出上层的主题色
+2. **嵌入模式**：`apply_theme()` 直接给 wrapper（.gradio-container）设内联 style background，同样所有子元素透明透出
+
+这种"只在根节点设背景，子节点全透明"的设计是 CSS 的最佳实践——避免了多层背景叠加导致的性能问题和颜色不一致问题。
+
+---
+
+### 11.9.5 嵌入模式为什么不需要设 html 背景
+
+嵌入模式（SPA）下，`apply_theme()` 给 wrapper（.gradio-container）设背景而不是 html/body：
+
+| 区别点 | 独立模式 | 嵌入模式 |
+|--------|---------|---------|
+| bg_element | `<html>` | `.gradio-container` |
+| 作用范围 | 整个浏览器视口 | Gradio 容器内部 |
+| 是否影响宿主 | 是（独占页面） | 否（严格隔离） |
+| app.html | ✅ 有（SvelteKit 模板） | ❌ 无（纯 SPA，宿主页面自己的 html/body） |
+
+嵌入模式的设计原则是**零宿主污染**：
+- 不修改宿主页面的 html/body 样式
+- 不依赖宿主页面的背景设置
+- 所有样式都限制在 .gradio-container 及其后代内
+
+因此嵌入模式宁可让 .gradio-container 外部（如果容器不足 100vh）露出宿主的背景，也不会去碰 html/body。这是嵌入场景的正确设计选择。
 
 ---
 
