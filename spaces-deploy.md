@@ -202,11 +202,17 @@ HTML 用法：
 
 > **注意**：SPA 入口默认 `is_embed=true`、`info=true`、`container=true`，和 SSR 入口恰好相反。
 
-SPA 内部再传递给 Embed 组件（[Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/spa/src/Index.svelte#L100-L117)）：
+SPA 内部再传递给 Embed 组件（[Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/spa/src/Index.svelte#L526-L540)）：
 ```
 is_embed → 原样传给 Embed 的 is_embed
 container + is_embed → Embed 的 display（与 SSR 相同规则）
-info → Embed 的 info（与 SSR 不同，SPA 默认 true）
+info → Embed 的 info = !!space && info（多一层 space 判断，无 space 自动隐藏）
+```
+
+**同时，Blocks 组件的 footer_links 在 SPA 嵌入下同样被强制清空**（[Index.svelte L607](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/spa/src/Index.svelte#L607)）：
+```javascript
+footer_links={is_embed ? [] : config.footer_links}
+// SSR 和 SPA 两个入口对 footer_links 的处理完全一致
 ```
 
 #### 入口 C：URL 查询参数（两种入口通用）
@@ -231,18 +237,20 @@ Gradio 存在**两种独立**的底部信息栏，分属不同组件、互不影
 | 条件 | 含义 | 说明 |
 |------|------|------|
 | `display` | `container && is_embed` | 必须同时启用嵌入模式和容器外框 |
-| `space` | `config.space_id` | 必须是在 Space 环境（`SYSTEM=spaces`）|
-| `info` | Props 传入 | SSR 入口固定 `false`，SPA 入口默认 `true` |
+| `space` | 传入 Embed 的 space prop | 必须有 space ID（来自 config.space_id 或传入的 space 属性）|
+| `info` | Props 传入 | SSR 入口固定 `false`；SPA 入口传入前已做 `!!space && info` |
+
+> **注意**：Embed.svelte 内部判断是 `display && space && info`（三重 AND）。SPA 入口在传入前已用 `!!space && info` 过滤了一次，所以即使 `info=true` 但没有 space，也会被前置拦截。
 
 **何时显示：**
 
-| 入口 | is_embed | container | space_id | info | 结果 |
-|------|----------|-----------|----------|------|------|
-| SSR 常规访问（hf.space 直接打开） | false | true | 有 | false | ❌ 不显示 |
-| SSR + embed=true 外部嵌入 | true | true | 有 | false | ❌ 不显示（info 固定 false）|
-| SPA（<gradio-app> Web Component）默认 | true | true | 有 | true | ✅ 显示 |
-| SPA + info=false | true | true | 有 | false | ❌ 不显示 |
-| SPA 嵌入非 Space 应用 | true | true | 无 | true | ❌ 不显示（space 为空）|
+| 入口 | is_embed | container | space | info（传入 Embed 后） | 结果 |
+|------|----------|-----------|-------|----------------------|------|
+| SSR 常规访问（hf.space 直接打开） | false | true | 有 | false | ❌ 不显示（display=false）|
+| SSR 嵌入（embed=true） | true | true | 有 | false | ❌ 不显示（info 固定 false）|
+| SPA 默认（有 space） | true | true | 有 | true | ✅ 显示 |
+| SPA + info=false（有 space） | true | true | 有 | false | ❌ 不显示 |
+| SPA 嵌入非 Space 应用（无 space） | true | true | 无 | false | ❌ 不显示（前置过滤 space）|
 
 #### 类型 B：Blocks 底部链接（API / Gradio / Settings）
 
@@ -262,10 +270,15 @@ if footer_links is None:
 - `"settings"` → 显示设置按钮
 - `dict` → 自定义链接 `{"label": "...", "url": "..."}`
 
-**嵌入时的强制覆盖：** [+page.svelte](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/app/src/routes/[...catchall]/+page.svelte#L469)
+**嵌入时的强制覆盖（SSR 与 SPA 入口逻辑完全相同）**：
+
+- SSR 入口：[+page.svelte#L469](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/app/src/routes/[...catchall]/+page.svelte#L469)
+- SPA 入口：[Index.svelte#L607](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/spa/src/Index.svelte#L607)
+
 ```javascript
 footer_links={is_embed ? [] : config.footer_links}
 // 嵌入模式下 footer_links 强制清空 = 类型 B 不显示
+// SSR / SPA 两种入口下代码逐字相同，无任何差异
 ```
 
 **类型 B 显示时机：**
@@ -276,7 +289,8 @@ footer_links={is_embed ? [] : config.footer_links}
 | 直接访问 + `footer_links=[]` | `[]` | ❌ 完全隐藏 |
 | 直接访问 + `footer_links=["gradio"]` | `["gradio"]` | ⚡ 只显示 Built with Gradio |
 | SSR 嵌入（is_embed=true） | `[]`（被强制覆盖） | ❌ 完全隐藏 |
-| SPA 嵌入（Web Component） | 取决于 config（不强制覆盖） | ⚡ 若 Space 未显式隐藏则显示 |
+| SPA 嵌入（Web Component，默认 embed=true） | `[]`（被强制覆盖，与 SSR 相同代码） | ❌ 完全隐藏 |
+| SPA 非嵌入（<gradio-app embed="false">） | `config.footer_links` | ✅ 按服务端配置显示 |
 
 ---
 
@@ -547,7 +561,8 @@ async def login(request, form_data):
 │   │
 │   ├─ 入口 B：SPA Custom Element (<gradio-app>)
 │   │   ├─ embed=true, container=true, info=true（默认值，与 SSR 相反）
-│   │   ├─ footer_links 不强制覆盖 → 按服务端配置显示
+│   │   ├─ footer_links 嵌入时强制清空（与 SSR 代码完全相同）→ 类型B不显示
+│   │   ├─ embed=false 时 footer_links 按服务端配置显示
 │   │   └─ display && space && info → 显示类型A（Hosted on Spaces）信息栏
 │   │
 │   └─ URL 查询参数
@@ -557,13 +572,17 @@ async def login(request, form_data):
 │
 ├─ 底部 Footer 显示
 │   ├─ 类型A（Embed.svelte info栏）：display && space && info
-│   │   ├─ SSR 入口：始终不显示（info=false）
-│   │   └─ SPA 入口：默认显示（info=true），需 info=false 才隐藏
+│   │   ├─ SSR 入口：info 固定=false → 始终不显示
+│   │   └─ SPA 入口：info 先做 !!space && info 前置过滤
+│   │       ├─ 有 space + info=true（默认）→ 显示
+│   │       ├─ 有 space + info=false → 不显示
+│   │       └─ 无 space → 始终不显示（前置短路）
 │   │
 │   └─ 类型B（Blocks footer_links）：footer_links.length > 0
 │       ├─ 默认：["api", "gradio", "settings"]
-│       ├─ SSR 嵌入：强制清空 → 不显示
-│       └─ SPA 嵌入：原样显示
+│       ├─ SSR 嵌入（is_embed=true）：强制清空 → 不显示
+│       ├─ SPA 嵌入（embed=true）：强制清空（代码与 SSR 逐字相同）→ 不显示
+│       └─ SPA 非嵌入（embed=false）：按服务端配置显示
 │
 ├─ 心跳处理
 │   ├─ connect_heartbeat 判断（任一满足即启用）
