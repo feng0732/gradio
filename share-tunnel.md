@@ -324,7 +324,38 @@ scheme='http', netloc='xyz.local:8080', path='', params='', query='', fragment='
 
 ## 六、服务器发现的代码事实
 
-### 6.1 默认路径：请求 Gradio API
+服务器发现有三条路径，优先级从高到低：
+1. **显式传参**：`launch(share_server_address="host:port")`
+2. **环境变量**：`GRADIO_SHARE_SERVER_ADDRESS`
+3. **默认路径**：请求 `api.gradio.app` 动态获取
+
+### 6.1 环境变量的读取位置
+
+> **代码事实**，见 [networking.py#L20](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L20-L20)
+
+```python
+GRADIO_SHARE_SERVER_ADDRESS = os.getenv("GRADIO_SHARE_SERVER_ADDRESS")
+```
+
+**注意**：环境变量在 `networking.py` 模块加载时读取，保存在模块级变量中。`blocks.py` **不读取**此环境变量，也不感知其存在。
+
+### 6.2 setup_tunnel 中的地址覆盖逻辑
+
+> **代码事实**，见 [networking.py#L30-L34](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L30-L34)
+
+```python
+share_server_address = (
+    GRADIO_SHARE_SERVER_ADDRESS
+    if share_server_address is None
+    else share_server_address
+)
+```
+
+**代码可见行为**：如果调用方传入的 `share_server_address` 为 None，则用 `GRADIO_SHARE_SERVER_ADDRESS` 环境变量的值覆盖。显式传参优先级高于环境变量。
+
+**关键事实**：此覆盖发生在 `setup_tunnel()` **函数内部**。也就是说，在 `blocks.py` 层面上，`self.share_server_address` 依然是 None（或用户显式传入的值），环境变量的生效对 `blocks.py` 是透明的。
+
+### 6.3 默认路径：请求 Gradio API
 
 > **代码事实**，见 [networking.py#L35-L53](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L35-L53)
 
@@ -341,12 +372,13 @@ if share_server_address is None:
 ```
 
 **代码可见行为**：
-1. 向 `https://api.gradio.app/v3/tunnel-request` 发 GET 请求
-2. 从 JSON 响应的 `[0]` 中取 `host`、`port`、`root_ca` 三个字段
-3. 将 `root_ca` 写入本地 `.gradio/certificate.pem`
-4. 将证书路径赋给 `share_server_tls_certificate`
+1. 当`share_server_address` 为 None（即没有显式传参**且**没有环境变量）时触发
+2. 向 `https://api.gradio.app/v3/tunnel-request` 发 GET 请求
+3. 从 JSON 响应的 `[0]` 中取 `host`、`port`、`root_ca` 三个字段
+4. 将 `root_ca` 写入本地 `.gradio/certificate.pem`
+5. 将证书路径赋给 `share_server_tls_certificate`，覆盖调用方传入的值
 
-### 6.2 自定义路径：用户指定服务器
+### 6.4 自定义路径：显式传参或环境变量
 
 > **代码事实**，见 [networking.py#L55-L57](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L55-L57)
 
@@ -356,13 +388,165 @@ else:
     remote_port = int(remote_port)
 ```
 
-**代码可见行为**：按 `:` 分割用户提供的地址字符串为 host 和 port。此时**不**请求 API、**不**获取证书、`share_server_tls_certificate` 保持为用户传入的原始值（通常为 None）。
+**代码可见行为**：
+- 当 `share_server_address` 不为 None（无论是用户显式传参还是环境变量注入）时触发
+- 按 `:` 分割地址字符串为 host 和 port
+- **不**请求 API、**不**获取证书
+- `share_server_tls_certificate` 保持为调用方传入的原始值（未被覆盖，通常为 None）
 
 ---
 
-## 七、frpc 二进制下载的代码事实
+## 七、自定义服务器两条路径的差异对比
 
-### 7.1 下载与校验
+### 7.1 三条路径的决策流程
+
+```
+blocks.py launch()
+    │
+    │  传入 share_server_address（显式传参值，可能为 None）
+    ▼
+networking.py setup_tunnel()
+    │
+    ├─ 传参 is None?
+    │      │
+    │      ├─ 是 → 尝试 GRADIO_SHARE_SERVER_ADDRESS 环境变量
+    │      │       │
+    │      │       ├─ 环境变量有值 → 路径 B（环境变量自定义服务器）
+    │      │       └─ 环境变量为 None → 路径 A（官方 API 发现）
+    │      │
+    │      └─ 否 → 路径 C（显式传参自定义服务器）
+    │
+    ▼
+   三条路径进入不同分支
+```
+
+### 7.2 差异逐项对比
+
+以下对比基于代码行为，不涉及语义推断。
+
+| 维度 | 路径 A：官方 API 发现 | 路径 B：环境变量 `GRADIO_SHARE_SERVER_ADDRESS` | 路径 C：显式传参 `share_server_address=` |
+|------|-------------------|--------------------------------------------|---------------------------------------|
+| **服务器地址来源** | `api.gradio.app` 返回的 `host:port` | 环境变量值 | 参数值 |
+| `networking.py` 中 `share_server_address` 值 | None（进入 API 分支） | 环境变量字符串（进入自定义分支） | 参数字符串（进入自定义分支） |
+| `blocks.py` 中 `self.share_server_address` 值 | None | None | 参数值 |
+| **默认协议**判断依据 | `blocks.py#L2966`：`share_server_address is None` → `"https"` | `blocks.py#L2966`：`share_server_address is None` → `"https"` ⚠️ | `blocks.py#L2966`：`share_server_address is not None` → `"http"` |
+| **实际默认协议** | `https`（正确，官方有 TLS） | `https`（可能错误，自定义服务器未必有 TLS）⚠️ | `http`（保守，用户可自行覆盖） |
+| **证书处理** | 从 API 获取 `root_ca`，写入本地，赋给 `share_server_tls_certificate`，frpc 追加 `--tls_enable` + `--tls_trusted_ca_file` | 不请求 API，证书保持调用方传入值（通常为 None），frpc **不追加** TLS 参数 ⚠️ | 同左：不请求 API，证书保持传入值，通常无 TLS |
+| frpc 是否启用 TLS | ✅ 是（有证书） | ❌ 否（证书为 None）⚠️ | ❌ 否（证书为 None，除非用户显式传 `share_server_tls_certificate=`） |
+| `frpc` `--server_addr` 参数值 | 来自 API 的 `host:port` | 环境变量字符串分割后的 `host:port` | 参数字符串分割后的 `host:port` |
+
+### 7.3 协议判断的关键代码位置
+
+> **代码事实**，见 [blocks.py#L2965-L2969](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L2965-L2969)
+
+```python
+self.share_server_address = share_server_address
+self.share_server_protocol = share_server_protocol or (
+    "http" if share_server_address is not None else "https"
+)
+self.share_server_tls_certificate = share_server_tls_certificate
+```
+
+**代码可见行为**：
+- `self.share_server_address` 保存的是函数参数 `share_server_address` 的原始值，不含环境变量的影响
+- `share_server_protocol` 的默认值判断**只看**函数参数 `share_server_address` 是否为 None
+- `self.share_server_tls_certificate` 保存的是函数参数 `share_server_tls_certificate` 的原始值
+
+> **代码事实**，见 [blocks.py#L3122-L3132](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L3122-L3132)
+
+```python
+share_url = networking.setup_tunnel(
+    local_host=self.server_name,
+    local_port=self.server_port,
+    share_token=self.share_token,
+    share_server_address=self.share_server_address,      # 原始参数值
+    share_server_tls_certificate=self.share_server_tls_certificate,  # 原始参数值
+)
+parsed_url = urlparse(share_url)
+self.share_url = urlunparse(
+    (self.share_server_protocol,) + parsed_url[1:]       # 用 blocks.py 层面判断的协议
+)
+```
+
+### 7.4 路径 B（环境变量）的实际效果示例
+
+假设：环境变量 `GRADIO_SHARE_SERVER_ADDRESS=custom.frp.io:7000`，用户未显式传任何 share_* 参数。
+
+**流程推演（基于代码逻辑）**：
+
+```
+1. blocks.py launch()
+   share_server_address 参数 = None
+   share_server_protocol = None or ("http" if None is not None else "https")
+                        = "https"          ← 判断为官方服务器，默认 https
+   share_server_tls_certificate = None
+   self.share_server_address = None      ← 保持 None
+
+2. networking.py setup_tunnel(share_server_address=None, ...)
+   share_server_address = GRADIO_SHARE_SERVER_ADDRESS if None else None
+                        = "custom.frp.io:7000"   ← 环境变量注入，blocks.py 无感知
+   
+   share_server_address is not None → 进入自定义分支
+   remote_host = "custom.frp.io"
+   remote_port = 7000
+   share_server_tls_certificate 保持 None（不请求 API，不获取证书）
+
+3. tunneling.py Tunnel(share_server_tls_certificate=None, ...)
+   share_server_tls_certificate is None → 不追加 --tls_enable 参数
+   frpc 启动时无 TLS
+
+4. blocks.py URL 改写
+   frpc 返回 "http://abc.custom.frp.io"
+   share_server_protocol = "https" （来自步骤 1）
+   最终 share_url = "https://abc.custom.frp.io"
+   ↑ 如果自定义服务器没有配置 TLS，此链接将无法访问
+```
+
+### 7.5 路径 C（显式传参）的实际效果示例
+
+假设：用户 `launch(share_server_address="custom.frp.io:7000")`，未设环境变量。
+
+```
+1. blocks.py launch()
+   share_server_address 参数 = "custom.frp.io:7000"
+   share_server_protocol = None or ("http" if "custom.frp.io:7000" is not None else "https")
+                        = "http"          ← 判断为自定义服务器，默认 http
+   share_server_tls_certificate = None
+   self.share_server_address = "custom.frp.io:7000"
+
+2. networking.py setup_tunnel(share_server_address="custom.frp.io:7000", ...)
+   显式传参不为 None，不使用环境变量
+   进入自定义分支
+   share_server_tls_certificate 保持 None
+
+3. tunneling.py
+   无 TLS 参数（证书为 None）
+
+4. blocks.py URL 改写
+   frpc 返回 "http://abc.custom.frp.io"
+   share_server_protocol = "http"
+   最终 share_url = "http://abc.custom.frp.io"
+   ↑ 与 frpc 返回一致，通常可以访问
+```
+
+### 7.6 差异总结
+
+**路径 B（环境变量）与路径 C（显式传参）的核心差异**：
+
+| 差异点 | 路径 B：环境变量 | 路径 C：显式传参 |
+|--------|---------------|---------------|
+| `blocks.py` 是否感知自定义服务器 | ❌ 否，`self.share_server_address` 仍为 None | ✅ 是，`self.share_server_address` 保存了参数值 |
+| 默认协议 | `https`（与官方服务器一致） | `http`（保守默认） |
+| 协议与实际服务器的匹配度 | ⚠️ 可能不匹配（用户自定义服务器可能无 TLS） | ✅ 通常匹配（http 总能访问） |
+| 是否需要额外传 `share_server_protocol="http"` | 需要，否则最终链接可能是 https 但服务器无 TLS | 不需要，默认即为 http |
+| `share_server_tls_certificate` 处理 | 均为 None，两条路径一致 | 均为 None，两条路径一致 |
+| frpc 是否启用 TLS | 均不启用，两条路径一致 | 均不启用，两条路径一致 |
+
+---
+
+## 八、frpc 二进制下载的代码事实
+
+### 8.1 下载与校验
 
 > **代码事实**，见 [tunneling.py#L83-L110](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L83-L110)
 
@@ -375,55 +559,80 @@ else:
 
 ---
 
-## 八、三者关系的数据流总结
+## 九、三者关系的数据流总结
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                       代码事实（本仓库可见）                          │
-├──────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  share_token                                                         │
-│  生成: secrets.token_urlsafe(32)  [blocks.py:143]                   │
-│  传递: frpc -n <share_token>      [tunneling.py:128-129]            │
-│                                                                      │
-│         ↓ frpc 子进程内部（黑箱，代码不可见）                        │
-│                                                                      │
-│  frpc stdout 输出                                                    │
-│  可见模式1: "login to server failed"   [tunneling.py:190]           │
-│  可见模式2: "start proxy success: http://xxx.gradio.live"            │
-│             [tunneling.py:184-189]                                   │
-│                                                                      │
-│         ↓ Python 代码处理                                            │
-│                                                                      │
-│  地址提取: 正则 "start proxy success: (.+)\n" → url                 │
-│            [tunneling.py:185-189]                                    │
-│                                                                      │
-│  协议改写: urlparse + urlunparse                                    │
-│            scheme 替换为 share_server_protocol                       │
-│            [blocks.py:3129-3132]                                    │
-│                                                                      │
-│  最终 URL: https://xxx.gradio.live（官方服务器）                     │
-│           http://xxx:port（自定义服务器）                             │
-│                                                                      │
-├──────────────────────────────────────────────────────────────────────┤
-│                       FRP 语义推断（本仓库不可见）                    │
-├──────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  frpc 内部行为:                                                      │
-│  - TCP 连接到 server_addr                                            │
-│  - TLS 握手（如果 --tls_enable）                                     │
-│  - 登录认证（"login to server failed" 证实此阶段存在）               │
-│  - 代理注册（-n 指定名称，--uc/--sd random 请求子域名）              │
-│  - 服务端分配子域名并返回完整 URL                                    │
-│                                                                      │
-│  上述步骤的具体协议和报文格式在 Go 代码中，Python 代码不可见         │
-│                                                                      │
-└──────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                          代码事实（本仓库可见）                                         │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                        │
+│  服务器选择                                                                            │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐     │
+│  │ 优先级 1: launch(share_server_address="host:port")                            │     │
+│  │   → blocks.py self.share_server_address = "host:port"                       │     │
+│  │   → share_server_protocol 默认 "http"                                       │     │
+│  │                                                                              │     │
+│  │ 优先级 2: 环境变量 GRADIO_SHARE_SERVER_ADDRESS                               │     │
+│  │   → blocks.py self.share_server_address = None  (⚠️ 无感知)                  │     │
+│  │   → share_server_protocol 默认 "https" (⚠️ 错判为官方服务器)                   │     │
+│  │   → networking.py 内部覆盖为环境变量值                                        │     │
+│  │                                                                              │     │
+│  │ 优先级 3: 官方 API 动态发现                                                   │     │
+│  │   → blocks.py self.share_server_address = None                               │     │
+│  │   → share_server_protocol 默认 "https"                                       │     │
+│  │   → networking.py 请求 api.gradio.app 获取 host/port/ca                       │     │
+│  │   → 自动注入 TLS 证书                                                        │     │
+│  └──────────────────────────────────────────────────────────────────────────────┘     │
+│                                                                                        │
+│  share_token                                                                           │
+│  生成: secrets.token_urlsafe(32)  [blocks.py:143]                                     │
+│  传递: frpc -n <share_token>      [tunneling.py:128-129]                              │
+│                                                                                        │
+│         ↓ frpc 子进程内部（黑箱，代码不可见）                                          │
+│                                                                                        │
+│  frpc stdout 输出                                                                      │
+│  可见模式1: "login to server failed"   [tunneling.py:190]                             │
+│  可见模式2: "start proxy success: http://xxx.gradio.live"                              │
+│             [tunneling.py:184-189]                                                     │
+│                                                                                        │
+│         ↓ Python 代码处理                                                              │
+│                                                                                        │
+│  地址提取: 正则 "start proxy success: (.+)\n" → url                                   │
+│            [tunneling.py:185-189]                                                      │
+│                                                                                        │
+│  协议改写: urlparse + urlunparse                                                      │
+│            scheme 替换为 share_server_protocol                                         │
+│            [blocks.py:3129-3132]                                                      │
+│                                                                                        │
+│  最终 URL:                                                                             │
+│    优先级3 (官方):       https://xxx.gradio.live                                       │
+│    优先级2 (环境变量):   https://xxx.custom.io   (⚠️ 可能无TLS, 需手动指定http)         │
+│    优先级1 (显式传参):  http://xxx.custom.io    (默认为http, 匹配实际)                  │
+│                                                                                        │
+│  证书/TLS:                                                                             │
+│    优先级3 (官方):       ✅ 有证书，启用 --tls_enable                                   │
+│    优先级2 (环境变量):   ❌ 无证书，不启用 TLS  (⚠️)                                    │
+│    优先级1 (显式传参):  ❌ 无证书，不启用 TLS                                           │
+│                                                                                        │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│                          FRP 语义推断（本仓库不可见）                                   │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                        │
+│  frpc 内部行为:                                                                        │
+│  - TCP 连接到 server_addr                                                              │
+│  - TLS 握手（如果 --tls_enable）                                                       │
+│  - 登录认证（"login to server failed" 证实此阶段存在）                                 │
+│  - 代理注册（-n 指定名称，--uc/--sd random 请求子域名）                                │
+│  - 服务端分配子域名并返回完整 URL                                                      │
+│                                                                                        │
+│  上述步骤的具体协议和报文格式在 Go 代码中，Python 代码不可见                           │
+│                                                                                        │
+└────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 九、完整流程时序图（区分代码事实与推断）
+## 十、完整流程时序图（区分代码事实与推断）
 
 ```
 用户/Python代码                          frpc子进程                   外部服务
@@ -474,7 +683,7 @@ else:
 
 ---
 
-## 十、关键边界总结
+## 十一、关键边界总结
 
 | 行为 | 代码是否可见 | 证据来源 |
 |------|-------------|---------|
@@ -491,7 +700,13 @@ else:
 | 服务端返回地址格式为 `http://...` | ⚠️ 间接推断 | `urlparse`+`urlunparse` 改写逻辑要求此格式 |
 | 子域名由服务端生成 | ⚠️ 间接推断 | Python 代码不生成子域名，只能从 frpc 输出获取 |
 | URL 协议改写逻辑 | ✅ 可见 | [blocks.py#L3129-L3132](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L3129-L3132) |
-| `share_server_protocol` 默认值逻辑 | ✅ 可见 | [blocks.py#L2966-L2968](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L2966-L2968) |
+| `share_server_protocol` 默认值逻辑（基于传参判断） | ✅ 可见 | [blocks.py#L2966-L2968](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L2966-L2968) |
 | API 服务器返回 host/port/root_ca | ✅ 可见 | [networking.py#L37-L40](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L37-L40) |
+| `GRADIO_SHARE_SERVER_ADDRESS` 环境变量在 networking.py 读取 | ✅ 可见 | [networking.py#L20](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L20-L20) |
+| 环境变量覆盖发生在 setup_tunnel() 函数内部 | ✅ 可见 | [networking.py#L30-L34](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L30-L34) |
+| blocks.py 不感知环境变量的存在（协议判断仍用传参值） | ✅ 可见 | [blocks.py#L2965-L2969](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L2965-L2969) |
+| 显式传参优先级高于环境变量 | ✅ 可见 | [networking.py#L30-L34](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L30-L34) |
+| 自定义服务器路径（环境变量或显式传参）不获取证书 | ✅ 可见 | [networking.py#L55-L57](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L55-L57) |
+| 环境变量路径下默认协议为 https 但无 TLS 证书 | ✅ 可见 | 综合 [blocks.py#L2966-L2968](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L2966-L2968) 与 [networking.py#L55-L57](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L55-L57) |
 
 图例：✅ 直接可见 | ⚠️ 间接推断（基于代码逻辑的必要前提） | ❌ 完全不可见
