@@ -610,9 +610,9 @@ export function apply_diff_stream(pending_diff_streams, event_id, data): void {
 
 ---
 
-## 九、核心修正点总结
+## 九、核心修正点总结（累计）
 
-针对之前理解的偏差，这里明确纠正：
+针对多轮理解的偏差，这里全部明确纠正：
 
 | 问题 | 之前误解 | 实际代码 |
 |------|----------|----------|
@@ -621,86 +621,106 @@ export function apply_diff_stream(pending_diff_streams, event_id, data): void {
 | **后端 diff 状态** | 只有前端存 diff 累积 | 后端也有 `pending_diff_streams[session_hash][run]` 存上一份全量 |
 | **前端两层职责** | `onmessage` 里做业务处理 | `open_stream.onmessage` 只做**分发**，**业务处理全部在 submit 的 callback 里** |
 | **最后一次数据** | 最后一次也是 diff | `final=True` 时后端返回**全量数据**（`data[i] = last_diffs[i]`） |
-| **SSE 单连接复用** | 每个事件一条 SSE 连接 | sse_v2+ 协议：**所有事件共享一条 `/queue/data` 连接**，靠 `event_id` 多路分发 |
+| **旧版 SSE 入口** | 先 POST `/queue/join` 再连 SSE | `protocol === "sse"` 时**直接连 `/queue/data?fn_index=X&session_hash=Y`**，跳过 `/queue/join` |
+| **`SSE_URL` 常量含义** | 名字即含义 | **命名反直觉**：`SSE_URL = "queue/data"`（流），`SSE_DATA_URL = "queue/join"`（入队） |
+| **`/call/v2` vs `/call`** | 同一入口 | `/call/v2` 接收 `dict[str, Any]`（命名参数），`/call` 接收 `list[Any]`（位置参数），都注入 `simple_format=True` |
+| **`GET /call/{api}/{event_id}` key** | 用 session_hash 查队列 | 外部 API 不传 session_hash → `event.session_hash = event._id`，所以用 event_id 作为队列 key |
+| **`POST /queue/data` 后端路由** | 存在对应路由 | 前端有调用但后端 routes.py 中**无此 POST 路由**，为历史遗留代码 |
+| **iterator 取消防护** | 仅靠删除字典 | `App.iterators_to_reset` 黑名单 + `restore_session_state` 入口检查，双重防护防竞态 |
+| **`/reset` 路由功能** | 实际重置 iterator | **空操作**，所有清理逻辑已移到 `/cancel`，保留仅为兼容 |
 
 ---
 
-## 十、边界点 1：`/call` vs `/queue/join` —— `simple_format` 与 diff 处理差异
+## 十、边界点 1：所有 API 入口与 `simple_format` / diff 处理对应关系
 
-### 10.1 两条入口的定位
+### 10.1 后端路由完整清单
 
-| 路由 | 所在函数 | 调用方 | 主要用途 |
-|------|----------|--------|----------|
-| `POST /queue/join` | [routes.py#L1357-L1368](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/routes.py#L1357-L1368) `queue_join` | Gradio 前端 UI（内部） | Web 界面触发事件 |
-| `POST /call/{api_name}` | [routes.py#L1342-L1355](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/routes.py#L1342-L1355) `simple_predict_post` | 外部 Python/JS API 客户端 | Gradio Client SDK / curl 调用 |
-| `POST /call/{api_name}/{event_id}` | [routes.py#L1319-L1340](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/routes.py#L1319-L1340) `simple_predict_post`（带 body） | 同上 | 同上（query 参数方式） |
+后端 routes.py 中共有 **6 个** 与 SSE / 事件触发相关的入口，按职责分为三类：
 
-**两条路径最终都会进入同一个 `queue_join_helper`**，区别只在构造 `PredictBody` 时是否带 `simple_format=True`。
+#### 类别 A：入队请求（POST）—— 创建 Event 对象并入队
 
-### 10.2 `simple_format` 的源头注入
+| 路由 | 所在函数 | 调用方 | `simple_format` | 说明 |
+|------|----------|--------|----------------|------|
+| `POST /queue/join` | [routes.py#L1357-L1368](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/routes.py#L1357-L1368) `queue_join` | Gradio 前端 UI（内部） | **False**（默认） | 前端 Web 界面触发事件，body 是完整 `PredictBody`，必须带 `session_hash` |
+| `POST /call/{api_name}` | [routes.py#L1342-L1355](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/routes.py#L1342-L1355) `simple_predict_post` | 外部 API 客户端（Gradio Client SDK / curl） | **True**（显式注入） | body 是 `SimplePredictBody(data: list[Any], session_hash: str \| None)`，按**位置参数**传参 |
+| `POST /call/v2/{api_name}` | [routes.py#L1318-L1340](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/routes.py#L1318-L1340) 匿名函数 | 同上（v2 协议） | **True**（显式注入） | body 是 `dict[str, Any]`，按**命名参数**传参，内部通过 `client_utils.construct_args()` 转成位置参数 |
 
+**所有三条入队路由最终都会进入同一个 `queue_join_helper`**，返回 `{"event_id": "..."}`。
+
+---
+
+#### 类别 B：SSE 接收端点（GET）—— 流式接收事件消息
+
+| 路由 | 所在函数 | 调用方 | 说明 |
+|------|----------|--------|------|
+| `GET /queue/data` | [routes.py#L1463-L1471](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/routes.py#L1463-L1471) `queue_data` | Gradio 前端 UI（内部） | query 参数 `session_hash`，从 `pending_messages_per_session[session_hash]` 取消息，**输出完整 JSON** |
+| `GET /call/{api_name}/{event_id}` | [routes.py#L1434-L1461](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/routes.py#L1434-L1461) `simple_predict_get` | 外部 API 客户端 | path 参数 `event_id`，**把 event_id 当作 session_hash 用**，从 `pending_messages_per_session[event_id]` 取消息，输出简化的 `event: ...\ndata: ...\n\n` 格式 |
+| `GET /call/v2/{api_name}/{event_id}` | 同上（共享同个装饰器） | 同上 | 与上面完全相同，只是多了 v2 路径别名 |
+
+**关键：`GET /call/{api}/{event_id}` 的 `event_id` 重用为 `session_hash`**
+
+[queueing.py#L63](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/queueing.py#L63) 中 Event 的 `session_hash` 有一个 fallback 逻辑：
 ```python
-# routes.py L1350 —— /call/{api_name}
-full_body = PredictBody(**body.model_dump(), simple_format=True)
-
-# routes.py L1357 —— /queue/join （前端内部）
-# PredictBody 本身有 simple_format: bool = False 默认值
-# 前端不传，所以 simple_format=False
+class Event:
+    def __init__(self, session_hash: str | None, ...):
+        self._id = uuid.uuid4().hex
+        self.session_hash: str = session_hash or self._id   # ★ 关键！
 ```
 
-### 10.3 `simple_format` 影响的两处代码
+这意味着：
+- 前端 UI 调用 `/queue/join`：传了 `session_hash` → `event.session_hash = 传入值`
+- 外部 API 调用 `/call/{api_name}`：**没传 `session_hash`** → `event.session_hash = event._id`（即 event_id）
+- 所以外部 API 后续调用 `GET /call/{api}/{event_id}` 时，把 `event_id` 传给 `queue_data_helper` 的 `session_hash` 参数，就能精确匹配到 `pending_messages_per_session[event_id]` 这个独立队列
 
-#### 位置 A：`blocks.handle_streaming_diffs` —— 决定是否做 diff
+---
 
-[blocks.py#L2140-L2172](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/blocks.py#L2140-L2172)
+#### 类别 C：取消端点
 
-```python
-def handle_streaming_diffs(self, block_fn, data, session_hash, run, final, simple_format=False):
-    ...
-    for i in range(len(block_fn.outputs)):
-        ...
-        else:
-            prev_chunk = last_diffs[i]
-            last_diffs[i] = data[i]
-            if not simple_format:           # ★★★ 关键判断 ★★★
-                data[i] = utils.diff(prev_chunk, data[i])   # 只有 False 才做 diff
-```
+| 路由 | 说明 |
+|------|------|
+| `POST /cancel` | 取消指定 event_id 的执行，清理 iterator（见第十一章） |
+| `POST /reset` | 空操作（兼容遗留代码，所有逻辑已移到 `/cancel`） |
 
-#### 位置 B：`blocks.process_api` —— 把 simple_format 传下去
+---
 
-[blocks.py#L2305-L2323](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/blocks.py#L2305-L2323)
+### 10.2 `simple_format` 的源头注入与传递链路
+
+#### 源头注入（routes.py）
 
 ```python
-data = self.handle_streaming_diffs(
-    block_fn, data, session_hash=session_hash, run=run,
-    final=not is_generating,
-    simple_format=simple_format    # ★ 从 call_process_api 一路透传
-)
+# /call/{api_name} 和 /call/v2/{api_name} —— 注入 simple_format=True
+full_body = PredictBody(**body.model_dump(), simple_format=True)   # routes.py L1335 / L1350
+
+# /queue/join —— PredictBody 本身 simple_format: bool = False 默认值
+# 前端不传，所以 simple_format=False                                 (data_classes.py L97)
 ```
 
-#### 位置 C：`route_utils.call_process_api` —— 从 body 取 simple_format
+#### 传递链路
 
-[route_utils.py#L386-L398](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/route_utils.py#L386-L398)
-
-```python
-output = await app.get_blocks().process_api(
-    ...
-    simple_format=body.simple_format,   # ★ 从 PredictBody.simple_format 取
-    ...
-)
+```
+入队路由 (routes.py)
+    ↓ 构造 PredictBody(simple_format=X)
+queue_join_helper → Queue.push(event)
+    ↓ event 入队等待
+Queue.process_events → call_process_api(body, ...)
+    ↓ body.simple_format 一路透传
+route_utils.call_process_api
+    ↓ [route_utils.py L390]
+blocks.process_api(simple_format=body.simple_format, ...)
+    ↓ [blocks.py L2321]
+blocks.handle_streaming_diffs(..., simple_format=simple_format)
+    ↓ [blocks.py L2165]
+    if not simple_format:
+        data[i] = utils.diff(prev_chunk, data[i])   # 只有 False 才做 diff
 ```
 
-### 10.4 两条入口的 diff 行为对比表
+### 10.3 入口与 `simple_format`、diff、接收端的完整对应矩阵
 
-| 维度 | `/queue/join`（前端内部） | `/call/{api_name}`（外部 API） |
-|------|--------------------------|-------------------------------|
-| `simple_format` 值 | `False`（默认） | `True`（显式注入） |
-| 第 1 次生成 | 全量数据 | 全量数据 |
-| 中间 N 次生成 | **diff 数据**（`utils.diff()` 计算） | **全量数据**（不做 diff，直接发） |
-| 最后 1 次（final） | 全量数据 | 全量数据 |
-| 前端是否需要 `apply_diff_stream` | ✅ 需要（sse_v2/v3 才启用） | ❌ 不需要 |
-| 典型 payload 大小 | LLM 输出每个 chunk 几字节 | 每次发完整字符串（可能几十 KB） |
-| SSE 接收端 | 前端 `/queue/data`（完整 JSON） | 外部 API `/call/{api}/{event_id}`（简化 `event:`+`data:` 格式） |
+| 入队入口 | `simple_format` | 中间 N 次生成 | SSE 接收端 | 前端协议 | 是否 `apply_diff_stream` |
+|----------|----------------|-------------|------------|----------|-------------------------|
+| `POST /queue/join`（前端内部） | **False** | **diff 数据** | `GET /queue/data`（完整 JSON） | sse_v2/v3 | ✅ 需要（sse_v2+ 才启用） |
+| `POST /call/{api_name}`（外部 API） | **True** | **全量数据**（不做 diff） | `GET /call/{api}/{event_id}`（简化格式） | — | ❌ 不需要 |
+| `POST /call/v2/{api_name}`（外部 API v2） | **True** | **全量数据**（不做 diff） | `GET /call/v2/{api}/{event_id}`（同上） | — | ❌ 不需要 |
 
 > **设计意图**：外部 API 的消费方（curl、第三方 SDK）通常不具备 diff 合并能力，所以直接发全量，牺牲带宽换兼容性；前端内部 UI 对延迟敏感，走 diff 压缩。
 
@@ -840,9 +860,24 @@ def restore_session_state(app: App, body: PredictBodyInternal):
 
 ---
 
-## 十二、边界点 3：旧版 SSE 与 SSE_v1/v2/v3 前端接收路径分支
+## 十二、边界点 3：前端协议分支（sse / sse_v1 / sse_v2 / sse_v3）完整对比
 
-### 12.1 分支入口
+### 12.1 容易搞混的常量命名
+
+先明确常量定义（[constants.ts#L4-L7](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/constants.ts#L4-L7)）：
+
+| 常量名 | 值 | 用途 | 备注 |
+|--------|----|------|------|
+| `SSE_URL` | `"queue/data"` | 新版 SSE 流的 GET endpoint | **名字和实际用途相反**：SSE_URL 是数据流 URL |
+| `SSE_DATA_URL` | `"queue/join"` | 新版入队的 POST endpoint | **名字和实际用途相反**：SSE_DATA_URL 是入队 URL |
+| `SSE_URL_V0` | `"queue/join"` | 旧版（历史遗留） | 已不用 |
+| `SSE_DATA_URL_V0` | `"queue/data"` | 旧版（历史遗留） | 已不用 |
+
+> **注意**：`SSE_URL` 和 `SSE_DATA_URL` 的命名非常反直觉。记住：
+> - `POST SSE_DATA_URL` → 入队 (`/queue/join`)
+> - `GET SSE_URL` → 收流 (`/queue/data`)
+
+### 12.2 分支入口
 
 所有分支都在 [submit.ts#L77-L79](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/submit.ts#L77-L79) 进入，基于 `config.protocol` 判断：
 
@@ -851,44 +886,62 @@ let protocol = config.protocol ?? "ws";
 if (protocol === "ws") {
     throw new Error("WebSocket protocol is not supported in this version");
 }
-// 之后三个 if/else if 分支：sse / sse_v1 / sse_v2~sse_v3
+// 之后两个大分支：sse / sse_v1~sse_v3
 ```
 
 后端 `config.protocol` 由 [blocks.py#L2404](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/blocks.py#L2404) 写死：`"protocol": "sse_v3"`（当前版本默认 sse_v3）。
 
-### 12.2 三条路径完整对比
+---
 
-#### 路径 A：`protocol === "sse"` —— 第一代 SSE（单事件单连接）
+### 12.3 路径 A：`protocol === "sse"` —— 第一代 SSE（单事件单连接，跳过 `/queue/join`）
 
 **位置**：[submit.ts#L266-L394](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/submit.ts#L266-L394)
 
+#### 关键修正：旧版 SSE **不经过** `/queue/join`
+
+```
+流程（实际代码）：
+  1. 直接构造 EventSource 连接：
+     url = `/queue/data?fn_index=X&session_hash=Y`   ← ★ 没有 POST /queue/join！
+     stream = this.stream(url)                        (submit.ts L279-L289)
+
+  2. stream.onmessage 内联处理所有逻辑（没有全局分发层）：
+     JSON.parse(event.data)
+       → handle_message() → {type, status, data}
+       → fire_event(status/data/log)                  (submit.ts L297-L392)
+
+  3. 特殊流程：当 type === "data" 时：
+     POST /queue/data {session_hash, event_id, ...}    (submit.ts L318-L325)
+     ↑ 注：后端 routes.py 中无此 POST 路由，为历史遗留
+
+  4. complete/error 时：
+     stream.close() → 关闭本 EventSource              (submit.ts L314 / L390)
+```
+
+**核心特点**：
+- ✅ **不经过 POST `/queue/join`**，直接 `new EventSource('/queue/data?fn_index=X&session_hash=Y')`
+- ❌ 每个事件一条独立 SSE 连接（并发事件会开多个 EventSource）
+- ❌ 没有全局流分发层，`onmessage` 内直接做 `handle_message` + `fire_event`
+- ❌ 没有 `apply_diff_stream`（sse 协议不支持 diff）
+- ❌ 代码中存在 `POST /queue/data` 调用（L318），但后端无对应路由，为历史遗留
+
+---
+
+### 12.4 路径 B：`protocol === "sse_v1"` —— 过渡协议
+
+**位置**：和 sse_v2/v3 走同一块 [submit.ts#L395-L631](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/submit.ts#L395-L631) 的分支入口。
+
 ```
 流程：
-  POST /queue/join {fn_index, session_hash}
-       ↓
-  直接为本次 submit 创建独立 EventSource:
-    stream = this.stream(`/queue/data?fn_index=X&session_hash=Y`)
-       ↓
-  stream.onmessage 内联处理所有逻辑：
-    JSON.parse → handle_message → fire_event(status/data/log)
-       ↓
-  type==="data" 时：再次 POST /queue/data 拉取实际 payload
-       ↓
-  complete 时：stream.close() 关闭本 EventSource
+  1. POST /queue/join → 拿 event_id                    (submit.ts L430-L440)
+  2. 注册 event_callbacks[event_id] = callback
+  3. 若 stream_status.open === false → open_stream() 建立全局 SSE
+  4. stream.onmessage（stream.ts 中）只做 JSON.parse + 按 event_id 分发
+  5. callback 里做 handle_message + fire_event
 ```
 
-**特点**：
-- ❌ 每个事件一条 SSE 连接（并发事件会开多个 EventSource）
-- ❌ 没有全局流分发层，`onmessage` 内直接做 `handle_message` 和 `fire_event`
-- ❌ 没有 `apply_diff_stream`（sse 协议不支持 diff）
-- ❌ type==="data" 时需要**额外 POST 请求**拿真正的 payload，SSE 只发了个通知
-
-#### 路径 B：`protocol === "sse_v1"` —— 过渡协议
-
-**位置**：和 sse_v2/v3 走同一块 [submit.ts#L395-L631](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/submit.ts#L395-L631) 的分支入口，但 apply_diff_stream 条件不包含 v1：
-
+**关键差异**：`apply_diff_stream` 条件不包含 v1（[submit.ts#L551-L557](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/submit.ts#L551-L557)）：
 ```typescript
-// submit.ts L551-L557
 if (
     data &&
     dependency.connection !== "stream" &&
@@ -899,16 +952,19 @@ if (
 ```
 
 **特点**：
-- ✅ 用全局单连接 + `event_callbacks` 分发
+- ✅ 用全局单连接 + `event_callbacks` 分发（和 sse_v2+ 一样）
+- ✅ 经过 POST `/queue/join`
 - ❌ 不做 diff，每次都是全量数据
 
-#### 路径 C：`protocol === "sse_v2" | "sse_v2.1" | "sse_v3"` —— 当前主流协议
+---
+
+### 12.5 路径 C：`protocol === "sse_v2" | "sse_v2.1" | "sse_v3"` —— 当前主流协议
 
 **位置**：[submit.ts#L395-L631](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/submit.ts#L395-L631)
 
 ```
 流程：
-  1. POST /queue/join → 拿 event_id
+  1. POST /queue/join → 拿 event_id                    (submit.ts L430-L440)
   2. 注册 event_callbacks[event_id] = callback
   3. 若 stream_status.open === false → open_stream() 建立全局 SSE
   4. stream.onmessage（stream.ts 中）只做 JSON.parse + 按 event_id 分发
@@ -916,46 +972,52 @@ if (
 ```
 
 **特点**：
+- ✅ 经过 POST `/queue/join`
 - ✅ 所有事件共享一条 `/queue/data` 连接（`event_callbacks` 多路复用）
-- ✅ `onmessage` 和 `callback` 职责严格分离（见第六章）
+- ✅ `onmessage`（分发层）和 `callback`（业务层）职责严格分离（见第六章）
 - ✅ 中间 chunk 走 diff 压缩，`apply_diff_stream` 前端合并
-- ✅ v3 独有：**只有后端发 `close_stream` 才关闭全局流**（v2 可能在事件结束时关）
+- ✅ v3 独有：**只有后端发 `close_stream` 才关闭全局流**（v2/v2.1 可能在事件结束时关）
 
-### 12.3 各协议特性矩阵
+---
+
+### 12.6 四协议完整特性对比矩阵
 
 | 特性 | sse (v0) | sse_v1 | sse_v2/v2.1 | sse_v3 |
 |------|----------|--------|-------------|--------|
-| 独立 EventSource/事件 | ✅ 每个事件一条 | ❌ 共享连接 | ❌ 共享连接 | ❌ 共享连接 |
-| event_callbacks 分发 | ❌ 内联处理 | ✅ | ✅ | ✅ |
-| SSE onmessage 职责 | JSON + handle_message + fire_event | JSON parse 分发 | JSON parse 分发 | JSON parse 分发 |
+| 经过 POST `/queue/join` | ❌ **不经过**，直接连 `/queue/data` | ✅ 经过 | ✅ 经过 | ✅ 经过 |
+| 连接模型 | 每事件一条独立 EventSource | 全局单连接共享 | 全局单连接共享 | 全局单连接共享 |
+| `event_callbacks` 分发 | ❌ 内联处理（没有分发层） | ✅ | ✅ | ✅ |
+| SSE onmessage 职责 | JSON.parse + handle_message + fire_event | 仅 JSON.parse + 分发 | 仅 JSON.parse + 分发 | 仅 JSON.parse + 分发 |
 | diff 压缩 | ❌ | ❌ | ✅ | ✅ |
-| type==="data" 额外 POST | ✅ 需要 | ❌ 不需要 | ❌ 不需要 | ❌ 不需要 |
-| 关闭流的时机 | 事件结束立即关 | 事件结束 | 事件结束 | 后端发 `close_stream` |
+| `type==="data"` 额外 POST | ✅ 代码存在（但后端无路由，遗留） | ❌ 不需要 | ❌ 不需要 | ❌ 不需要 |
+| 关闭流的时机 | 事件结束立即 `stream.close()` | 事件结束 | 事件结束 | 后端发 `close_stream` |
+| 典型使用场景 | 历史遗留（几乎不用） | 过渡版本 | 当前/近期版本 | 当前默认版本 |
 
-### 12.4 前端分支判断代码位置汇总
+### 12.7 前端分支判断代码位置汇总
 
 | 判断点 | 位置 | 含义 |
 |--------|------|------|
-| 协议总分支 | [submit.ts#L266](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/submit.ts#L266) `protocol == "sse"` | 进入旧版单连接路径 |
-| 新版协议总分支 | [submit.ts#L395-L399](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/submit.ts#L395-L399) `sse_v1 \|\| sse_v2 \|\| sse_v2.1 \|\| sse_v3` | 进入新版全局流路径 |
-| diff 启用判断 | [submit.ts#L551-L557](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/submit.ts#L551-L557) `["sse_v2", "sse_v2.1", "sse_v3"].includes(protocol)` | 是否调 `apply_diff_stream` |
-| close_stream 消息 | [stream.ts#L73-L76](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/stream.ts#L73-L76) | 仅 v3 会收到并触发全局关闭 |
+| 旧版协议分支 | [submit.ts#L266](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/submit.ts#L266) `protocol == "sse"` | 进入旧版单连接路径（跳过 `/queue/join`） |
+| 新版协议总分支 | [submit.ts#L395-L399](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/submit.ts#L395-L399) `sse_v1 \|\| sse_v2 \|\| sse_v2.1 \|\| sse_v3` | 进入新版全局流路径（先 POST `/queue/join`） |
+| diff 启用判断 | [submit.ts#L551-L557](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/submit.ts#L551-L557) `["sse_v2", "sse_v2.1", "sse_v3"].includes(protocol)` | 是否调用 `apply_diff_stream` 合并后端 diff |
+| `close_stream` 处理 | [stream.ts#L73-L76](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/stream.ts#L73-L76) | 仅 v3 会收到并触发全局流关闭 |
 
 ---
 
 ## 十三、涉及文件索引
 
 **后端（Python）：**
-- [queueing.py](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/queueing.py) — Queue 类、Event 生命周期、process_events 流式循环、clean_events、remove_from_queue
-- [routes.py](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/routes.py) — `/queue/join`、`/queue/data`、`/call/{api_name}`、`/cancel`、`/reset`、SSE StreamingResponse、App.iterators / App.iterators_to_reset
+- [queueing.py](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/queueing.py) — Queue 类、Event 类（`session_hash = session_hash or self._id` 关键 fallback）、process_events 流式循环、clean_events、remove_from_queue、send_message
+- [routes.py](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/routes.py) — 所有 API 入口：`/queue/join`、`/queue/data`、`/call/{api_name}`、`/call/v2/{api_name}`、`/call/{api}/{event_id}`、`/cancel`、`/reset`、`queue_data_helper` SSE 流式响应、App.iterators / App.iterators_to_reset
+- [data_classes.py](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/data_classes.py) — `PredictBody`（`simple_format: bool = False`）、`SimplePredictBody`、`SimplePredictBodyV2`、`CancelBody`、`ResetBody`
 - [server_messages.py](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/server_messages.py) — 所有 EventMessage 类型定义
-- [route_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/route_utils.py) — `call_process_api` 桥接层、`restore_session_state`（iterators_to_reset 检查）
-- [blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/blocks.py) — `process_api` 流程编排、`call_function` 生成器推进、`handle_streaming_diffs`（simple_format 控制）
+- [route_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/route_utils.py) — `call_process_api` 桥接层、`restore_session_state`（iterators_to_reset 黑名单检查）
+- [blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/blocks.py) — `process_api` 流程编排、`call_function` 生成器推进（`async_iteration` → `anext`）、`handle_streaming_diffs`（`simple_format` 控制是否做 diff）、`config.protocol = "sse_v3"`
 - [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/utils.py) — `diff()` 算法、`async_iteration()`、`safe_aclose_iterator()`
 
 **前端（TypeScript）：**
-- [client/js/src/utils/submit.ts](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/submit.ts) — submit() 主流程、sse/sse_v1/sse_v2~v3 协议分支、cancel()、callback 业务处理层
+- [client/js/src/utils/submit.ts](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/submit.ts) — submit() 主流程、**sse/sse_v1/sse_v2~v3 四大协议分支**、cancel()、callback 业务处理层、旧版 SSE 直接连 `/queue/data` 的逻辑
 - [client/js/src/utils/stream.ts](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/utils/stream.ts) — `open_stream` 全局分发层、`apply_diff_stream` 前端 diff 合并、`readable_stream`
 - [client/js/src/client.ts](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/client.ts) — Client 类、全局状态字段定义
 - [client/js/src/helpers/api_info.ts](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/helpers/api_info.ts) — `handle_message` 消息类型转换
-- [client/js/src/constants.ts](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/constants.ts) — `SSE_URL`、`SSE_DATA_URL`、`CANCEL_URL`、`RESET_URL`
+- [client/js/src/constants.ts](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/client/js/src/constants.ts) — **命名反直觉的常量**：`SSE_URL = "queue/data"`、`SSE_DATA_URL = "queue/join"`、`CANCEL_URL = "cancel"`、`RESET_URL = "reset"`
