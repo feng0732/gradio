@@ -502,8 +502,15 @@ root_url = (
 ```
 完整 URL root_path > x-forwarded-host + x-forwarded-proto > request.url
 root_path (相对) 会强制替换 path 部分
-custom_mount_path 仅在前两者都为空时作为 fallback
 ```
+
+> ⚠️ **验证标注**：`custom_mount_path` **并非** `get_root_url()` 的内部 fallback。
+> 它只在 `/` 和 `/config` 两个路由的**调用侧**以 `or` 链形式传入：
+> `root_path=app.root_path or request.scope.get("root_path") or blocks.custom_mount_path`
+> （[routes.py:616-618](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/routes.py#L616-L618)、[routes.py:961-963](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/routes.py#L961-L963)）。
+> 而 `/gradio_api/info` 等路由**只用 `app.root_path`**，不兜底 `custom_mount_path`
+> （[routes.py:730](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/routes.py#L730-L730)）。
+> 这意味着挂载子应用但未设 `root_path` 时，API 信息页中的示例 URL 可能缺少挂载前缀。
 
 ---
 
@@ -515,11 +522,16 @@ custom_mount_path 仅在前两者都为空时作为 fallback
 ```
 浏览器 → http://localhost:7860/demo
 
-各路由内 get_root_url() 解析：
+对 / 和 /config 路由（custom_mount_path 参与兜底）：
   root_path=""，x-forwarded-host=空，request.url = http://localhost:7860/demo/
-  → origin = http://localhost:7860
-  → root_path 相对为空，custom_mount_path="/demo" 补入
-  → 最终 root = "http://localhost:7860/demo"
+  → get_request_origin: origin = http://localhost:7860
+  → root_path 参数 = app.root_path(空) or scope.root_path(空) or custom_mount_path("/demo")
+  → get_root_url 内部：root_path="/demo" 替换 origin.path → root = "http://localhost:7860/demo"
+
+对 /gradio_api/info 路由（custom_mount_path 不参与）：
+  root_path 参数 = app.root_path(空)（无兜底）
+  → get_root_url 内部：root_path 为空，不做 path 替换
+  → root = "http://localhost:7860"（可能缺少 /demo 前缀）
 ```
 
 #### 场景 B：nginx 反代 + root_path 手动指定
@@ -542,11 +554,21 @@ FastAPI 主应用 localhost:8000
 
 浏览器访问 http://localhost:8000/tools/gradio
 
-各路由内 get_root_url() 解析：
-  ① root_path 为空
-  ② request.url = http://localhost:8000/tools/gradio/（FastAPI mount 已自动注入 root_path scope）
-  → request.scope["root_path"] = "/tools/gradio" 或 custom_mount_path 兜底
-  → 最终 root = "http://localhost:8000/tools/gradio"
+对 / 和 /config 路由：
+  FastAPI mount 会自动将 scope["root_path"] 设为 "/tools/gradio"
+  → root_path 参数 = app.root_path(空) or scope["root_path"]("/tools/gradio")
+  → custom_mount_path 无需兜底（scope.root_path 已经命中）
+  → root = "http://localhost:8000/tools/gradio"
+
+对 /gradio_api/info 路由：
+  root_path 参数 = app.root_path(空)（无兜底，无 scope["root_path"]）
+  → get_request_origin: request.url = http://localhost:8000/tools/gradio/gradio_api/info
+  → 截去 route_path 后 origin = http://localhost:8000
+  → root_path 为空，不做 path 替换
+  → root = "http://localhost:8000"（缺少 /tools/gradio 前缀）
+
+  ⚠️ 此场景下 /info 路由的示例代码 URL 不正确是已知行为，
+  需要用户显式设置 root_path="/tools/gradio" 来修正。
 ```
 
 ---
@@ -710,7 +732,7 @@ predict_body, _output = route_utils.call_process_api(
 浏览器请求
     │
     ├─ GET / (主页)
-    │   └─ get_root_url() → root
+    │   └─ get_root_url(app.root_path or scope.root_path or custom_mount_path) → root
     │       └─ update_root_in_config()
     │           ├─ config["root"] = root
     │           └─ add_root_url() → 所有文件 URL 拼接前缀
@@ -720,25 +742,30 @@ predict_body, _output = route_utils.call_process_api(
     │   └─ 同上流程 → JSON
     │
     ├─ GET /gradio_api/info
-    │   └─ get_root_url() → root
-    │       └─ generate_code_snippets(root) → 代码片段中的 URL 正确
+    │   └─ get_root_url(app.root_path 仅此，无兜底) → root
+    │       └─ generate_code_snippets(root) → 代码片段中的 URL
+    │           ⚠️ 若未设 root_path 且 custom_mount_path 有值，此处 root 可能缺前缀
     │
     ├─ POST /gradio_api/queue/join
     │   └─ 队列系统:
-    │       └─ get_root_url() → root_path
+    │       └─ get_root_url(app.root_path) → root_path
     │           └─ call_process_api(root_path)
     │               └─ add_root_url() → 输出文件 URL 拼接前缀
     │                   → SSE 返回给浏览器
     │
     └─ 所有 /gradio_api/file=... / /file=... 请求
-        → 路径本身就是相对路径，由浏览器自动基于 location.origin + config.root
-           解析为完整 URL，后端收到后无需再加前缀
+        → 浏览器基于 config.root 拼出完整 URL 发起请求
+           后端收到后路径本身已带 /gradio_api/file=... 前缀，无需再加
 ```
 
 > **核心设计洞察**：Gradio 采取「**后端算 root、后端拼 URL**」的策略，
-> 所有对外暴露的 URL（文件、代理、API 示例代码）都在后端一次性拼接完成，
-> 前端只负责消费，避免了前后端对前缀理解不一致的 bug。
+> 所有对外暴露的 URL（文件、代理、API 示例代码）都在后端一次性拼接完成。
 > `config["root"]` 是前后端的契约字段，前端基于它构造 API 请求的 base URL。
+>
+> 但这一策略存在**不一致**：`/` 和 `/config` 用 `or` 链兜底 `custom_mount_path`，
+> 而 `/gradio_api/info` 和队列系统只用 `app.root_path`。
+> 当 `mount_gradio_app(path="/demo")` 但未设 `root_path` 时，
+> 页面和 config 中的 URL 正确，但 API 文档页的示例 URL 会缺少前缀。
 
 ---
 
@@ -782,7 +809,7 @@ Python FastAPI (App) ── 端口 7860
 
 ---
 
-#### 拓扑 2：多进程资源分离（Static Workers）
+#### 拓扑 2：多进程资源分离（Static Workers，无 Node 代理）
 **条件**：`num_workers ≥ 1`，`ssr_mode=False`
 
 端口分配逻辑（[blocks.py:3004-3008](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/blocks.py#L3004-L3008)）：
@@ -793,13 +820,18 @@ Static Worker 2 端口 7862
 ...
 ```
 
-**⚠️ 重要发现**：在「无 Node 代理」的拓扑 2 下，
-StaticWorkerPool 进程**虽然存在并监听端口，但浏览器并不知道它们**。
-所有请求仍由 Python 主端口接收，`_static_prefixes` 元组虽然在 App 中声明
-（[routes.py:254-256](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/routes.py#L254-L256)），
-但在当前代码版本中**未被主服务使用来做重定向**。
+**⚠️ 关键发现：Worker 进程已启动但无流量入口**
 
-StaticWorkerPool 的价值在**拓扑 3** 中真正体现。
+经过代码逐项验证（详见[第十一章 11.1 节](#111-无-node-时-staticworkerpool-是否接收流量)），在无 Node 代理的拓扑 2 下：
+
+- ✅ Worker 进程确实通过 `multiprocessing.Process` + uvicorn 启动并监听端口
+- ✅ Python 主服务**没有任何代码**将请求重定向或代理到 Worker 端口
+- ✅ `StaticWorkerPool.get_next_url()` 在全库中**零调用点**
+- ✅ `App._static_prefixes` 仅声明未使用，`enable_static_workers` 函数**从未实现**
+
+**结论**：拓扑 2 下 StaticWorkerPool 是**已启动但闲置**的进程——正常使用流程中
+没有任何流量会到达 Worker 端口。Worker 的实际价值仅在拓扑 3（Node 代理）中体现，
+由 Node 侧的 `classifyRoute` 完成分流。
 
 ---
 
@@ -825,53 +857,90 @@ if static_worker_ports:
     env["GRADIO_STATIC_WORKER_PORTS"] = "7862,7863"   # Node 用逗号分隔的端口列表做 RR
 ```
 
-Node 作为七层反向代理，根据路径前缀分流：
+Node 作为七层反向代理，路由逻辑定义在 [proxy_routes.js](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_routes.js)，
+由 [proxy_index.js](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_index.js) 中的 `classifyRoute()` 函数调用。
+
+**`classifyRoute` 的三级分流规则**（可直接验证，[proxy_routes.js:83-116](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_routes.js#L83-L116)）：
+
+```
+① 匹配 STATIC_ROUTE_PREFIXES？
+   前缀列表（[proxy_routes.js:23-37](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_routes.js#L23-L37)）：
+     /gradio_api/upload, /gradio_api/upload_progress,
+     /gradio_api/file=, /gradio_api/file/,
+     /upload, /upload_progress, /file=, /file/,
+     /static/, /assets/, /svelte/, /favicon.ico, /custom_component/
+   ├─ hasWorkers=true  → route="worker"（轮询分发到 Static Worker）
+   └─ hasWorkers=false → route="python"（回退到 Python）
+
+② 匹配 PYTHON_ROUTE_PREFIXES？
+   前缀列表（[proxy_routes.js:8-18](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_routes.js#L8-L18)）：
+     /gradio_api, /config, /login, /logout,
+     /theme.css, /robots.txt, /pwa_icon, /manifest.json, /monitoring
+   → route="python"（转发到 Python 内部端口）
+
+③ 其余所有路径
+   → route="sveltekit"（Node 自身 SSR 渲染）
+```
+
+**⚠️ 重要修正**：STATIC_ROUTE_PREFIXES 的匹配优先于 PYTHON_ROUTE_PREFIXES。
+这意味着 `/gradio_api/upload` 和 `/gradio_api/file=` 虽然也以 `/gradio_api` 开头，
+但会被 STATIC 规则**先命中**，转发到 Worker 而非 Python。
+这与直觉不同——`/gradio_api` 前缀并不保证请求一定去 Python。
+
+**上传亲和性路由**（可直接验证，[proxy_routes.js:41-46](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_routes.js#L41-L46)）：
+
+对于 `/gradio_api/upload` 和 `/upload` 带有 `upload_id` 查询参数的请求，
+Node 使用 `hashString(upload_id) % numWorkers` 确定目标 Worker，
+保证同一上传的 upload + upload_progress 请求命中同一 Worker。
+
+**实际分流图**：
 
 ```
 浏览器 → Node (7860)
            │
-           ├─ /static/*  /assets/*  /svelte/*  /favicon.ico
-           │     └─ 轮询分发 → Static Worker 1 / 2 / ...
+           ├─ /static/*  /assets/*  /svelte/*  /favicon.ico  /custom_component/*
+           │     └─ 有 Workers → 轮询分发 → Static Worker N
+           │        无 Workers → 转发 → Python
            │
-           ├─ /gradio_api/file=*  /file=*
-           │     └─ 轮询分发 → Static Worker 1 / 2 / ...
-           │
-           ├─ /gradio_api/upload  /upload
-           │     └─ 轮询分发 → Static Worker 1 / 2 / ...
-           │
+           ├─ /gradio_api/upload  /upload  (带 upload_id → 亲和性哈希)
            ├─ /gradio_api/upload_progress  /upload_progress
-           │     └─ 轮询分发 → Static Worker 1 / 2 / ...
+           ├─ /gradio_api/file=*  /file=*
+           │     └─ 有 Workers → Static Worker N (轮询或亲和)
+           │        无 Workers → Python
            │
-           ├─ / (页面 HTML)
-           │     └─ Node 自身 SSR 渲染（不转发）
+           ├─ /gradio_api/*  /config  /login  /logout  /theme.css  ...
+           │     └─ 转发 → Python 内部端口 (7861)
            │
-           └─ 所有其他 /gradio_api/*
-                 POST /gradio_api/queue/join
-                 POST /gradio_api/call/*
-                 POST /gradio_api/run/*
-                 GET  /gradio_api/info
-                 GET  /config
-                 ...
-                   └─ 转发 → Python 内部端口 (7861)
+           └─ 其余路径（/ /{page} 等）
+                 └─ Node SvelteKit SSR 渲染
 ```
 
-**各路径归属（拓扑 3）**：
+**各路径归属（拓扑 3，有 Workers）**：
 
-| 请求路径 | 首次接收者 | 最终处理者 |
-|---------|-----------|-----------|
-| `GET /`（HTML） | **Node 自身** | Node SSR 引擎 |
-| `GET /config` | Node | Python (内部端口) |
-| `GET /static/*` | Node | **Static Worker N**（轮询） |
-| `GET /assets/*` | Node | **Static Worker N**（轮询） |
-| `GET /favicon.ico` | Node | **Static Worker N**（轮询） |
-| `POST /gradio_api/upload` | Node | **Static Worker N**（轮询，写文件） |
-| `GET /gradio_api/upload_progress` | Node | **Static Worker N**（轮询，SSE） |
-| `GET /gradio_api/file=*` | Node | **Static Worker N**（轮询，读文件） |
-| `POST /gradio_api/queue/join` | Node | Python（队列、SSE） |
-| `POST /gradio_api/call/*` | Node | Python（入队） |
-| `POST /gradio_api/run/*` | Node | Python（直接执行） |
-| `GET /gradio_api/info` | Node | Python（元数据） |
-| `GET /gradio_api/proxy=*` | Node | Python（反向代理） |
+| 请求路径 | classifyRoute 结果 | 最终处理者 |
+|---------|-------------------|-----------|
+| `GET /` `GET /{page}` | sveltekit | **Node SSR 引擎** |
+| `GET /config` | python | Python |
+| `GET /static/*` | worker | **Static Worker N**（轮询） |
+| `GET /assets/*` | worker | **Static Worker N**（轮询） |
+| `GET /svelte/*` | worker | **Static Worker N**（轮询） |
+| `GET /favicon.ico` | worker | **Static Worker N**（轮询） |
+| `GET /custom_component/*` | worker | **Static Worker N**（轮询） |
+| `POST /gradio_api/upload` | worker (带亲和性) | **Static Worker N**（upload_id 哈希） |
+| `GET /gradio_api/upload_progress` | worker (带亲和性) | **Static Worker N**（upload_id 哈希） |
+| `GET /gradio_api/file=*` | worker | **Static Worker N**（轮询） |
+| `POST /gradio_api/queue/join` | python | Python |
+| `POST /gradio_api/call/*` | python | Python |
+| `POST /gradio_api/run/*` | python | Python |
+| `GET /gradio_api/info` | python | Python |
+| `GET /gradio_api/proxy=*` | python | Python |
+| `GET /theme.css` | python | Python |
+| `GET /login` `GET /logout` | python | Python |
+
+> ⚠️ **无 Workers 时的回退**（拓扑 3 但 `num_workers=0`）：
+> `classifyRoute` 中 STATIC 匹配但 `hasWorkers=false` 时回退到 `route="python"`
+> （[proxy_routes.js:92-95](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_routes.js#L92-L95)），
+> 即所有 `/static/*`、`/file=`、`/upload` 等请求也由 Python 处理。
 
 **关键代码佐证**：Static Worker 的路由表在 [static_server.py:68-165](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/static_server.py#L68-L165)，
 完全对应上表中「由 Static Worker 处理」的路径。Python 主服务在拓扑 3 中
@@ -879,22 +948,33 @@ Node 作为七层反向代理，根据路径前缀分流：
 
 ---
 
-### 9.2 Static Worker 轮询分发机制
+### 9.2 Node 代理中的轮询分发机制
 
-**位置**：[static_server.py:229-233](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/static_server.py#L229-L233)
+Node 代理的实际分发代码在 [proxy_index.js:68-81](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_index.js#L68-L81)：
 
-```python
-def get_next_url(self) -> str:
-    """Round-robin to the next static worker."""
-    port = self.ports[self._counter % len(self.ports)]
-    self._counter += 1
-    return f"http://127.0.0.1:{port}"
+```javascript
+if (affinityIndex !== undefined) {
+    // 亲和性路由：upload_id 哈希到固定 Worker
+    targetPort = staticWorkerPorts[affinityIndex];
+} else {
+    // 普通轮询：递增计数器取模
+    targetPort = staticWorkerPorts[workerIndex % staticWorkerPorts.length];
+    workerIndex = (workerIndex + 1) % staticWorkerPorts.length;
+}
+proxy.web(req, res, { target: `http://${pythonHost}:${targetPort}` });
 ```
 
-在实际 Node 代理中，轮询由 Node 侧根据环境变量 `GRADIO_STATIC_WORKER_PORTS`
-实现（Node 代码由 `templates/node/build/` 中的 SSR 应用执行），而非通过
-`StaticWorkerPool.get_next_url()`。`get_next_url()` 预留用于非 Node 场景下
-的程序化调用。
+**两种分发策略**：
+
+| 策略 | 触发条件 | 算法 | 用途 |
+|------|---------|------|------|
+| 轮询（Round-Robin） | 普通静态路由（/static、/assets、/file= 等） | `workerIndex++ % N` | 均衡分发 |
+| 亲和性哈希 | 上传路由带 `upload_id` 查询参数 | `hashString(upload_id) % N` | 保证 upload + upload_progress 命中同一 Worker |
+
+**⚠️ Python 端的 `StaticWorkerPool.get_next_url()` 不参与实际分发**：
+该函数在 [static_server.py:229-233](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/static_server.py#L229-L233) 定义，
+但全库搜索**零调用点**。它是 Python 端预留的轮询接口，实际流量分发完全由
+Node 侧 `proxy_index.js` 完成。详见[第十一章 11.2 节](#112-node-代理如何选择-worker)。
 
 ---
 
@@ -963,3 +1043,176 @@ def get_next_url(self) -> str:
 | [route_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/route_utils.py) | `get_root_url()` / `get_request_origin()` / `update_root_in_config()` / 文件响应工具 |
 | [processing_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/processing_utils.py) | `add_root_url()` —— 递归给文件对象拼接公开前缀 |
 | [queueing.py](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/queueing.py) | 队列回调中同样调用 `get_root_url()` 给输出文件拼前缀 |
+| [proxy_index.js](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_index.js) | Node 代理入口，读取环境变量、调用 classifyRoute、执行轮询/亲和性分发 |
+| [proxy_routes.js](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_routes.js) | Node 代理分流规则定义：STATIC_ROUTE_PREFIXES / PYTHON_ROUTE_PREFIXES / classifyRoute |
+| [+page.server.ts](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/src/routes/[...catchall]/+page.server.ts) | SvelteKit SSR 服务端加载，从请求头提取 x-gradio-* 构造 root_url |
+| [+page.ts](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/src/routes/[...catchall]/+page.ts) | SvelteKit 客户端加载，用 root_url 调用 Client.connect |
+| [client.ts](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/client/js/src/client.ts) | @gradio/client 核心类，使用 config.root 拼接所有 API 请求 URL |
+| [init_helpers.ts](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/client/js/src/helpers/init_helpers.ts) | resolve_config：从 /config 接口获取配置，保留后端提供的 root |
+
+---
+
+## 十一、代码验证核对：逐条区分依据与推断
+
+> 本章对前文中的关键结论逐条标注验证状态，区分「代码直接可证」与「需要推断」的结论。
+
+### 11.1 无 Node 时 StaticWorkerPool 是否接收流量
+
+| 结论 | 验证状态 | 依据 |
+|------|---------|------|
+| Worker 进程会被启动并监听端口 | ✅ **直接可证** | [static_server.py:207-215](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/static_server.py#L207-L215) 中 `multiprocessing.Process(target=_run_static_worker, ...)` + 轮询 `/health` |
+| 浏览器不直接访问 Worker 端口 | ✅ **直接可证** | Python 主服务的 `local_url` 始终指向主端口（[blocks.py:2958](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/blocks.py#L2958-L2958)），无任何代码将 Worker 端口写入 `local_url` |
+| Python 主服务不会将请求重定向/代理到 Worker | ✅ **直接可证** | 全库搜索 `get_next_url` 仅一处定义（[static_server.py:229](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/static_server.py#L229-L233)），零调用点；搜索 `_static_prefixes` 仅声明（[routes.py:254-256](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/routes.py#L254-L256)），零读取点 |
+| `enable_static_workers` 函数不存在 | ✅ **直接可证** | 全库搜索 `enable_static_workers` 仅出现在注释 `# Populated by enable_static_workers`（[routes.py:256](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/routes.py#L256-L256)），函数本身从未定义 |
+| 拓扑 2 下 Worker 是「已启动但闲置」 | ⚠️ **推断** | 代码中无显式"禁用"或"标记闲置"逻辑。结论基于：(1) Worker 启动代码存在；(2) 无任何流量入口指向它。如果用户手动访问 `http://localhost:7861`（Worker 端口），Worker **确实能响应请求**。所谓「闲置」是指正常使用流程中不会被访问到 |
+| 拓扑 2 是「预留架构」 | ⚠️ **推断** | 代码中无注释说明这是预留设计。从 `enable_static_workers` 的注释和 `_static_prefixes` 的声明看，**原本计划**让 Python 主服务分流到 Worker，但该功能尚未实现。这是一个合理推断但不是确定性结论 |
+
+### 11.2 Node 代理如何选择 Worker
+
+| 结论 | 验证状态 | 依据 |
+|------|---------|------|
+| Node 从环境变量读取 Worker 端口列表 | ✅ **直接可证** | [proxy_index.js:14-18](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_index.js#L14-L18) 中 `process.env.GRADIO_STATIC_WORKER_PORTS.split(",")` |
+| 静态路由使用轮询（Round-Robin）分发 | ✅ **直接可证** | [proxy_index.js:74-76](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_index.js#L74-L76) 中 `workerIndex % staticWorkerPorts.length` + `workerIndex++` |
+| 上传路由使用亲和性哈希分发 | ✅ **直接可证** | [proxy_routes.js:97-108](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_routes.js#L97-L108) 中 `hashString(uploadId) % numWorkers` |
+| 无 Workers 时静态路由回退到 Python | ✅ **直接可证** | [proxy_routes.js:92-95](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_routes.js#L92-L95) 中 `if (!hasWorkers) return { route: "python" }` |
+| Python 端的 `get_next_url()` 不参与实际分发 | ✅ **直接可证** | 全库搜索 `get_next_url` 仅在 [static_server.py:229](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/static_server.py#L229-L233) 定义，无任何调用 |
+| 轮询状态在 Node 进程内存中，重启后重置 | ⚠️ **推断** | `workerIndex` 是模块级变量（[proxy_index.js:20](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_index.js#L20-L20)），进程重启归零。这是 JS 变量的自然行为，代码未做持久化 |
+
+### 11.3 页面和文件地址如何最终形成
+
+本节追踪从浏览器输入 URL 到前端发出 API 请求的完整链路，区分两种渲染模式。
+
+#### 模式 A：Python 渲染（拓扑 1/2，无 Node）
+
+```
+1. 浏览器输入 http://localhost:7860/demo
+      │
+2. GET /demo → FastAPI app.mount("/demo", gradio_app)
+      │ Starlette 自动设置 scope["root_path"]="/demo"
+      │
+3. 路由函数 main() 被调用（[routes.py:603](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/routes.py#L603-L681)）
+      │
+   3a. get_root_url() 计算 root：
+       root_path = app.root_path("") or scope.root_path("/demo") or custom_mount_path("/demo")
+       → root = "http://localhost:7860/demo"
+       │
+   3b. update_root_in_config(config, root)：
+       config["root"] = "http://localhost:7860/demo"
+       add_root_url() 递归拼接所有文件 URL：
+         "/file=/tmp/img.png" → "http://localhost:7860/demo/file=/tmp/img.png"
+       │
+   3c. HTML 模板输出，内嵌 gradio_config：
+       <script>window.gradio_config = {root: "http://localhost:7860/demo", ...}</script>
+      │
+4. 浏览器执行 JS，Client.connect("http://localhost:7860/demo")
+      │
+   4a. resolve_config() 发现 window.gradio_config 存在 → 直接使用
+       （[init_helpers.ts:77-108](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/client/js/src/helpers/init_helpers.ts#L77-L108)）
+       │
+   4b. config.root = "http://localhost:7860/demo"
+       api_prefix = config.api_prefix || ""
+       │
+5. 前端后续请求全部基于 config.root + api_prefix 拼接：
+      │
+   5a. SSE 流：new URL(`${config.root}${api_prefix}/queue/join?session_hash=xxx`)
+       → http://localhost:7860/demo/gradio_api/queue/join?session_hash=xxx
+       （[stream.ts:28](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/client/js/src/utils/stream.ts#L28-L28)）
+       │
+   5b. 提交请求：`${config.root}${api_prefix}/call/predict`
+       → http://localhost:7860/demo/gradio_api/call/predict
+       （[submit.ts:199](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/client/js/src/utils/submit.ts#L199-L199)）
+       │
+   5c. 文件上传：config.root + api_prefix + "/upload?upload_id=xxx"
+       → http://localhost:7860/demo/gradio_api/upload?upload_id=xxx
+       （[client.ts:448-451](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/client/js/src/client.ts#L448-L451)）
+       │
+   5d. 取消/重置：`${config.root}${api_prefix}/cancel` / `/reset`
+       （[submit.ts:122,129](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/client/js/src/utils/submit.ts#L122-L129)）
+       │
+6. 浏览器发出的所有请求都经过同一个 http://localhost:7860/demo 前缀
+   → Python FastAPI 正常路由匹配
+```
+
+**验证标注**：
+
+| 步骤 | 结论 | 验证状态 |
+|------|------|---------|
+| `scope["root_path"]` 由 FastAPI mount 自动设置 | Starlette ASGI 规范行为 | ✅ 直接可证 |
+| `config["root"]` 被写入 HTML 模板的 `window.gradio_config` | 模板渲染机制 | ✅ 直接可证 |
+| 前端 `Client.connect` 优先使用 `window.gradio_config` | [init_helpers.ts:77-108](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/client/js/src/helpers/init_helpers.ts#L77-L108) | ✅ 直接可证 |
+| 前端所有请求基于 `config.root + api_prefix` 拼接 | stream.ts / submit.ts / client.ts 中多处使用 | ✅ 直接可证 |
+| 文件 URL 已在后端通过 `add_root_url` 拼好了前缀 | [processing_utils.py:626](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/processing_utils.py#L626-L635) | ✅ 直接可证 |
+
+#### 模式 B：Node SSR 渲染（拓扑 3）
+
+```
+1. 浏览器输入 http://localhost:7860/demo
+      │
+2. Node 代理接收请求，classifyRoute("/demo") → "sveltekit"
+      │ Node 注入请求头（[proxy_index.js:94-102](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_index.js#L94-L102)）：
+      │   x-gradio-server = "http://127.0.0.1:7861"（Python 内部地址）
+      │   x-gradio-mounted-path = "/"
+      │   x-gradio-original-url = "https://example.com"（公开地址，来自 x-forwarded-proto + x-forwarded-host）
+      │
+3. SvelteKit +page.server.ts load() 执行（[+page.server.ts:3-53](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/src/routes/[...catchall]/+page.server.ts#L3-L53)）
+      │
+   3a. server = request.headers.get("x-gradio-server") → "http://127.0.0.1:7861"
+   3b. mount_path = request.headers.get("x-gradio-mounted-path") → "/"
+   3c. real_url = new URL(x-gradio-original-url).origin → "https://example.com"
+   3d. root_url = new URL(mount_path, real_url).href → "https://example.com/"
+   3e. 向 Python 内部端口 fetch /config 检查认证
+      │
+4. +page.ts load() 执行（[+page.ts:12-163](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/src/routes/[...catchall]/+page.ts#L12-L163)）
+      │
+   4a. 浏览器端：api_url = new URL(mount_path, root_url).href → "https://example.com/"
+       服务端：api_url = server → "http://127.0.0.1:7861"
+   4b. Client.connect(api_url, {headers: {x-gradio-server: "https://example.com/"}})
+       │
+   4c. resolve_config 发起 fetch("/config")
+       服务端：直接请求 Python 内部端口 http://127.0.0.1:7861/config
+       浏览器端：请求 https://example.com/config → Node → Python
+       │
+   4d. Python /config 路由中 get_root_url() 计算：
+       x-gradio-server 头存在 → origin = "http://127.0.0.1:7861"
+       root_path = app.root_path → 可能是空或用户指定
+       → root = "http://127.0.0.1:7861" 或用户指定的 root_path
+       │
+       ⚠️ 这里 Python 后端计算的 root 可能是内部地址，
+       但 resolve_config 中有修正逻辑：
+       if (!config.root) config.root = endpoint
+       即如果后端未提供 root 或 root 为空，使用 Client.connect 传入的 api_url
+       （[init_helpers.ts:123-125](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/client/js/src/helpers/init_helpers.ts#L123-L125)）
+      │
+5. 最终前端使用 config.root 拼接所有请求，请求经过 Node 代理分流
+```
+
+**验证标注**：
+
+| 步骤 | 结论 | 验证状态 |
+|------|------|---------|
+| Node 注入 x-gradio-server / x-gradio-mounted-path / x-gradio-original-url | [proxy_index.js:99-102](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_index.js#L99-L102) | ✅ 直接可证 |
+| +page.server.ts 从请求头提取 root_url | [+page.server.ts:13-22](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/src/routes/[...catchall]/+page.server.ts#L13-L22) | ✅ 直接可证 |
+| +page.ts 区分浏览器端/服务端构造 api_url | [+page.ts:32-35](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/src/routes/[...catchall]/+page.ts#L32-L35) | ✅ 直接可证 |
+| resolve_config 优先用后端 root，fallback 到 endpoint | [init_helpers.ts:121-125](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/client/js/src/helpers/init_helpers.ts#L121-L125) | ✅ 直接可证 |
+| Node 中 x-gradio-mounted-path 硬编码为 "/" | [proxy_index.js:101](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_index.js#L101-L101) | ✅ 直接可证 |
+| 子路径挂载（如 /demo）在 Node 代理模式下可能有问题 | ⚠️ **推断** | `x-gradio-mounted-path` 硬编码为 `"/"`（[proxy_index.js:101](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_index.js#L101-L101)），而 Python 后端通过 `get_root_url` 计算的 root 可能包含子路径。如果 Node 代理前面还有一个 nginx 做子路径挂载，root_url 的计算可能不一致，这取决于具体反代配置。代码中未发现对此场景的显式处理 |
+
+### 11.4 关键修正与注意事项
+
+1. **STATIC_ROUTE_PREFIXES 优先于 PYTHON_ROUTE_PREFIXES**：
+   这不是直觉设计，而是代码中明确的前后顺序
+   （[proxy_routes.js:92](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_routes.js#L92-L92) 先匹配 STATIC，
+   [proxy_routes.js:112](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_routes.js#L112-L112) 后匹配 PYTHON）。
+   因此 `/gradio_api/upload` 和 `/gradio_api/file=` **不会**去 Python，而是去 Worker。
+
+2. **`custom_mount_path` 的兜底仅限 `/` 和 `/config`**：
+   其他路由（`/gradio_api/info`、队列系统）只用 `app.root_path`，不兜底 `custom_mount_path`。
+   这意味着挂载子应用但未设 `root_path` 时，API 文档页的示例 URL 可能缺前缀。
+
+3. **`_static_prefixes` 和 `enable_static_workers` 是未完成的功能**：
+   代码中声明了字段和注释，但函数从未实现。这是 Python 主服务侧原计划的分流机制，
+   最终由 Node 代理侧的 `classifyRoute` 替代完成。
+
+4. **Node 代理的 `x-gradio-mounted-path` 硬编码为 `"/"`**：
+   当前代码中 Node 不感知 Gradio 的 `custom_mount_path`，
+   子路径挂载场景下 Node 代理如何处理需视具体反代配置而定。
