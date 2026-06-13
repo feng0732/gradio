@@ -954,6 +954,199 @@ Python: gr.Examples(examples, inputs=[MyCustomComponent])
     └─ 重新走 ①~⑧ 流程
 ```
 
+### 6.6 Dataset 示例渲染路径详解
+
+Dataset（即 `gr.Examples`）的示例渲染有自己独立的一套加载/挂载路径，和通用组件树（`MountComponents`）完全不同。下面从 `load_component` 调用开始，完整梳理到示例挂载的实际路径。
+
+#### 6.6.1 入口：Dataset 是一个独立的内置组件
+
+Dataset 在 Gradio 中是一个**内置组件**，类型为 `"dataset"`，和 Textbox、Image 等并列。其组件层级：
+
+```
+gradio.Dataset (Python)
+    ↓ 配置传给前端
+Index.svelte (js/dataset/Index.svelte)  ← 组件外壳，Block 容器
+    ↓
+Dataset.svelte (js/dataset/Dataset.svelte)  ← 示例表格/画廊渲染逻辑
+    ↓
+MountExample.svelte (js/dataset/MountExample.svelte)  ← 挂载单个示例组件
+```
+
+Dataset 组件从 [Index.svelte L49-L58](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/dataset/Index.svelte#L49-L58) 接收 `load_component`（从 `gradio.shared.load_component` 注入），然后传入内层 `Dataset.svelte`。
+
+#### 6.6.2 两层 `{#await}` 结构
+
+Dataset.svelte 中有**两层嵌套**的 `{#await}`，是理解失败行为的关键：
+
+```svelte
+{#await get_component_meta(selected_samples_json)}
+    <!-- 第一层 await 进行中：加载骨架屏 -->
+    <div class="gallery">...</div>
+{:then _}
+    <!-- 第一层 await 完成：component_meta 已填充 -->
+    {#if gallery}
+        {#each selected_samples as sample_row, i}
+            {#await Promise.all([component_meta[i][0].component, component_meta[i][0].runtime]) then [component, runtime]}
+                <!-- 第二层 await 完成：挂载示例 -->
+                <MountExample {component} {runtime} ... />
+            {/await}
+        {/each}
+    {/if}
+{/await}
+```
+
+**关键点：两层 `{#await}` 都没有 `{:catch}` 分支。**
+
+#### 6.6.3 第一层：`get_component_meta` 与 Promise.all 全部失败
+
+[get_component_meta()](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/dataset/Dataset.svelte#L116-L142) 函数结构：
+
+```typescript
+async function get_component_meta(selected_samples_json: string): Promise<void> {
+    const _selected_samples: any[][] = JSON.parse(selected_samples_json);
+
+    component_meta = await Promise.all(  // ← 外层 Promise.all
+        _selected_samples.map(
+            async (sample_row) =>
+                await Promise.all(  // ← 内层 Promise.all
+                    sample_row.map(async (sample_cell, j) => {
+                        const loaded = load_component(
+                            components[j].name,
+                            "example",
+                            components[j].class_id
+                        );
+                        return {
+                            value: sample_cell,
+                            component: loaded.component,   // ← 注意：存储 Promise 本身
+                            runtime: loaded.runtime        // ← 不 await，不 catch
+                        };
+                    })
+                )
+        )
+    );
+}
+```
+
+**这里有一个关键细节**：`load_component()` 同步返回的对象里 `component` 和 `runtime` 本身就是 **Promise**，但 `get_component_meta` 中直接存储 Promise 对象而**不 await**。
+
+Promise.all 等待的是 `sample_row.map(async ...)` 这些**外层 async 函数**，这些函数很快就会同步返回（因为内部不 await Promise）。所以：
+
+- **第一层 Promise.all 几乎不会 reject**：即使后续 HTTP 请求失败，也不会在这一层体现
+- `component_meta[i][j].component` 和 `.runtime` 存储的是 Pending 状态的 Promise，后续是否成功/失败由第二层 await 处理
+
+#### 6.6.4 第二层：单元格级 `{#await Promise.all([component, runtime])}`
+
+在 [Dataset.svelte L257-L269](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/dataset/Dataset.svelte#L257-L269) 表格模式和 [L200-L214](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/dataset/Dataset.svelte#L200-L214) 画廊模式中：
+
+```svelte
+{#await Promise.all([component, runtime]) then [component, runtime]}
+    <MountExample {component} {runtime} ... />
+{/await}
+```
+
+**Promise reject 的消费位置就在这里**——但 `{#await}` 没有 `{:catch}` 分支。
+
+Svelte 中 `{#await promise}` 的行为：
+- Promise pending → 不渲染 then 块（也不渲染 catch，因为没有）
+- Promise resolve → 渲染 then 块，显示 `<MountExample />`
+- **Promise reject → 不渲染任何内容，也不抛出到外层**（因为没有 `{:catch}`）
+
+**这就是界面空白的根本原因**：`{#await}` 在 Promise reject 时**静默什么都不渲染**，相当于该单元格的 DOM 为空。
+
+#### 6.6.5 第三层：MountExample 挂载单个示例
+
+[MountExample.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/dataset/MountExample.svelte) 的实现非常简洁：
+
+```svelte
+<script lang="ts">
+    import { mount, unmount } from "svelte";
+    let { component, runtime, ...rest }: Props = $props();
+    let el: HTMLElement = $state(null);
+
+    $effect(() => {
+        if (!el || !component) return;
+
+        if (runtime) {
+            // 自定义组件：使用组件独立打包的 Svelte runtime
+            const mounted = runtime.mount(component.default, { target: el, props: rest });
+            return () => runtime.unmount(mounted);
+        } else {
+            // 内置组件：使用主应用的 Svelte mount
+            const mounted = mount(component.default, { target: el, props: rest });
+            return () => unmount(mounted);
+        }
+    });
+</script>
+
+<span bind:this={el}></span>
+```
+
+MountExample 的挂载逻辑和 `MountCustomComponent` 几乎完全相同：
+- `runtime` 为 truthy → 使用独立的 Svelte runtime（自定义组件，避免版本冲突）
+- `runtime` 为 falsy（`false`） → 使用主应用 `import { mount } from "svelte"`（内置组件）
+
+区别在于：
+- MountExample 接收的是**已经 resolve 的组件对象**（从 `{#await then}` 解构出来）
+- MountCustomComponent 内部自己做 `$derived(await node.component)`
+
+#### 6.6.6 Dataset 路径 vs 通用组件树路径对比
+
+| 维度 | Dataset 示例路径 | 通用组件树路径 |
+|-----|----------------|-------------|
+| **入口组件** | `js/dataset/Dataset.svelte`（内置组件） | `js/core/src/_init.ts` → `MountComponents.svelte` |
+| **load_component 调用方** | `get_component_meta()` 内部 for 循环 | `walk_layout()` 递归处理每个节点 |
+| **load_component 签名** | `load_component(name, "example", class_id)`（shared_props 位置参数形式） | `load_component({api_url,name,id,variant})`（虚拟模块对象参数形式） |
+| **Promise 处理方式** | 两层 `{#await}`（无 `{:catch}`） | `$derived(await node.component)` + `{#if}` 判断 |
+| **Promise reject 表现** | 单元格静默空白，不影响其他单元格 | 单个组件空白，不影响兄弟组件 |
+| **挂载实现** | `MountExample.svelte`（dataset 专属） | `MountCustomComponent.svelte` / `<svelte:component>` |
+| **variant** | 强制 `"example"` | 通常 `"component"`（少数情况 `"example"`） |
+| **runtime 来源** | `loaded.runtime`（Promise） | `node.runtime`（存在于 node 对象上） |
+| **失败缓存** | `request_map` 缓存 reject 的 Promise → 刷新前永久空白 | `request_map` 同上 |
+
+#### 6.6.7 完整失败流程图（Dataset 场景）
+
+```
+Python: gr.Examples([sample1, sample2], inputs=[MyCustomComponent])
+    ↓
+配置中的 type="dataset"，components=[{name, class_id}]
+    ↓
+① Index.svelte (dataset 外壳) 接收配置
+    ↓
+② Dataset.svelte get_component_meta() 被调用
+    ├─ 遍历每个单元格，调用 load_component(name, "example", class_id)
+    ├─ load_component → get_component → virtual:component-loader
+    ├─ _component_map 找不到 → throw → get_component_with_css()
+    ├─ 返回 { component: Promise<index.js>, runtime: Promise<runtime> }
+    ├─ component_meta[i][j] = { value, component: Promise, runtime: Promise }
+    └─ 第一层 Promise.all resolve（因为 async 函数内部没有 await Promise）
+                ↓
+③ 外层 {#await then _} 进入 then 块
+    ↓
+④ 每个单元格 {#await Promise.all([component, runtime])}
+    ├─ 浏览器发起 HTTP 请求
+    │   ├─ GET .../style.css  → 404
+    │   ├─ GET .../index.js   → 404
+    │   └─ GET .../svelte_runtime_entry.js → 404
+    ├─ Promise<component> → reject
+    ├─ Promise<runtime> → reject
+    └─ Promise.all → reject
+                ↓
+⑤ {#await} 没有 {:catch} → **静默不渲染任何内容**
+    ├─ 单元格 <td> 仍然存在（由 {#each} 渲染）
+    ├─ 但 <td> 内部完全空白（{#await} 的 then/catch 块都不渲染）
+    └─ 用户看到空表格单元格 / 空画廊
+                ↓
+⑥ 下次翻页/切换（selected_samples 变化）
+    ├─ get_component_meta() 被重新调用
+    ├─ load_component() 被再次调用
+    ├─ 但 request_map[id-example] 已缓存了 reject 的 Promise
+    └─ → 继续返回同一个 reject 的 Promise → 继续空白
+                ↓
+⑦ 刷新页面
+    ├─ request_map 清空（模块级变量重置）
+    └─ 重新尝试加载（但如果问题没解决，继续失败 → 继续空白）
+```
+
 ---
 
 ## 七、组件未渲染原因分析
@@ -1348,6 +1541,9 @@ if (auth_required) {
 | Block 原子组件 | [Block.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/atoms/src/Block.svelte) |
 | Fallback 组件 (Python) | [fallback.py](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/gradio/components/fallback.py) |
 | Fallback 组件 (Svelte) | [Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/fallback/Index.svelte) |
+| Dataset 组件外壳 | [Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/dataset/Index.svelte) |
+| Dataset 示例渲染逻辑 | [Dataset.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/dataset/Dataset.svelte) |
+| Dataset 单示例挂载 | [MountExample.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/dataset/MountExample.svelte) |
 | 后端路由 | [routes.py](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/gradio/routes.py#L981-L1044) |
 | SSR 页面加载器 | [+page.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/app/src/routes/%5B...catchall%5D/%2Bpage.ts) |
 | 组件基类 | [base.py](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/gradio/components/base.py) |
