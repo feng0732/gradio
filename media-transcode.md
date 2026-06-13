@@ -7,26 +7,41 @@
 ## 1. 整体架构概览
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                         前端 (浏览器)                                 │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐  │
-│  │ Upload 组件  │───▶│  FFmpeg WASM │───▶│  <video>/<audio> 播放 │  │
-│  └──────────────┘    └──────────────┘    └──────────────────────┘  │
-└──────────────────────────┬───────────────────────────────────────────┘
-                           │ HTTP (multipart/form-data)
-                           ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                         后端 (Python)                                 │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐  │
-│  │ upload 路由  │───▶│ preprocess   │───▶│  用户预测函数        │  │
-│  └──────────────┘    └──────────────┘    └──────────┬───────────┘  │
-│         │            move_files_to_cache            │                │
-│         ▼                    ▲                      ▼                │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐  │
-│  │  file 路由   │◀───│ postprocess  │◀───│  move_files_to_cache │  │
-│  └──────────────┘    └──────────────┘    └──────────────────────┘  │
-└──────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                               前端 (浏览器)                                    │
+│                                                                              │
+│  ┌──────────────────── Video ────────────────────┐    ┌────── Audio ──────┐  │
+│  │  Upload  ─▶  FFmpeg WASM  ─▶  <video> 播放    │    │  Upload           │  │
+│  │                (裁剪用)                        │    │    │              │  │
+│  │                            ▲                   │    │    ▼              │  │
+│  │                            │ HLS.js            │    │  WaveSurfer.js    │  │
+│  └────────────────────────────┼───────────────────┘    │  / <audio> 播放   │  │
+│                               │                         │       ▲          │  │
+│                               │ HLS                     │       │ HLS.js   │  │
+└───────────────────────────────┼─────────────────────────┴───────┼──────────┘
+                                │ HTTP (multipart/form-data)      │
+                                ▼                                 ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                               后端 (Python)                                   │
+│                                                                              │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐          │
+│  │ upload 路由  │───▶│ preprocess   │───▶│  用户预测函数        │          │
+│  └──────────────┘    └──────────────┘    └──────────┬───────────┘          │
+│         │            move_files_to_cache            │                       │
+│         ▼                    ▲                      ▼                       │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐          │
+│  │  file 路由   │◀───│ postprocess  │◀───│  move_files_to_cache │          │
+│  └──────────────┘    └──────────────┘    └──────────────────────┘          │
+│         ▲                                                                   │
+│         │ /stream/ (HLS m3u8 + 分片)                                         │
+│  ┌──────────────┐                                                           │
+│  │ stream 路由  │◀── MediaStream (内存) ◀── stream_output                    │
+│  └──────────────┘                                                           │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
+
+> **重要修正**：FFmpeg WASM 仅用于 Video 前端裁剪，**Audio 前端不使用 FFmpeg**。
+> Audio 播放通过 WaveSurfer.js 或原生 `<audio>` 实现，流媒体通过 HLS.js 解码。
 
 ---
 
@@ -445,43 +460,182 @@ else:
 
 ## 7. 浏览器播放
 
+前端播放是整个链路的最终环节。Video 和 Audio 各自有多种播放路径，根据文件类型（普通文件/流式）和配置参数选择不同的播放器实现。
+
 ### 7.1 Video 播放
 
-**播放组件**：
+**核心播放组件**：[Video.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/video/shared/Video.svelte)
+
+**上层组件**：
 - 静态模式：[VideoPreview.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/video/shared/VideoPreview.svelte)
 - 交互模式：[Player.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/video/shared/Player.svelte)
 
-**播放方式**：HTML5 `<video>` 标签
+#### 7.1.1 两种播放路径
+
+Video 有**两条播放路径**，由 `is_stream` 属性决定：
+
+| 路径 | 触发条件 | 实现方式 | 代码位置 |
+|------|---------|---------|---------|
+| 原生 `<video>` | `is_stream=false`（普通文件） | 直接设置 `video.src` | [Video.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/video/shared/Video.svelte) |
+| HLS.js | `is_stream=true`（流式输出） | HLS.js 加载 m3u8 → 绑定到 `<video>` | [Video.svelte L70-L110](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/video/shared/Video.svelte#L70-L110) |
+
+**播放选择逻辑**：
+```javascript
+// Video.svelte
+if (is_stream && Hls.isSupported()) {
+    // 路径1：HLS.js 流式播放
+    const hls = new Hls({ lowLatencyMode: true });
+    hls.loadSource(src);       // 加载 m3u8 播放列表
+    hls.attachMedia(node);      // 绑定到 <video> 元素
+} else {
+    // 路径2：原生 <video> 播放普通文件
+    // src 直接设置到 <video src=...>
+}
+```
 
 **支持的浏览器可播放格式**（后端保证）：
 - MP4 + H.264 / AV1
 - WebM + VP9 / VP8 / AV1
 - Ogg + Theora
 
-**前端 FFmpeg（WASM）**：
+#### 7.1.2 前端 FFmpeg（WASM）
+
+**仅 Video 组件使用**，Audio 无此功能。
+
 - 位置：[js/video/shared/utils.ts](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/video/shared/utils.ts)
-- 用途：视频裁剪（trimVideo 函数）
+- 用途：视频裁剪（`trimVideo` 函数）
 - 库：`@ffmpeg/ffmpeg` + `@ffmpeg/util`
 - 加载方式：从 `/static/ffmpeg/` 加载 WASM 核心
+- 触发时机：用户在前端对视频进行裁剪编辑时
 
 ### 7.2 Audio 播放
 
-**播放组件**：
+**核心播放组件**：[AudioPlayer.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/audio/player/AudioPlayer.svelte)
+
+**上层组件**：
 - 静态模式：[StaticAudio.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/audio/static/StaticAudio.svelte)
-- 播放器：[AudioPlayer.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/audio/player/AudioPlayer.svelte)
+- 交互模式：[InteractiveAudio.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/audio/interactive/InteractiveAudio.svelte)
 
-**两种播放模式**：
+#### 7.2.1 三条播放路径
 
-| 模式 | 实现 | 适用场景 |
-|------|------|---------|
-| 波形模式 | WaveSurfer.js + 隐藏 `<audio>` | `show_recording_waveform=True`（默认） |
-| 原生模式 | 原生 `<audio>` 控件 | `show_recording_waveform=False` 或 流式 |
+Audio 有**三条播放路径**，由两个维度决定：
+1. 是否为流式（`is_stream`）
+2. 是否显示波形（`show_recording_waveform`）
 
-**播放方式**：
-- 非流式：加载完整文件到 WaveSurfer.js 或 `<audio>`
-- 流式：HLS.js 播放 m3u8 流媒体
+| 路径 | 播放引擎 | 触发条件 | 适用场景 |
+|------|---------|---------|---------|
+| 路径 A | WaveSurfer.js | `show_recording_waveform=true` 且 非流式 | 默认模式，显示波形 |
+| 路径 B | 原生 `<audio>` | `show_recording_waveform=false` 且 非流式 | 简化模式，原生控件 |
+| 路径 C | HLS.js + `<audio>` | `is_stream=true` | 流式输出 |
+
+#### 7.2.2 路径 A：WaveSurfer.js 波形播放
+
+**触发条件**：`waveform_options.show_recording_waveform = true`（默认）且非流式
+
+**实现方式**：
+- WaveSurfer.js 负责解码音频、绘制波形、控制播放
+- 内部使用 Web Audio API
+- 不依赖 `<audio>` 标签播放（但组件中仍有隐藏的 `<audio>` 用于流式场景）
+
+**相关代码**：
+```javascript
+// AudioPlayer.svelte L199-L207
+function load_audio(data: string): void {
+    stream_active = false;
+    if (waveform_options.show_recording_waveform) {
+        waveform?.load(data);   // WaveSurfer.js 加载并解码音频
+    } else if (audio_player) {
+        audio_player.src = data;  // 原生 <audio>
+    }
+}
+```
+
+**特点**：
+- 支持精细的波形显示和交互
+- 支持裁剪、缩放等编辑操作
+- 需要完整下载后才能绘制波形
+- 依赖浏览器 Web Audio API
+
+#### 7.2.3 路径 B：原生 `<audio>` 播放
+
+**触发条件**：`show_recording_waveform = false` 且非流式
+
+**实现方式**：直接使用浏览器原生 `<audio controls>` 控件
+
+**相关代码**：
+```html
+<!-- AudioPlayer.svelte L390-L400 -->
+<audio
+    class="standard-player"
+    class:hidden={use_waveform}
+    controls
+    bind:this={audio_player}
+    preload="metadata"
+></audio>
+```
+
+**特点**：
+- 浏览器原生 UI，风格随浏览器而异
+- 支持 HTTP Range 请求，可边下边播
+- 内存占用小
+- 无波形显示
+
+#### 7.2.4 路径 C：HLS.js 流式播放
+
+**触发条件**：`value.is_stream = true`（流式输出模式）
+
+**实现方式**：
+- HLS.js 加载 m3u8 播放列表
+- 将解码后的音视频流绑定到 `<audio>` 元素
+- 不使用 WaveSurfer.js（流式时禁用波形）
+
+**相关代码**：
+```javascript
+// AudioPlayer.svelte L219-L261
+function load_stream(value: FileData | null): void {
+    if (Hls.isSupported() && !stream_active) {
+        const hls = new Hls({ lowLatencyMode: true });
+        hls.loadSource(value.url);     // 加载 m3u8
+        hls.attachMedia(audio_player);  // 绑定到 <audio>
+        hls.on(Hls.Events.MANIFEST_PARSED, function () {
+            if (waveform_settings.autoplay) audio_player.play();
+        });
+    } else if (!stream_active) {
+        // 浏览器原生支持 HLS 时（如 Safari）
+        audio_player.src = value.url;
+    }
+}
+```
+
+**特点**：
+- 边生成边播放，低延迟
+- 使用 HLS 协议（m3u8 + aac 分片）
+- 波形显示不可用（`use_waveform = false` 当 is_stream 时）
+- 有错误自动恢复机制（网络错误、媒体错误）
+
+#### 7.2.5 播放路径选择流程图
+
+```
+                    接收到 Audio FileData
+                            │
+                            ▼
+                     is_stream == true ?
+                       /            \
+                     是              否
+                     │                │
+                     ▼                ▼
+               HLS.js 播放     show_recording_waveform ?
+               (路径 C)             /          \
+                                   是            否
+                                   │              │
+                                   ▼              ▼
+                           WaveSurfer.js    原生 <audio>
+                           (路径 A)         (路径 B)
+```
 
 **支持格式**：依赖浏览器原生支持（wav, mp3, ogg, flac, aac 等）
+
+> **重要**：Audio 前端**不使用 FFmpeg WASM**。所有音频解码和播放都依赖浏览器原生能力（Web Audio API 或 `<audio>` 标签）。
 
 ---
 
@@ -634,8 +788,10 @@ WaveSurfer.js / <audio src="/file=..."> 播放
 
 | 介质 | 后端保证 | 前端播放方式 |
 |------|---------|------------|
-| Video | 一定是浏览器可播放格式（mp4+h264 等组合） | HTML5 `<video>` |
-| Audio | 按 format 参数透传或转换，不保证浏览器兼容 | WaveSurfer.js / HTML5 `<audio>` |
+| Video | 一定是浏览器可播放格式（mp4+h264 等组合） | 两条路径：<br>• 普通文件：原生 `<video>`<br>• 流式：HLS.js + `<video>` |
+| Audio | 按 format 参数透传或转换，不保证浏览器兼容 | 三条路径：<br>• WaveSurfer.js（波形模式，默认）<br>• 原生 `<audio>`（无波形）<br>• 流式：HLS.js + `<audio>` |
+
+> **注意**：前端 FFmpeg WASM **仅用于 Video 裁剪**，Audio 前端不使用 FFmpeg，完全依赖浏览器原生解码能力。
 
 ### 10.4 FFmpeg 使用位置
 
@@ -663,8 +819,12 @@ WaveSurfer.js / <audio src="/file=..."> 播放
 | [gradio/blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/blocks.py) | move_resource_to_block_cache、流处理调度 |
 | [gradio/components/base.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/components/base.py) | 组件基类，初始化时 move_files_to_cache |
 | [gradio/_vendor/ffmpy/ffmpy.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/_vendor/ffmpy/ffmpy.py) | FFmpeg Python 封装 |
+| [js/video/shared/Video.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/video/shared/Video.svelte) | Video 核心播放组件（HLS 支持） |
+| [js/video/shared/Player.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/video/shared/Player.svelte) | Video 播放器交互组件 |
+| [js/video/shared/VideoPreview.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/video/shared/VideoPreview.svelte) | Video 静态预览组件 |
 | [js/video/shared/InteractiveVideo.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/video/shared/InteractiveVideo.svelte) | Video 前端交互组件 |
-| [js/video/shared/utils.ts](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/video/shared/utils.ts) | 前端 FFmpeg WASM 封装 |
+| [js/video/shared/utils.ts](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/video/shared/utils.ts) | 前端 FFmpeg WASM 封装（裁剪用） |
 | [js/audio/interactive/InteractiveAudio.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/audio/interactive/InteractiveAudio.svelte) | Audio 前端交互组件 |
-| [js/audio/player/AudioPlayer.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/audio/player/AudioPlayer.svelte) | Audio 播放器（WaveSurfer.js） |
+| [js/audio/player/AudioPlayer.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/audio/player/AudioPlayer.svelte) | Audio 播放器（WaveSurfer.js + HLS.js） |
+| [js/audio/static/StaticAudio.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/audio/static/StaticAudio.svelte) | Audio 静态展示组件 |
 | [js/upload/src/Upload.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/upload/src/Upload.svelte) | 通用上传组件 |
