@@ -628,6 +628,12 @@ export function apply_diff_stream(pending_diff_streams, event_id, data): void {
 | **`POST /queue/data` 后端路由** | 存在对应路由 | 前端有调用但后端 routes.py 中**无此 POST 路由**，为历史遗留代码 |
 | **iterator 取消防护** | 仅靠删除字典 | `App.iterators_to_reset` 黑名单 + `restore_session_state` 入口检查，双重防护防竞态 |
 | **`/reset` 路由功能** | 实际重置 iterator | **空操作**，所有清理逻辑已移到 `/cancel`，保留仅为兼容 |
+| **`/call` 传 session_hash** | 不支持 | `SimplePredictBody` 有 `session_hash` 字段，通过 `model_dump()` 透传，**支持** |
+| **`/call/v2` 传 session_hash** | 和 v1 一样支持 | 构造 `SimplePredictBody` 时**只传了 data**，body 里的 session_hash 被**静默丢弃** |
+| **`SimplePredictBodyV2`** | `/call/v2` 用的模型 | **只定义不使用**的遗留类，`/call/v2` 实际接收 `dict[str, Any]` |
+| **旧版 SSE 的 fn_index 参数** | 后端用来路由事件 | **无效残留**，后端 `GET /queue/data` 根本不接收这个参数 |
+| **`POST /queue/data` 路由** | 存在，用来拉数据 | 前端有调用、后端**没有**对应 POST 路由，是死代码 |
+| **`/run` / `/api` 入口** | 也是入队接口 | **同步执行**接口，不入队，直接 `call_process_api` |
 
 ---
 
@@ -723,6 +729,148 @@ blocks.handle_streaming_diffs(..., simple_format=simple_format)
 | `POST /call/v2/{api_name}`（外部 API v2） | **True** | **全量数据**（不做 diff） | `GET /call/v2/{api}/{event_id}`（同上） | — | ❌ 不需要 |
 
 > **设计意图**：外部 API 的消费方（curl、第三方 SDK）通常不具备 diff 合并能力，所以直接发全量，牺牲带宽换兼容性；前端内部 UI 对延迟敏感，走 diff 压缩。
+
+---
+
+### 10.4 容易踩坑的契约细节
+
+#### 细节 1：`/call/{api_name}` 支持显式传递 `session_hash`
+
+`SimplePredictBody`（[data_classes.py#L56-L58](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/data_classes.py#L56-L58)）定义：
+```python
+class SimplePredictBody(BaseModel):
+    data: list[Any]
+    session_hash: str | None = None   # ★ 可选字段
+```
+
+构造 `PredictBody` 时通过 `**body.model_dump()` 展开，所以 `session_hash` 会被透传：
+```python
+# routes.py L1350
+full_body = PredictBody(**body.model_dump(), simple_format=True)
+```
+
+**行为**：
+- 传了 `session_hash` → 使用该值，多个调用可以共享同一个会话队列
+- 没传（`None`）→ `Event` 构造时 fallback 为 `event._id`，即每个 event 独立一个队列 key
+
+---
+
+#### 细节 2：`/call/v2/{api_name}` —— 丢弃 session_hash + 绕过 Pydantic 模型
+
+**关键问题**：`/call/v2` 的实现有两个容易忽视的设计选择。
+
+##### A. 绕过 Pydantic 命名参数模型
+
+`/call/v2` 接收的是 `body: dict[str, Any]`（原始字典），而 **不是** `SimplePredictBodyV2`：
+
+```python
+# routes.py L1318-L1322
+@router.post("/call/v2/{api_name}", ...)
+async def _(
+    api_name: str,
+    body: dict[str, Any],    # ★ 原始 dict，不是 SimplePredictBodyV2
+    request: fastapi.Request,
+    ...
+):
+```
+
+对比：`SimplePredictBodyV2` 在 [data_classes.py#L61-L63](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/data_classes.py#L61-L63) 中定义了，但 **routes.py 中完全没有使用这个类**：
+```python
+class SimplePredictBodyV2(BaseModel):
+    data: dict[str, Any]         # 命名参数
+    session_hash: str | None = None
+```
+
+> **结论**：`SimplePredictBodyV2` 是一个"只定义不使用"的遗留类。`/call/v2` 直接用 `dict[str, Any]` 接收，然后调用 `client_utils.construct_args(parameters_info, (), body)` 把命名参数按参数表顺序转换成位置参数列表。
+
+##### B. 静默丢弃 session_hash 字段
+
+因为 `body` 是原始字典，构造 `SimplePredictBody` 时只传了 `data`：
+
+```python
+# routes.py L1334
+simple_body = SimplePredictBody(data=processed_args)
+# ★ 没有传 session_hash！body 里的 session_hash 字段被直接丢弃了
+```
+
+**影响**：调用 `/call/v2/{api_name}` 时，即使在 JSON body 里传了 `session_hash` 字段，也会被忽略，最终 event 的 session_hash 永远等于 event._id（每个调用独立队列）。
+
+##### 为什么这么设计？
+
+可能的原因：
+1. v2 API 的设计目标是"只关心命名参数"，session_hash 被认为是内部概念
+2. 外部 API 调用方通常不需要会话状态持久化
+3. 但这确实是一个与直觉不符的边界：`/call` 支持 session_hash，`/call/v2` 不支持
+
+---
+
+#### 细节 3：旧版 SSE 中 `fn_index` 参数的作用
+
+旧版 SSE（`protocol === "sse"`）构造 URL 时把 `fn_index` 放在 query string 里：
+
+```typescript
+// submit.ts L275-L283
+var params = new URLSearchParams({
+    fn_index: fn_index.toString(),   // ★ 作为 query 参数
+    session_hash: session_hash
+}).toString();
+let url = new URL(`${config.root}${api_prefix}/${SSE_URL}?${params}`);
+// SSE_URL = "queue/data"
+```
+
+**但后端 `GET /queue/data` 只接收 `session_hash` 参数**：
+```python
+# routes.py L1463-L1467
+@router.get("/queue/data", ...)
+async def queue_data(
+    request: fastapi.Request,
+    session_hash: str,      # ★ 只有 session_hash，没有 fn_index
+):
+```
+
+**结论**：`fn_index` 在旧版 SSE 的 GET 请求中是 **无效残留参数**，后端 FastAPI 会直接忽略。它可能是更早期版本（SSE 连接建立时自动入队）的遗物，现在已经没有实际作用。
+
+---
+
+#### 细节 4：`POST /queue/data` —— 前端存在、后端没有的死路由
+
+旧版 SSE 的 `type === "data"` 分支里，会调用 `POST /queue/data`：
+
+```typescript
+// submit.ts L317-L325
+} else if (type === "data") {
+    let [_, status] = await post_data(
+        `${config.root}${api_prefix}/queue/data`,   // ★ POST /queue/data
+        {
+            ...payload,
+            session_hash,
+            event_id
+        }
+    );
+```
+
+**但在 routes.py 中，`/queue/data` 只有 GET 路由，没有 POST 路由**（[routes.py#L1463-L1471](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/routes.py#L1463-L1471)）。
+
+**历史背景推测**：
+- 更早期的 Gradio 中，`POST /queue/data` 可能是"拉取下一批数据"的接口（类似分页）
+- 现在 SSE 流本身就带完整数据，不再需要额外 POST
+- 这段代码是遗留死路径，实际执行时会返回 405 Method Not Allowed
+
+> 补充：类似的遗留 POST 路由还有 `/run/{api_name}` 和 `/api/{api_name}`（[routes.py#L1269-L1272](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/routes.py#L1269-L1272)），但那两个是**同步执行**接口（不入队，直接 call_process_api），用于非流式场景。
+
+---
+
+#### 细节 5：同步调用入口 `/run/{api_name}` / `/api/{api_name}`
+
+作为补充知识，除了入队类入口，还有一组**同步**入口：
+
+| 路由 | 模式 | 说明 |
+|------|------|------|
+| `POST /run/{api_name}` | 同步执行 | 不入队，直接 `call_process_api`，Colab 兼容别名 |
+| `POST /api/{api_name}` | 同步执行 | 同上，向后兼容别名 |
+| `POST /call/{api_name}` | 异步入队 | 走 Queue + SSE |
+
+代码位置：[routes.py#L1268-L1303](file:///d:/fz/0601/solo-dogfeeding/code/248-gradio/gradio/routes.py#L1268-L1303)
 
 ---
 
