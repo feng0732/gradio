@@ -555,3 +555,567 @@ for attr in base.__dict__:
 2. **引用循环**：`A → *B` 且 `B → *A`，`_get_computed_value()` 有 `max_depth=100` 保护，但 `_get_theme_css()` 走 CSS 运行时解析，浏览器会报循环引用警告。
 3. **dark 变量默认 `None` 的含义**：很多 `*_dark` 在 Base.set() 中默认就是 `None`，表示和 light 相同——在 CSS 输出阶段才会被 light 值回填，读代码时容易困惑"为什么 dark 字典里没有这个键"。
 4. **子类调用顺序**：子类必须先 `super().__init__()`（会自动调用 `self.set()` 产生默认值），再 `super().set(...)` 覆盖。如果顺序颠倒会出 bug。
+
+---
+
+## 十一、独立模式 vs 嵌入模式：主题样式链路深度对比
+
+Gradio 应用有两种运行模式，主题 CSS、字体和暗色模式的注入/生效链路存在本质差异。
+
+### 11.1 两种模式的入口与判断
+
+| 模式 | 入口 | `is_embed` 默认值 | 典型场景 |
+|------|------|-------------------|----------|
+| **独立模式（App 模式）** | SvelteKit 路由 `/[...catchall]` | `false`（+page.svelte L115） | 用户直接在浏览器打开 Gradio 应用 |
+| **嵌入模式（SPA 模式）** | Web Component `<gradio-app>` | `true`（main.ts L68） | 用 `<gradio-app src="...">` 嵌入到其他网页 |
+
+#### 判断逻辑
+
+**嵌入模式判断链**（[main.ts](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/main.ts) L44-L130）：
+```javascript
+class GradioApp extends HTMLElement {
+    is_embed: string;
+    constructor() {
+        this.is_embed = this.getAttribute("embed") ?? "true";  // 默认 true
+    }
+    connectedCallback() {
+        const opts = {
+            props: {
+                is_embed: this.is_embed === "false" ? false : true  // 任何非 "false" 都视为 true
+            }
+        };
+        this.app = mount(IndexComponent, opts);  // 传给 Index.svelte
+    }
+}
+```
+
+**独立模式判断**（[+page.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/[...catchall]/+page.svelte) L109-L120）：
+```javascript
+let {
+    is_embed = false,    // 默认 false
+    ...
+}: Props = $props();
+```
+
+---
+
+### 11.2 主题 CSS 注入路径对比
+
+两种模式下主题 CSS 的加载时机、方式、位置都不同，是理解整个链路的关键。
+
+#### 链路总览
+
+```
+                              ┌─────────────────────────────────────┐
+                              │        Python 后端（相同）           │
+                              │  Base → Soft → _get_theme_css()     │
+                              │  _stylesheets[], _font_css[]        │
+                              │  theme_hash (SHA256)                │
+                              └──────────────┬──────────────────────┘
+                                             │ config.theme_css / config.stylesheets
+                                             │ /theme.css 路由
+                    ┌────────────────────────┴────────────────────────┐
+                    │                                                 │
+        ┌───────────▼───────────┐                         ┌───────────▼───────────┐
+        │   独立模式（App）     │                         │   嵌入模式（SPA）     │
+        │  SvelteKit SSR        │                         │  Web Component         │
+        │  静态注入 head        │                         │  动态 JS 加载          │
+        └───────────────────────┘                         └───────────────────────┘
+```
+
+#### 独立模式（App）注入路径
+
+**第 1 步：布局层静态导入**（[+layout.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/+layout.svelte) L1-L6）
+
+SvelteKit 构建时会将这些 CSS 打包进应用的样式块中：
+```javascript
+import "@gradio/theme/reset.css";       // 浏览器样式重置
+import "@gradio/theme/global.css";      // 全局基础样式
+import "@gradio/theme/pollen.css";      // pollen 设计令牌
+import "@gradio/theme/typography.css";  // 排版预设
+import "@gradio/theme/gradio-style.scss"; // Gradio 组件样式
+```
+
+**第 2 步：页面层静态注入主题 CSS**（[+page.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/[...catchall]/+page.svelte) L422-L430）
+
+通过 `<svelte:head>` 在 SSR 时将 `<link>` 标签注入到 `<head>`：
+```svelte
+<svelte:head>
+    <link rel="stylesheet" href={root + "/theme.css?v=" + config?.theme_hash} />
+    {#if config?.stylesheets}
+        {#each config.stylesheets as stylesheet}
+            {#if stylesheet.startsWith("http:") || stylesheet.startsWith("https:")}
+                <link rel="stylesheet" href={stylesheet} />
+            {/if}
+        {/each}
+    {/if}
+</svelte:head>
+```
+
+**关键特点**：
+- `/theme.css` 由 SvelteKit 在 SSR/CSR 时作为普通 `<link>` 注入到 `document.head`
+- Google Fonts 等外链 stylesheets 同样走 `<link>` 静态注入
+- 首屏即有样式，无 FOUC（无样式内容闪烁）
+
+**第 3 步：SSR 防闪屏内联样式**（[+layout.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/+layout.svelte) L12-L21）
+
+```css
+:global(body) {
+    background: var(--body-background-fill);
+    color: var(--body-text-color);
+}
+
+@media (prefers-color-scheme: dark) {
+    :global(body:not(.theme-loaded)) {
+        background: var(--neutral-950);  /* 深色模式下先显示深色背景 */
+    }
+}
+```
+
+在主题初始化完成（`.theme-loaded` 类加上）之前，用系统媒体查询兜底，避免白屏闪。
+
+#### 嵌入模式（SPA）注入路径
+
+**第 1 步：入口启动预加载**（[main.ts](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/main.ts) L33-L41, L86-L90）
+
+`<gradio-app>` 自定义元素连接到 DOM 时，先预加载字体和入口 CSS：
+```javascript
+// main.ts L86-L90
+if (typeof FONTS !== "string") {
+    FONTS.forEach((f) => mount_css(f, document.head));  // 字体预加载
+}
+await mount_css(ENTRY_CSS, document.head);               // 应用入口 CSS
+```
+
+**第 2 步：Index.svelte 动态加载**（[Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte) L137-L171）
+
+在 `mount_custom_css()` 中动态加载主题和用户自定义 CSS：
+```javascript
+async function mount_custom_css(css_string: string | null): Promise<void> {
+    // 1) 用户自定义 CSS: 走 prefix_css 加作用域前缀后内联
+    if (css_string) {
+        if (!css_text_stylesheet) {
+            css_text_stylesheet = document.createElement("style");
+            document.head.appendChild(css_text_stylesheet);
+        }
+        css_text_stylesheet.textContent = prefix_css(
+            css_string, version, css_text_stylesheet
+        );
+    }
+
+    // 2) 主题 CSS: 走 mount_css() 动态创建 <link>
+    await mount_css(
+        config.root + "/theme.css?v=" + config.theme_hash,
+        document.head
+    );
+
+    // 3) stylesheets: 外链走 mount_css，本地 CSS 走 fetch + prefix_css 内联
+    if (!config.stylesheets) return;
+    await Promise.all(
+        config.stylesheets.map((stylesheet) => {
+            let absolute_link = stylesheet.startsWith("http:") || stylesheet.startsWith("https:");
+            if (absolute_link) {
+                return mount_css(stylesheet, document.head);  // 绝对URL → <link>
+            }
+            return fetch(config.root + "/" + stylesheet)      // 相对URL → fetch → 内联
+                .then((response) => response.text())
+                .then((css_string) => {
+                    prefix_css(css_string, version);
+                });
+        })
+    );
+}
+```
+
+**关键差异总结**：
+
+| 注入项 | 独立模式（App） | 嵌入模式（SPA） |
+|--------|-----------------|-----------------|
+| 主题 CSS `/theme.css` | `<svelte:head>` 静态 `<link>` | `mount_css()` 动态 `<link>` |
+| 重置/全局/排版样式 | 构建时静态 import 打包 | 无需（SPA 入口已包含） |
+| Google Fonts 外链 | `<svelte:head>` 静态 `<link>` | `mount_css()` 动态 `<link>` |
+| 本地 stylesheets | **仅加载绝对 URL**，相对 URL 被忽略 | 所有 URL 都加载，相对 URL `fetch` 后 `prefix_css` 内联 |
+| 用户自定义 `css` | `<style>` 标签 `prefix_css` 后内联 | `<style>` 标签 `prefix_css` 后内联 |
+| SSR 防闪屏 | `+layout.svelte` 内联 body 背景 | 无 SSR，由嵌入方负责 |
+
+---
+
+### 11.3 字体样式加载机制
+
+字体有三种类型，两种模式下加载路径也有差异。
+
+#### 字体类型与后端分流
+
+在 `Base.__init__()` 时就已完成字体的分类分流：
+
+| 字体类型 | 后端处理 | 产物 |
+|----------|---------|------|
+| `GoogleFont` | 检查本地是否有字体文件 → 有则降级为 LocalFont；无则生成 CDN URL | `_stylesheets[]` 中的 URL 字符串 |
+| `LocalFont` | 生成 `@font-face { ... }` CSS 字符串 | `_font_css[]` 中的 CSS 片段 |
+| `Font`（系统字体） | 无需加载，仅在 CSS 变量中声明字体族 | 无额外产物 |
+
+#### 独立模式下字体加载
+
+1. **Google Fonts**：通过 `<svelte:head>` 中的 `<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=...">` 加载
+2. **LocalFont**：内联在 `/theme.css` 开头的 `@font-face` 规则中，随主题 CSS 一起加载
+3. **字体变量**：通过 `/theme.css` 的 `:root { --font: "IBM Plex Sans", system-ui, ...; }` 声明
+
+#### 嵌入模式下字体加载
+
+1. **Google Fonts**：通过 `mount_css()` 动态创建 `<link>` 加载，与独立模式等效
+2. **LocalFont**：同样内联在 `/theme.css` 中，随 `mount_css("/theme.css")` 加载
+3. **内置字体预加载**：main.ts L86-L88 在连接时就遍历 `FONTS` 数组（构建时注入的字体列表）调用 `mount_css()` 预加载
+4. **相对路径 stylesheets**：`fetch` 拉取后 `prefix_css()` 加作用域前缀，内联到 `<style>` 标签
+
+#### 关键代码：mount_css() 实现
+
+[css.ts](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/core/src/css.ts) L15-L37：
+
+```javascript
+export function mount_css(url: string, target: HTMLElement): Promise<void> {
+    // CDN 适配：如果页面 origin 与构建 origin 不同，生成绝对 URL
+    const base = new URL(import.meta.url).origin;
+    var _url = url;
+    if (window.location.origin !== base) {
+        _url = new URL(url, base).href;
+    }
+
+    // 防重复：已存在相同 href 的 link 就跳过
+    const existing_link = document.querySelector(`link[href='${_url}']`);
+    if (existing_link) return Promise.resolve();
+
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = _url;
+
+    return new Promise((res, rej) => {
+        link.addEventListener("load", () => res());
+        link.addEventListener("error", () => {
+            console.error(`Unable to preload CSS for ${_url}`);
+            res();   // 加载失败不阻塞
+        });
+        target.appendChild(link);   // 通常是 document.head
+    });
+}
+```
+
+**CDN 适配逻辑**是嵌入模式下的关键：当 Gradio 资源从 CDN 加载但页面在另一个 origin 时，`mount_css` 会把相对 URL 转成 CDN 的绝对 URL，确保样式能正确加载。
+
+---
+
+### 11.4 暗色模式切换：两种模式下的 `.dark` 类挂载差异
+
+这是最容易混淆的部分。`apply_theme()` 在两种模式下把 `.dark` 类挂到**完全不同的 DOM 元素**上。
+
+#### 核心代码对比
+
+**独立模式版本**（[+page.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/[...catchall]/+page.svelte) L158-L168）：
+```javascript
+function apply_theme(target: HTMLElement, theme: "dark" | "light"): void {
+    const dark_class_element = is_embed ? target.parentElement! : document.body;
+    const bg_element = is_embed ? target : target.parentElement!;
+
+    bg_element.style.background = "var(--body-background-fill)";
+    dark_class_element.classList.add("theme-loaded");
+
+    if (theme === "dark")   dark_class_element.classList.add("dark");
+    else                    dark_class_element.classList.remove("dark");
+}
+```
+
+**嵌入模式版本**（[Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte) L269-L278）：
+```javascript
+function apply_theme(target: HTMLDivElement, theme: "dark" | "light"): void {
+    const dark_class_element = is_embed ? target.parentElement! : document.body;
+    const bg_element = is_embed ? target : target.parentElement!;
+
+    bg_element.style.background = "var(--body-background-fill)";
+
+    if (theme === "dark") {
+        dark_class_element.classList.add("dark");
+    } else {
+        dark_class_element.classList.remove("dark");
+    }
+}
+```
+
+两份代码逻辑完全一致，只是调用时机略有不同（独立模式在模块初始化时调用，嵌入模式在 `onMount` 时调用）。
+
+#### DOM 结构与挂载点
+
+先看最终渲染的 DOM 结构：
+
+**独立模式 DOM 树**：
+```
+document.body                           ← .dark / .theme-loaded 挂在这里
+└── <div class="gradio-container ...">  ← target.parentElement, bg_element
+    └── <div class="main ...">          ← target（<Embed> 的 wrapper）
+        └── <Blocks ... />
+```
+
+| 变量 | 值 | 说明 |
+|------|----|------|
+| `target` | `<div class="main ...">` | `wrapper` 绑定到 `<Embed>` 的内部 div |
+| `dark_class_element` | `document.body` | `.dark` 类挂在 body 上，全局生效 |
+| `bg_element` | `target.parentElement` | 背景色设到 `.gradio-container` 上 |
+
+**嵌入模式 DOM 树**：
+```
+<gradio-app>                           ← .dark 挂在这里（target.parentElement）
+└── <div class="gradio-container gradio-container-xxx embed-container">  ← target（wrapper）
+    └── <div class="main ...">         ← bg_element，背景色设到这里
+        └── <Blocks ... />
+```
+
+| 变量 | 值 | 说明 |
+|------|----|------|
+| `target` | `<div class="gradio-container ...">` | `wrapper` 绑定到 `<Embed>` 的最外层 div |
+| `dark_class_element` | `<gradio-app>` 自定义元素 | `.dark` 类挂在自定义元素上，不污染宿主 body |
+| `bg_element` | `target`（`.gradio-container`） | 背景色设到容器自身 |
+
+#### CSS 选择器匹配逻辑
+
+主题 CSS 中的暗模式选择器是：
+```css
+:root.dark, :root .dark {
+  --body-background-fill: var(--neutral-950);
+  ...
+}
+```
+
+- **独立模式**：`:root.dark` 匹配（`document.documentElement` 的子元素 body 有 `.dark` 类，`:root.dark` 实际匹配 html 上是否有 dark？不对，实际是 `body.dark` 让 `:root .dark` 匹配——因为 body 是 :root 的后代且有 .dark 类）
+- **嵌入模式**：`:root .dark` 匹配（`<gradio-app>` 是 `:root` 的后代且有 `.dark` 类）
+
+两种模式都通过 `:root .dark` 这个后代选择器触发暗模式变量覆写。
+
+#### 模式优先级与切换流程
+
+**优先级链**（L122-L137）：
+```
+theme_mode prop（Svelte 组件传入）
+    > URL ?__theme=dark|light
+        > "system"（默认）→ matchMedia("(prefers-color-scheme: dark)")
+```
+
+**完整切换流程**（[handle_theme_mode](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte) L228-L248）：
+```javascript
+function handle_theme_mode(target: HTMLDivElement): "light" | "dark" {
+    // 1) 网站模式强制 light（用于 gradio.app 官网展示）
+    const force_light = window.__gradio_mode__ === "website";
+    if (force_light) new_theme_mode = "light";
+    else {
+        // 2) 读 URL 参数 ?__theme=
+        const url_color_mode = url.searchParams.get("__theme");
+        // 3) 优先级: prop > URL > system
+        new_theme_mode = theme_mode || url_color_mode || "system";
+    }
+
+    if (new_theme_mode === "dark" || new_theme_mode === "light") {
+        apply_theme(target, new_theme_mode);  // 直接应用
+    } else {
+        new_theme_mode = sync_system_theme(target);  // 监听系统主题变化
+    }
+    return new_theme_mode;
+}
+
+function sync_system_theme(target): "light" | "dark" {
+    // 初始匹配
+    function update_scheme() {
+        const _theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        apply_theme(target, _theme);
+        return _theme;
+    }
+    const theme = update_scheme();
+    // 监听变化
+    matchMedia("(prefers-color-scheme: dark)").addEventListener("change", update_scheme);
+    return theme;
+}
+```
+
+#### theme-loaded 类的防闪屏作用
+
+`.theme-loaded` 类是 SSR 防闪屏机制的关键。在 [+layout.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/+layout.svelte) L17-L21：
+```css
+@media (prefers-color-scheme: dark) {
+    :global(body:not(.theme-loaded)) {
+        background: var(--neutral-950);
+    }
+}
+```
+
+时序：
+1. 浏览器加载 HTML，系统是深色模式 → `body:not(.theme-loaded)` 生效，body 显示 `--neutral-950`（深色）
+2. JS 加载，`handle_theme_mode()` 调用 `apply_theme()` → 给 body 加 `.theme-loaded` 和 `.dark`
+3. `.theme-loaded` 加上后，`:not(.theme-loaded)` 规则失效，主题 CSS 的 `:root .dark` 规则接管
+4. 背景色平滑过渡，用户看不到白屏闪烁
+
+---
+
+### 11.5 prefix_css：CSS 作用域隔离机制
+
+[prefix_css()](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/core/src/css.ts) L39-L119 是嵌入模式下防止样式污染宿主页面的核心机制。
+
+#### 启用条件（特性检测）
+
+```javascript
+let supports_adopted_stylesheets = false;
+if (
+    typeof window !== "undefined" &&
+    "attachShadow" in Element.prototype &&
+    "adoptedStyleSheets" in Document.prototype
+) {
+    const shadow_root_test = document.createElement("div").attachShadow({ mode: "open" });
+    supports_adopted_stylesheets = "adoptedStyleSheets" in shadow_root_test;
+}
+```
+
+必须同时支持 **Shadow DOM** 和 **adoptedStyleSheets** 才启用。不支持时 `prefix_css` 直接返回原字符串（L44）。
+
+#### 核心处理逻辑
+
+对于传入的 CSS 字符串，`prefix_css` 做了四件事：
+
+**1. @import 抽离前置**（L53-L57）：
+```javascript
+let importString = "";
+string = string.replace(/@import\s+url\((.*?)\);\s*/g, (match, url) => {
+    importString += `@import url(${url});\n`;
+    return "";
+});
+```
+CSS 语法要求 `@import` 必须在最前面，所以先抽出来。
+
+**2. 构造前缀**（L62）：
+```javascript
+let gradio_css_infix = `.gradio-container.gradio-container-${version} .contain `;
+```
+版本号用于多版本共存时的隔离。
+
+**3. 按规则类型遍历处理**（L64-L117）：
+
+| 规则类型 | 处理方式 | 示例 |
+|----------|---------|------|
+| **CSSStyleRule**（普通样式） | 每个选择器前加前缀；`.dark` 移到最前面 | `.dark .foo` → `.dark .gradio-container.x .contain .foo` |
+| **CSSMediaRule**（媒体查询） | 内部规则同样加前缀，保留媒体查询 | `@media (max-width:600px) { .foo {...} }` → 包裹前缀版本 |
+| **CSSKeyframesRule**（关键帧） | 原样保留，不做前缀 | `@keyframes spin { ... }` 直接输出 |
+| **CSSFontFaceRule**（字体） | 原样保留 | `@font-face { ... }` 直接输出 |
+
+**4. 普通选择器前缀注入**（L68-L82）：
+```javascript
+const selector = rule.selectorText;
+const new_selector = selector
+    .replace(".dark", "")          // 先去掉 .dark
+    .split(",")                    // 多选择器拆分
+    .map((s) =>
+        `${is_dark_rule ? ".dark" : ""} ${gradio_css_infix} ${s.trim()} `
+    )                               // 每个选择器前加前缀，.dark 移到最前
+    .join(",");
+css_string += rule.cssText;          // 保留原始规则（向后兼容）
+css_string += rule.cssText.replace(selector, new_selector);  // 追加前缀版本
+```
+
+**注意**：原始规则和前缀版本都会输出，这是为了向后兼容。
+
+#### 效果示例
+
+输入 CSS：
+```css
+.dark .foo { color: red; }
+.bar { font-size: 14px; }
+```
+
+输出 CSS（version=4.0.0）：
+```css
+/* 原始规则保留 */
+.dark .foo { color: red; }
+.bar { font-size: 14px; }
+/* 前缀版本追加 */
+.dark .gradio-container.gradio-container-4.0.0 .contain .foo { color: red; }
+.gradio-container.gradio-container-4.0.0 .contain .bar { font-size: 14px; }
+```
+
+这样用户自定义的 CSS 只会作用于 `.gradio-container` 内部，不会外泄到宿主页面。
+
+#### 调用时机与位置
+
+- **用户自定义 CSS**（`config.css`）：[Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte) L144，内联到 `<style>` 标签
+- **本地 stylesheets**（相对路径）：[Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte) L167，fetch 后 `prefix_css` 注入
+
+---
+
+### 11.6 SSR 与预计算主题值
+
+后端在 `get_config()` 时会预计算 4 个关键主题变量的字面量，用于 SSR：
+
+[blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/gradio/blocks.py) L2405-L2416：
+```python
+"body_css": {
+    "body_background_fill": self.theme._get_computed_value("body_background_fill"),
+    "body_text_color": self.theme._get_computed_value("body_text_color"),
+    "body_background_fill_dark": self.theme._get_computed_value("body_background_fill_dark"),
+    "body_text_color_dark": self.theme._get_computed_value("body_text_color_dark"),
+}
+```
+
+调用 `_get_computed_value()` 递归解析所有 `*引用`，得到最终的颜色字面量（如 `"#ffffff"`）。
+
+这部分数据目前主要用于：
+1. **嵌入卡片的背景色预览**：`<Embed>` 组件可在主题加载前用这些值设置占位背景
+2. **SSR 模板内联**：供服务端渲染时直接内联到 `<body style="...">` 上
+
+目前 SvelteKit 的实现中，`body_css` 实际上**没有被直接使用**，而是通过 `+layout.svelte` 中的 CSS 变量方式设置背景色。这是因为 CSS 变量方案更灵活，支持运行时切换。
+
+---
+
+### 11.7 嵌入专属主题变量：embed_radius
+
+主题系统中专门有一个变量供嵌入模式使用：
+
+[base.py](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/gradio/themes/base.py) L536, L1088：
+```python
+self.embed_radius = embed_radius or getattr(self, "embed_radius", "*radius_sm")
+```
+
+在 [Embed.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/core/src/Embed.svelte) L194-L198 中使用：
+```css
+.embed-container {
+    margin: var(--size-4) 0px;
+    border: 1px solid var(--button-secondary-border-color);
+    border-radius: var(--embed-radius);  /* 专属圆角变量 */
+}
+```
+
+当 `display=true`（嵌入且有边框时），`.embed-container` 会应用这个圆角。这就是为什么主题变量列表中有一个看似孤立的 `embed_radius`。
+
+---
+
+### 11.8 两种模式链路总结对比表
+
+| 环节 | 独立模式（App） | 嵌入模式（SPA） |
+|------|-----------------|-----------------|
+| **入口** | SvelteKit `/[...catchall]` 路由 | `<gradio-app>` 自定义元素 |
+| **`is_embed` 默认** | `false` | `true` |
+| **基础样式加载** | 构建时 import 打包进应用 | main.ts 启动时 `mount_css(ENTRY_CSS)` |
+| **主题 CSS `/theme.css`** | `<svelte:head>` 静态 `<link>` | `mount_css()` 动态 `<link>` |
+| **Google Fonts** | `<svelte:head>` 静态 `<link>` | `mount_css()` 动态 `<link>` |
+| **本地 stylesheets** | 仅加载绝对 URL，相对 URL 被忽略 | 所有 URL 都加载，相对 URL fetch 后 `prefix_css` 内联 |
+| **`.dark` 挂载点** | `document.body` | `<gradio-app>` 自定义元素 |
+| **背景色设置** | `.gradio-container` 容器 | `.main` 内部 div |
+| **`.theme-loaded`** | 有，用于 SSR 防闪屏 | 无（SSR 场景不适用） |
+| **防闪屏机制** | `+layout.svelte` 中 `@media` 兜底 + `body:not(.theme-loaded)` | 依赖嵌入方处理，通常无 |
+| **CSS 作用域隔离** | 不需要（独占页面） | `prefix_css()` 给所有选择器加 `.gradio-container.version .contain` 前缀 |
+| **CDN 适配** | SvelteKit 构建时处理 | `mount_css()` 运行时判断 origin，自动转绝对 URL |
+| **SSR 支持** | 完整支持 | 不适用（客户端渲染） |
+| **自定义样式注入点** | `<style>` 标签 + `prefix_css` | `<style>` 标签 + `prefix_css` |
+
+### 关键理解点
+
+1. **两套 Svelte 入口**：Gradio 实际上有两个前端入口——`js/app`（SvelteKit SSR，独立模式）和 `js/spa`（纯客户端 SPA，嵌入模式），各自有独立的主题加载逻辑但共享 `@gradio/core` 工具。
+
+2. **CSS 变量的跨模式复用**：主题 CSS 中的 `:root.dark, :root .dark` 选择器设计非常巧妙——`.dark` 类挂在 body 上匹配 `:root .dark`，挂在自定义元素上也匹配 `:root .dark`，同一套 CSS 适配两种挂载模式。
+
+3. **prefix_css 的双重输出**：同时输出原始规则和前缀版本，保证了向后兼容——旧的自定义 CSS 即使不做前缀也能工作，同时新的前缀版本确保不污染宿主页面。
+
+4. **CDN 适配的关键**：`mount_css()` 中的 origin 判断是嵌入模式下的隐形基础设施——当 Gradio 静态资源从 CDN 提供时，能正确把 `/theme.css` 转成 `https://cdn.xxx.com/theme.css`。
+
+5. **防闪屏的三层防护**：独立模式下有三层防闪屏——① `+layout.svelte` 的媒体查询兜底、② `body:not(.theme-loaded)` 的过渡背景、③ 主题 CSS 尽早通过 `<link>` 加载，三者配合实现无缝的主题切换体验。
