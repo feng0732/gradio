@@ -923,7 +923,9 @@ def preprocess(
 ### 9.1 序列化初始路径
 1. 组件初始化入口: [base.py#L207-L219](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/base.py#L207-L219)
 2. postprocess 主流程: [dataframe.py#L461-L517](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L461-L517)
-3. metadata 提取: [dataframe.py#L609-L639](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L609-L639)
+3. metadata 统一入口 `get_metadata()`: [dataframe.py#L436-L459](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L436-L459)
+4. metadata 分支 1：Styler 自动生成 `__extract_metadata()`: [dataframe.py#L609-L639](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L609-L639)
+5. metadata 分支 2：dict 直接携带 `value.get("metadata", None)`: [dataframe.py#L457-L458](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L457-L458)
 
 ### 9.2 单元格编辑路径
 1. 双击进入编辑: [Table.svelte#L433-L446](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L433-L446)
@@ -942,10 +944,20 @@ def preprocess(
 2. 后端自动推断: [dataframe.py#L519-L606](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L519-L606)
 3. datatype 对齐: [Index.svelte#L24-L39](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/Index.svelte#L24-L39)
 
-### 9.5 display_value 路径
-1. 显示优先级逻辑: [EditableCell.svelte#L90-L92](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/EditableCell.svelte#L90-L92)
-2. get_display_value 函数: [Table.svelte#L353-L357](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L353-L357)
-3. push_change 中 metadata 置空: [Table.svelte#L363-L374](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L363-L374)
+### 9.5 metadata 来源与 display_value 路径
+
+**后端 metadata 三条来源路径**：
+1. 统一入口 `get_metadata()`: [dataframe.py#L436-L459](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L436-L459)
+2. Styler 自动生成分支 `__extract_metadata()`: [dataframe.py#L609-L639](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L609-L639)
+3. dict 直接携带分支 `value.get("metadata", None)`: [dataframe.py#L457-L458](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L457-L458)
+
+**前端 display_value 消费路径**：
+4. 前端接收并拆分 metadata → display_value/styling: [standalone/Index.svelte#L123-L124](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/standalone/Index.svelte#L123-L124)
+5. 显示优先级逻辑（EditableCell）: [EditableCell.svelte#L90-L92](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/EditableCell.svelte#L90-L92)
+6. get_display_value 函数（Table）: [Table.svelte#L353-L357](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L353-L357)
+
+**编辑回传 metadata 丢弃路径**：
+7. push_change 中 metadata 置空: [Table.svelte#L363-L374](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L363-L374)
 
 ### 9.6 事件系统路径
 1. push_change 触发点: [Table.svelte#L363-L374](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/js/dataframe/shared/Table.svelte#L363-L374)
