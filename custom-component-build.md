@@ -269,38 +269,213 @@ Gradio 使用 **虚拟模块** `virtual:component-loader` 来统一处理内置�
 - 开发模式下，将自定义组件信息注入到 `window.__GRADIO__CC__` 和 `window.__GRADIO__CC__RUNTIMES__`
 - 组件加载器优先从这些全局变量中查找组件
 
-#### 3.1.2 load_component 函数
+#### 3.1.2 load_component 的两层 API 设计
 
-核心加载函数：[load_component()](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/component_loader.js#L8-L75)
+`load_component` 在代码中存在**两种签名**的实现，分别对应不同的调用场景，两者通过包装函数串联：
 
-加载策略（优先级从高到低）：
+**第 1 层：虚拟模块底层 API（对象参数形式）**
 
-1. **缓存检查**：`request_map` 中是否已有请求
-2. **开发模式自定义组件**：从 `window.__GRADIO__CC__` 查找
-3. **内置组件**：从 `component_map` 查找
-4. **动态 HTTP 加载**：通过 `/custom_component/{id}/...` 接口加载（生产模式自定义组件）
-5. **降级处理**：加载失败时使用 `@gradio/fallback` 组件（仅 example 变体）
+来源：`import { load_component } from "virtual:component-loader"`
 
-#### 3.1.3 动态 HTTP 加载
+签名在 [vite-env-override.d.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/vite-env-override.d.ts#L10-L20)：
 
-生产环境下，自定义组件通过 HTTP 动态加载：
+```typescript
+// virtual:component-loader
+interface Args {
+    api_url: string;
+    name: string;
+    id?: string;
+    variant: "component" | "example" | "base";
+}
+export function load_component(args: Args): {
+    name: ComponentMeta["type"];
+    component: LoadedComponent;
+    runtime: false | typeof import("svelte");
+};
+```
+
+这是最原始的加载器，实现位于 [component_loader.js](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/component_loader.js#L8-L75)，由 `@gradio/core` 的 `init_utils.ts` 和 `_init.ts` 直接导入。
+
+**第 2 层：Gradio 类 shared_props API（位置参数形式）**
+
+来源：每个组件实例 `this.shared.load_component` 或 `this.load_component`
+
+签名在 [utils.svelte.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/utils/src/utils.svelte.ts#L283-L287)：
+
+```typescript
+export type load_component = (
+    name: string,
+    variant: "component" | "example" | "base",
+    component_class_id?: string
+) => LoadedComponentWithRuntime;
+```
+
+这一层在 [init.svelte.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/init.svelte.ts#L754-L758) 中通过闭包包装底层 API 并注入到 `shared_props`：
+
+```typescript
+_shared_props.load_component = (
+    name: string,
+    variant: "base" | "component" | "example",
+    component_class_id?: string
+) => get_component(name, component_class_id || "", api_url, variant);
+```
+
+**中间工具函数：get_component()**
+
+[init_utils.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/init_utils.ts#L11-L25) 中的 `get_component()` 是连接两层 API 的桥梁：
+
+```typescript
+export function get_component(
+    type: string,
+    class_id: string,
+    root: string,
+    variant: "component" | "example" | "base" = "component"
+): { component: LoadingComponent; runtime: false | typeof import("svelte") } {
+    if (type === "api") type = "state";
+    return load_component({
+        api_url: root,     // 从闭包/参数获取 api_url
+        name: type,
+        id: class_id,
+        variant
+    });
+}
+```
+
+#### 3.1.3 完整调用链
+
+组件加载共有**四个入口**，最终都汇聚到虚拟模块的 `load_component`：
+
+```
+调用方                                 函数签名                          汇聚点
+───────────────────────────────────────────────────────────────────────────────────
+① 预加载 create_layout/preload_visible
+   _init.ts:770-786               load_component({api_url,name,id,variant})
+   _init.ts:980                         ↓
+② walk_layout 递归处理每个节点         get_component(type,class_id,root,variant)
+   _init.ts:354-360                      ↓
+③ 组件内部 this.load_component         load_component(name,variant,class_id?)
+   Dataset.svelte:128                    ↓
+   Chatbot load_components:307    _shared_props.load_component = 包装函数
+                                        ↓
+                              get_component(name, id, api_url, variant)
+                                        ↓
+                              virtual:component-loader → load_component({...})
+```
+
+各入口说明：
+
+| 入口 | 位置 | 用途 |
+|-----|------|------|
+| ① 预加载 | [_init.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/_init.ts#L204) | 页面初始化时预加载所有可见组件 |
+| ② walk_layout | [_init.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/_init.ts#L354-L360) | 遍历布局树时，组件尚未加载则动态加载 |
+| ③ Dataset 内部 | [Dataset.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/dataset/Dataset.svelte#L128-L132) | 示例表格中渲染每种类型的 example 组件 |
+| ④ Chatbot 内部 | [utils.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/chatbot/shared/utils.ts#L307) | 消息中嵌入的自定义组件按需加载 |
+
+#### 3.1.4 底层 load_component 的完整加载策略
+
+核心函数：[component_loader.js L8-L75](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/component_loader.js#L8-L75)
 
 ```javascript
-// component_loader.js 第 91-119 行
+export function load_component({ api_url, name, id, variant }) {
+    const comps = is_browser && window.__GRADIO__CC__;
+    const runtimes = is_browser && window.__GRADIO__CC__RUNTIMES__;
+
+    const _component_map = {
+        ...component_map,           // 内置组件（构建时注入）
+        ...(!comps ? {} : comps)    // 开发模式自定义组件
+    };
+
+    let _id = id || name;
+
+    // 第 1 层：缓存检查
+    if (request_map[`${_id}-${variant}`]) {
+        return { component, name, runtime };
+    }
+
+    try {
+        // 第 2 层：从静态映射表加载（内置组件 + 开发模式自定义组件）
+        if (!_component_map?.[_id]?.[variant] && !_component_map?.[name]?.[variant])
+            throw new Error();
+        request_map[`${_id}-${variant}`] = (
+            _component_map?.[_id]?.[variant] ||
+            _component_map?.[name]?.[variant]
+        )();
+        runtime_map[`${_id}-${variant}`] =
+            (is_browser && window.__GRADIO__CC__RUNTIMES__?.[id]) || false;
+        return { name, component, runtime };
+    } catch (e) {
+        if (!_id) throw new Error(`Component not found: ${name}`);
+        try {
+            // 第 3 层：HTTP 动态加载（生产环境自定义组件）
+            const cc = get_component_with_css(api_url, _id, variant);
+            const [component_module, svelte_runtime_module] = cc;
+            request_map[`${_id}-${variant}`] = component_module;
+            runtime_map[`${_id}-${variant}`] = svelte_runtime_module;
+            return { name, component, runtime };
+        } catch (e) {
+            // 第 4 层：兜底回退（仅 example 变体）
+            if (variant === "example") {
+                request_map[`${_id}-${variant}`] = import("@gradio/fallback/example");
+                return {
+                    name,
+                    component: request_map[`${_id}-${variant}`],
+                    runtime: runtime_map[`${_id}-${variant}`]  // 注意：此处 runtime 可能未定义
+                };
+            }
+            console.error(`failed to load: ${name}`);
+            console.error(e);
+            throw e;
+        }
+    }
+}
+```
+
+加载优先级（从高到低）：
+
+1. **缓存命中**：`request_map` 中已有请求 Promise，直接复用
+2. **静态映射加载**：内置组件（`component_map`）或开发模式自定义组件（`window.__GRADIO__CC__`）
+3. **HTTP 动态加载**：调用 `get_component_with_css()` 从服务器加载
+4. **兜底回退**：仅当 `variant === "example"` 且前面全部失败时，回退到 `@gradio/fallback/example`
+
+#### 3.1.5 动态 HTTP 加载
+
+生产环境下，自定义组件通过 HTTP 动态加载。核心函数：[get_component_with_css()](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/component_loader.js#L91-L120)
+
+```javascript
 function get_component_with_css(api_url, id, variant) {
-    const path = `${api_url}/custom_component/${id}/client/${variant}/index.js`;
-    
+    const environment = is_browser ? "client" : "server";
+
+    if (environment === "server") {
+        // Node.js 不能动态 import HTTP URL，SSR 环境直接回退
+        return [import("@gradio/fallback"), Promise.resolve(false)];
+    }
+
+    const path = `${api_url}/custom_component/${id}/${environment}/${variant}/index.js`;
+
     return [
-        // 1. 加载样式 + 组件 JS
+        // 1. 并行加载 CSS 样式 + 组件 JS
         Promise.all([
-            load_css(`${api_url}/custom_component/${id}/client/${variant}/style.css`),
-            import(path)  // 动态 ES 模块导入
-        ]),
-        // 2. 加载 Svelte 运行时
-        import(`${api_url}/custom_component/${id}/client/${variant}/svelte_runtime_entry.js`)
+            load_css(
+                `${api_url}/custom_component/${id}/${environment}/${variant}/style.css`
+            ),
+            import(/* @vite-ignore */ path)  // 动态 ES 模块导入
+        ]).then(([_, component_module]) => {
+            return component_module;
+        }),
+        // 2. 加载 Svelte 运行时（独立版本，避免与主应用冲突）
+        import(
+            /* @vite-ignore */
+            `${api_url}/custom_component/${id}/${environment}/${variant}/svelte_runtime_entry.js`
+        )
     ];
 }
 ```
+
+**浏览器环境加载流程**：
+1. 并行发起 3 个 HTTP 请求：`style.css`、`index.js`（组件）、`svelte_runtime_entry.js`（运行时）
+2. CSS 通过 `<link>` 注入 `document.head`
+3. 组件 JS 和运行时通过 `import()` 动态加载为 ES Module
+4. 返回 `[component_promise, runtime_promise]`
 
 ### 3.2 组件挂载机制
 
@@ -513,62 +688,119 @@ Fallback 组件的核心特点：
 - 前端使用 `JsonView` 以 JSON 格式渲染任意数据
 - 支持 `change` 事件和加载状态显示
 
-### 6.2 组件加载失败时的回退逻辑
+### 6.2 回退逻辑的两层设计
 
-核心回退代码位于 [component_loader.js](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/component_loader.js) 中。
+回退（fallback）在代码中分为**两个不同层级**，分别处理不同场景，对应两个不同的代码位置。
 
-#### 6.2.1 Example 变体回退
+#### 6.2.1 SSR 环境强制回退（在 get_component_with_css 内部）
 
-当**示例组件**（example variant）加载失败时，自动回退到 `@gradio/fallback/example`：
-
-```javascript
-// component_loader.js 第 55-63 行
-export async function load_component(id, variant, api_url) {
-    // ... 尝试各种加载方式 ...
-    // 最终兜底：只有 example 变体支持 fallback
-    if (variant === "example") {
-        request_map[`${_id}-${variant}`] = import("@gradio/fallback/example");
-        return [request_map[`${_id}-${variant}`], Promise.resolve(false)];
-    }
-    throw new Error(`Could not load component ${id} variant ${variant}`);
-}
-```
-
-**注意**：主组件（`variant === "component"`）加载失败时**不会**使用 fallback，而是直接抛出错误。这意味着：
-- `gr.Examples` 中展示的示例组件加载失败 → 使用 JSON 形式兜底显示
-- 用户界面中的实际组件加载失败 → 页面报错，组件不可用
-
-#### 6.2.2 SSR 模式下的强制回退
-
-在**服务端渲染（SSR）**环境中，自定义组件会被强制回退：
+**位置**：[component_loader.js L91-L99](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/component_loader.js#L91-L99)
 
 ```javascript
-// component_loader.js 第 89-98 行
-function get_component_type(_id, variant, api_url) {
+function get_component_with_css(api_url, id, variant) {
     const environment = is_browser ? "client" : "server";
 
     if (environment === "server") {
+        // Node.js cannot dynamically import HTTP URLs.
         // Fall back to @gradio/fallback during SSR; the real component
         // will be loaded client-side.
         return [import("@gradio/fallback"), Promise.resolve(false)];
     }
-    // ... 浏览器环境正常加载 ...
+    // ... 浏览器环境正常发起 HTTP 请求 ...
 }
 ```
 
-SSR 回退策略的设计意图：
-1. **避免 Node.js 环境问题**：自定义组件的 JS 可能依赖浏览器 API，在 Node SSR 环境中无法运行
-2. **两阶段渲染**：SSR 阶段先渲染 Fallback（JSON 占位），客户端水化（hydration）阶段再加载真实组件
-3. **自定义组件 SSR 尚未支持**：路由代码中有注释 `// Uncomment when we support custom component SSR`，表明未来可能支持
+**为什么必须回退？** 根本原因不是组件依赖浏览器 API，而是 **Node.js 无法通过 `import()` 动态加载 HTTP URL**。在 Node.js 中，动态 `import()` 仅支持文件系统路径和内置模块，不支持 HTTP/HTTPS URL，这是 Node.js 的硬限制。
 
-### 6.3 回退触发场景总结
+SSR 回退的关键特征：
+- **不区分 variant**：无论是 `"component"`、`"example"` 还是 `"base"`，都统一回退到 `@gradio/fallback`（主组件变体，不是 example 变体）
+- **runtime 返回 `false`**：表示不需要独立的 Svelte 运行时（内置组件使用主应用的 Svelte）
+- **不发起任何网络请求**：直接返回内置 fallback，性能零开销
+- **对组件透明**：`load_component` 的外层 try/catch 根本不会感知到这次回退，因为 `get_component_with_css` 正常返回了一个 Promise 数组
+
+#### 6.2.2 Example 变体兜底回退（在 load_component 最外层 catch）
+
+**位置**：[component_loader.js L60-L73](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/component_loader.js#L60-L73)
+
+这是**第二层**回退，当 `get_component_with_css` 本身抛出异常（例如 HTTP 404、网络错误、JS 语法错误等）时才会触发：
+
+```javascript
+try {
+    const cc = get_component_with_css(api_url, _id, variant);
+    // ... 正常处理 ...
+} catch (e) {
+    // 只有 example 变体才兜底
+    if (variant === "example") {
+        request_map[`${_id}-${variant}`] = import("@gradio/fallback/example");
+
+        return {
+            name,
+            component: request_map[`${_id}-${variant}`],
+            runtime: runtime_map[`${_id}-${variant}`]  // 潜在问题：此处 runtime 可能未定义！
+        };
+    }
+    // 主组件或 base 变体：直接抛出错误
+    console.error(`failed to load: ${name}`);
+    console.error(e);
+    throw e;
+}
+```
+
+**回退条件**（必须同时满足）：
+1. 前面所有加载方式都失败（`_component_map` 找不到，`get_component_with_css` 抛出异常）
+2. `variant === "example"`
+
+**主组件（`variant === "component"`）加载失败时无回退**，直接 `throw e`。这意味着：
+- `gr.Examples` 中展示的示例组件加载失败 → 使用 JSON 形式兜底显示（不影响主界面）
+- 用户界面中的实际组件加载失败 → 控制台报错，组件区域空白或异常
+
+**潜在缺陷**：example 回退分支中返回的 `runtime: runtime_map[`${_id}-${variant}`]` 没有被赋值过（因为前面的 try 分支走的是异常路径），实际值为 `undefined`，可能导致 `MountCustomComponent` 中 `await node.runtime` 出问题。
+
+#### 6.2.3 两种回退的对比
+
+| 维度 | SSR 强制回退 | Example 兜底回退 |
+|-----|------------|----------------|
+| 代码位置 | `get_component_with_css()` 函数内部入口判断 | `load_component()` 最外层 catch |
+| 触发条件 | `is_browser === false`（Node.js 环境） | 所有加载方式失败且 `variant === "example"` |
+| 回退组件 | `@gradio/fallback`（主组件变体） | `@gradio/fallback/example`（示例变体） |
+| runtime 返回值 | `Promise.resolve(false)` | `runtime_map[...]`（可能为 `undefined`） |
+| 是否抛异常 | ❌ 正常返回 | ❌ 静默处理（只打 log） |
+| 触发方式 | 每次 SSR 加载都必然触发 | 仅在异常情况下触发 |
+
+### 6.3 SSR 回退的设计意图与两阶段渲染流程
+
+SSR 回退的根本原因是 Node.js 的技术限制，但设计上形成了**两阶段渲染**的模式：
+
+```
+阶段 1：SSR (Node.js 环境)
+    ├─ SvelteKit +page.ts 的 load() 执行
+    ├─ 调用 load_component() → environment="server"
+    ├─ get_component_with_css() 检测到 server 环境
+    ├─ 直接返回 @gradio/fallback（不发 HTTP 请求）
+    ├─ Fallback 以 <JsonView> 形式渲染 value（空壳占位）
+    └─ 生成 HTML 发送给浏览器
+
+阶段 2：客户端水化 (Browser 环境)
+    ├─ 浏览器接收 HTML 并渲染（用户先看到 Fallback 的 JSON）
+    ├─ Svelte hydration 启动
+    ├─ 重新执行 load_component() → environment="client"
+    ├─ get_component_with_css() 检测到 client 环境
+    ├─ 发起 /custom_component/{id}/client/... HTTP 请求
+    ├─ 加载真实组件和独立 Svelte 运行时
+    └─ 替换 Fallback，用户看到真实组件界面
+```
+
+**用户可见影响**：开启 SSR 后，自定义组件区域会先短暂显示 JSON 内容，客户端加载完成后闪烁切换为真实组件。后端路由代码中也有注释 `// Uncomment when we support custom component SSR`（[routes.py L1025-L1026](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/gradio/routes.py#L1025-L1026)），表明未来可能支持自定义组件的 SSR。
+
+### 6.4 回退触发场景总结
 
 | 场景 | 回退组件 | 是否用户可见 | 说明 |
 |------|---------|------------|------|
-| `gradio cc create` 空白模板 | `gradio.components.Fallback` | 否 | 创建时基于其复制代码 |
-| Example 组件加载失败 | `@gradio/fallback/example` | 是 | 示例区以 JSON 显示 |
-| SSR 服务端渲染 | `@gradio/fallback` | 短暂可见 | 客户端水化后替换为真实组件 |
-| 主组件加载失败 | 无回退 | 是（报错） | 直接抛出错误 |
+| `gradio cc create` 空白模板 | `gradio.components.Fallback` | 否 | 创建组件时基于其复制代码 |
+| Example 组件加载完全失败 | `@gradio/fallback/example` | 是（示例区） | 兜底分支 catch，HTTP 请求或解析失败 |
+| SSR 服务端渲染（所有自定义组件） | `@gradio/fallback` | 短暂可见 | `get_component_with_css` 入口直接返回 |
+| 主组件（variant=component）加载失败 | **无回退** | 是（报错/空白） | 直接 `throw e`，无兜底 |
+| 内置组件加载失败 | **无回退** | 是（报错/空白） | 不在 fallback 处理范围内 |
 
 ---
 
@@ -731,7 +963,7 @@ Object.entries(instance_map).forEach(([id, component]) => {
 
 ## 八、浏览器与服务端集成路径差异
 
-Gradio 在浏览器和服务端（SSR/Node.js 环境）对自定义组件的处理存在显著差异，核心原因是：**Node.js 环境缺少浏览器 DOM API，且自定义组件可能依赖浏览器特性**。
+Gradio 在浏览器和服务端（SSR/Node.js 环境）对自定义组件的处理存在显著差异，核心原因是 **Node.js 无法通过 `import()` 动态加载 HTTP URL**（这是 Node.js 的硬限制），而自定义组件需要通过 HTTP URL 动态加载。
 
 ### 8.1 组件加载路径：environment 参数
 
@@ -742,71 +974,117 @@ Gradio 在浏览器和服务端（SSR/Node.js 环境）对自定义组件的处�
 environment: Literal["client", "server"],
 ```
 
+但需要注意的是：**这个参数在 SSR 环境中实际上不会被使用**，因为代码在到达 HTTP 请求之前就已经回退了。
+
 #### 8.1.1 浏览器环境（environment="client"）
 
-[component_loader.js](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/component_loader.js#L92) 通过 `is_browser` 判断：
+[component_loader.js L92](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/component_loader.js#L92) 通过 `is_browser` 判断：
 
 ```javascript
+const is_browser = typeof window !== "undefined";
+// ...
 const environment = is_browser ? "client" : "server";
 ```
 
-浏览器环境的完整加载路径：
-1. `load_component()` → `get_component_type()`
-2. 检查 `window.__GRADIO__CC__`（开发模式自定义组件）
-3. 检查内置 `component_map`
-4. **动态 HTTP 加载**：向 `/custom_component/{id}/client/{variant}/index.js` 发起请求
-5. `import()` 动态加载 ES Module
-6. 返回 `[component_promise, runtime_promise]`
+浏览器环境的完整加载路径（从入口到底层）：
+
+```
+① get_component(type, class_id, root, variant)          init_utils.ts
+   ↓
+② load_component({ api_url, name, id, variant })         virtual:component-loader
+   ├─ 缓存检查 request_map
+   ├─ _component_map 查找（内置组件 + window.__GRADIO__CC__）
+   └─ 全部失败 → get_component_with_css()
+        ↓
+③ get_component_with_css(api_url, id, variant)           component_loader.js
+   ├─ environment = "client"
+   ├─ 并行发起 3 个 HTTP 请求：
+   │   ├─ GET /custom_component/{id}/client/{variant}/style.css
+   │   ├─ GET /custom_component/{id}/client/{variant}/index.js          (import())
+   │   └─ GET /custom_component/{id}/client/{variant}/svelte_runtime_entry.js (import())
+   └─ 返回 [component_promise, runtime_promise]
+```
 
 #### 8.1.2 服务端环境（environment="server"）
 
-SSR 模式下走完全不同的路径：
+SSR 模式下在 `get_component_with_css()` 的**入口处**就被拦截，走完全不同的路径，根本不会发起 HTTP 请求：
 
 ```javascript
-// component_loader.js 第 94-98 行
+// component_loader.js 第 92-99 行
+const environment = is_browser ? "client" : "server";
+
 if (environment === "server") {
-    // Fall back to @gradio/fallback during SSR;
-    // the real component will be loaded client-side.
+    // Node.js cannot dynamically import HTTP URLs.
+    // Fall back to @gradio/fallback during SSR; the real component
+    // will be loaded client-side.
     return [import("@gradio/fallback"), Promise.resolve(false)];
 }
 ```
 
 关键点：
-- **不发起任何 HTTP 请求**，直接返回 `@gradio/fallback`
-- `runtime` 返回 `false`（表示不需要独立的 Svelte 运行时）
-- 真实组件完全不参与 SSR
+- **拦截位置早**：在 `get_component_with_css()` 函数内部最开头判断，外层 `load_component` 完全无感知
+- **不发起任何 HTTP 请求**：直接返回 `@gradio/fallback`（内置组件，打包时已包含）
+- **runtime 返回 `false`**：表示不需要独立的 Svelte 运行时，使用主应用的 Svelte
+- **回退组件是主变体**：`import("@gradio/fallback")` 不是 example 变体，是完整的主组件
+- **所有自定义组件都会回退**：不区分 variant，component/example/base 都统一回退
 
-对应后端路由中也有相关注释：
+对应后端路由中也有相关注释证实 SSR 未实现：
 ```python
 # routes.py 第 1025-1026 行
 # Uncomment when we support custom component SSR
 # if environment == "server":
 ```
 
-表明自定义组件的 SSR 支持目前处于**未实现状态**。
+#### 8.1.3 浏览器 vs 服务端：加载链路分叉点对比
+
+```
+load_component({ api_url, name, id, variant })
+│
+├─ 第 1 层 try: _component_map 查找
+│      ├─ 浏览器：component_map + window.__GRADIO__CC__
+│      └─ SSR：   component_map（window 为 undefined，只查内置）
+│
+└─ 第 2 层 try: get_component_with_css()
+       │
+       ├─ is_browser === true (浏览器)
+       │    ├─ environment = "client"
+       │    ├─ 并行请求 style.css / index.js / svelte_runtime_entry.js
+       │    ├─ import() 动态加载 ES Module
+       │    └─ 返回 [component_promise, runtime_promise]
+       │
+       └─ is_browser === false (SSR/Node.js)
+            ├─ environment = "server"
+            ├─ 【直接返回，不发起 HTTP 请求】
+            ├─ 回退组件：@gradio/fallback（内置）
+            └─ runtime：Promise.resolve(false)
+```
 
 ### 8.2 两阶段渲染流程（SSR + 客户端水化）
 
-当 `ssr_mode=True` 时，页面渲染分为两个阶段：
+当 `ssr_mode=True` 时，页面渲染分为两个阶段。由于 SSR 阶段自定义组件统一回退为 Fallback，会出现"先显示 JSON、再显示真实组件"的闪烁。
 
 ```
 阶段 1：SSR (Node.js 环境)
     ├─ SvelteKit +page.ts 的 load() 执行
-    ├─ 调用 Client.connect() 获取 config
-    ├─ 自定义组件 → 强制回退为 @gradio/fallback
-    ├─ Fallback 以 JSON 形式渲染 value（空壳）
+    ├─ 调用 Client.connect() 获取 config（含组件元信息）
+    ├─ preload_visible_components() / walk_layout()
+    ├─ 为每个组件调用 load_component()
+    ├─ 进入 get_component_with_css() → environment="server"
+    ├─ 直接回退 @gradio/fallback（不发 HTTP 请求）
+    ├─ Fallback 以 <JsonView> 形式渲染 value（空壳占位）
     └─ 生成 HTML 发送给浏览器
 
 阶段 2：客户端水化 (Browser 环境)
-    ├─ 浏览器接收 HTML 并渲染（看到 Fallback 的 JSON）
+    ├─ 浏览器接收 HTML 并渲染（先看到 Fallback 的 JSON）
     ├─ Svelte hydration 启动
-    ├─ 重新执行 load_component() → environment="client"
-    ├─ 发起 /custom_component/{id}/client/... 请求
-    ├─ 加载真实组件并替换 Fallback
-    └─ 用户看到真实组件界面（可能有闪烁）
+    ├─ 组件树重新渲染时再次调用 load_component()
+    ├─ 进入 get_component_with_css() → environment="client"
+    ├─ 发起 /custom_component/{id}/client/... HTTP 请求
+    ├─ 加载真实组件和独立 Svelte 运行时
+    └─ MountCustomComponent 挂载真实组件，替换 Fallback
 ```
 
-**用户可见影响**：开启 SSR 后，自定义组件区域会先显示 JSON 内容，闪烁后才变为真实组件。
+**用户可见影响**：开启 SSR 后，自定义组件区域会先短暂显示 JSON 内容，客户端加载完成后闪烁切换为真实组件。
 
 ### 8.3 API URL 构造差异
 
@@ -911,6 +1189,10 @@ if (auth_required) {
 | 组件挂载组件 | [MountCustomComponent.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/MountCustomComponent.svelte) |
 | 组件树渲染入口 | [MountComponents.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/MountComponents.svelte) |
 | 动态渲染/初始化逻辑 | [_init.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/_init.ts) |
+| init 工具函数/包装层 | [init_utils.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/init_utils.ts) |
+| shared_props 包装/load_component 注入 | [init.svelte.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/init.svelte.ts) |
+| Gradio 类/shared_props 类型 | [utils.svelte.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/utils/src/utils.svelte.ts) |
+| 虚拟模块类型声明 | [vite-env-override.d.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/vite-env-override.d.ts) |
 | Block 原子组件 | [Block.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/atoms/src/Block.svelte) |
 | Fallback 组件 (Python) | [fallback.py](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/gradio/components/fallback.py) |
 | Fallback 组件 (Svelte) | [Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/fallback/Index.svelte) |
