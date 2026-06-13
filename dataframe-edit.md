@@ -87,7 +87,7 @@ def postprocess(self, value) -> DataframeData:
             *[str(i) for i in range(len(headers) + 1, len(data[0]) + 1)],
         ]                                     # 表头少 → 用数字序号补齐
     
-    # 5. 获取 metadata（仅 Styler 时有值，其他为 None）
+    # 5. 获取 metadata（Styler 自动生成，或 dict 直接携带，其他为 None）
     metadata = self.get_metadata(value)
     
     return DataframeData(
@@ -99,35 +99,39 @@ def postprocess(self, value) -> DataframeData:
 
 ### 2.3 metadata 的来源
 
-**`__extract_metadata()` 静态方法** ([dataframe.py#L609-L639](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L609-L639)):
+**`get_metadata()` 方法是所有 metadata 的统一入口** ([dataframe.py#L436-L459](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L436-L459)):
 
 ```python
 @staticmethod
-def __extract_metadata(df: Styler, hidden_cols=None) -> dict[str, list[list]]:
-    style_data = df._compute()._translate(None, None)
-    cell_styles = style_data.get("cellstyle", [])
-    # ... 构建 cell_id → style_string 的映射 ...
-    
-    metadata = {"display_value": [], "styling": []}
-    
-    for row in style_data["body"]:
-        row_display = []
-        row_styling = []
-        cells = [cell for cell in row if cell["type"] == "td"]
-        cells = [cell for col_idx, cell in enumerate(cells)
-                 if col_idx not in hidden_cols_set]
-        for cell in cells:
-            row_display.append(cell["display_value"])   # 格式化后的显示值
-            row_styling.append(style_dict.get(cell["id"], ""))
-        metadata["display_value"].append(row_display)
-        metadata["styling"].append(row_styling)
-    return metadata
+def get_metadata(value):
+    from pandas.io.formats.style import Styler
+
+    if isinstance(value, Styler):
+        return Dataframe.__extract_metadata(
+            value, [int(c) for c in getattr(value, "hidden_columns", [])]
+        )
+    elif isinstance(value, dict):
+        return value.get("metadata", None)
+    return None
 ```
 
+**两大来源的处理方式**：
+
+1. **来源 1：pandas Styler 对象** → 调用 `__extract_metadata()` 自动生成
+   - 代码位置: [dataframe.py#L609-L639](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L609-L639)
+   - 内部调用 pandas `_compute()._translate()` 渲染样式
+   - 提取 `display_value`（格式化字符串）和 `styling`（CSS 样式）
+
+2. **来源 2：Python dict 输入** → 直接读取 `metadata` 键
+   - 代码位置: [dataframe.py#L457-L458](file:///d:/fz/0601/solo-dogfeeding/code/258-gradio/gradio/components/dataframe.py#L457-L458)
+   - 用户可主动提供 `metadata.display_value` 和 `metadata.styling`
+   - 格式与 Styler 生成的完全一致
+
 > **重要结论**：
-> - **metadata 仅在输入为 pandas Styler 对象时才有值**
+> - **metadata 两大来源**：1) pandas Styler 对象自动生成；2) Python dict 输入直接携带 `metadata` 键
 > - metadata 包含两个键：`display_value`（二维字符串数组）和 `styling`（二维 CSS 字符串数组）
-> - 普通 DataFrame / list / numpy / polars 的 metadata 均为 `None`
+> - 普通 DataFrame / list / numpy / polars / str 的 metadata 均为 `None`
+> - 第三章详细分析四大场景（Styler、dict、普通数据、编辑回传）对 display_value 的影响
 
 ---
 
@@ -413,7 +417,7 @@ row_data (类型转换层)
     │  用于：TanStack Table 内部、排序、过滤、BooleanCell 渲染
     ▼
 display_value (格式化显示层)
-       来源：metadata.display_value（仅 Styler）
+       来源：metadata.display_value（Styler 自动生成 或 dict 输入携带）
        存储类型：string[][] | null
        用于：非编辑模式下的格式化展示
 ```
