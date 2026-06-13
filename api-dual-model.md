@@ -327,22 +327,9 @@ for dependency in self.fns.values():
 - **(a) 重编号 `_id`**：子 Blocks 的 `fn._id` 从 0 开始编号（例如 0, 1, 2），加上偏移后变为 3, 4, 5，与父的 0, 1, 2 不冲突。
   ⚠️ **重要**：`dependency._id += dependency_offset` 是**原地修改 `BlockFunction` 对象的属性**。同一个对象同时被子和父的 fns 字典引用，修改后子的 fns 字典中 key（旧 `_id`）与 value 的 `_id`（新 `_id`）不一致。
 
-- **(b) 重映射 target（代码意图正确但实现完全无效）**：`dependency.targets` 是 `list[tuple[int | None, str]]`，每个元组是 `(block_id, event_name)`。代码意图是：当 `target[0] == self._id` 时（最典型的就是 `Blocks.load()` 事件，它的 target 是子 Blocks 本身的 `_id`），嵌入后这个事件应该由根 Blocks 触发，所以将 `block_id` 替换为 `Context.root_block._id`。
+- **(b) 重映射 target（代码意图正确但实现完全无效，且无兜底路径）**：`dependency.targets` 是 `list[tuple[int | None, str]]`，每个元组是 `(block_id, event_name)`。代码意图是：当 `target[0] == self._id` 时（最典型的就是 `Blocks.load()` 事件，它的 target 是子 Blocks 本身的 `_id`），嵌入后这个事件应该由根 Blocks 触发，所以将 `block_id` 替换为 `Context.root_block._id`。
 
-  但这段代码有两个根本性缺陷导致它**完全没有实际效果**：
-
-  1. **tuple 是不可变对象**：`(block_id, event_name)` 一旦创建就不能修改。代码试图给 `target[0]` 重新赋值，但 tuple 元素无法原地修改。
-
-  2. **循环变量重新绑定不修改列表**：`for target in dependency.targets:` 中 `target` 是局部循环变量。`target = (Context.root_block._id, target[1])` 只是让 `target` 变量指向一个新创建的 tuple，**完全没有修改 `dependency.targets` 列表中的原始元素**。
-
-  正确的写法应该是通过索引原地修改列表：
-  ```python
-  for i, target in enumerate(dependency.targets):
-      if target[0] == self._id:
-          dependency.targets[i] = (Context.root_block._id, target[1])
-  ```
-
-  > 那为什么还能工作？因为即使 target 中的 block_id 仍是子 Blocks 的 `_id`，这个 `_id` 已经通过 `root_context.blocks.update(self.blocks)` 被合并到父的 blocks 字典中了。前端仍然能找到这个 block_id 对应的组件（子 Blocks 本身也是一个 Block 实例），并将 load 事件绑定到它上面。所以虽然 target 没有被重写为根 Blocks，但事件仍然能触发——只是触发者是子 Blocks 而不是根 Blocks。
+  但这段循环完全无效（详见 8.5 节事实三），且不存在兜底路径——子 Blocks 的 `_id` 既不在 `root_context.blocks` 中，也不在合并后的 layout 树中。
 
 - **(c) API 名称去重**：如果子的 API 名称与父的重复，自动追加后缀。例如两个子 Interface 都有 `/predict`，会变成 `/predict` 和 `/predict_1`。
 
@@ -432,7 +419,7 @@ Gradio 运行时的请求处理**完全绑定在根 Blocks 实例上**：
 - `call_function`: [blocks.py#L1687](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1687)
 - 队列 `predict`: [blocks.py#L2214](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L2214)
 
-**事实三：target 重写循环完全没有修改 dependency.targets**
+**事实三：target 重写循环完全无效，且兜底路径也不成立**
 
 [blocks.py#L1486-L1488](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1486-L1488) 的代码：
 
@@ -442,7 +429,9 @@ for target in dependency.targets:
         target = (Context.root_block._id, target[1])
 ```
 
-有两个根本性缺陷导致它**完全无效**：
+**3a. 循环为何无效**
+
+两个根本性缺陷：
 
 1. **tuple 是不可变对象**：`dependency.targets` 是 `list[tuple[int | None, str]]`（见 [blocks.py#L725-L731](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L725-L731) 和 [block_function.py#L31](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/block_function.py#L31)），tuple 一旦创建就不能修改其元素。
 
@@ -455,7 +444,59 @@ for i, target in enumerate(dependency.targets):
         dependency.targets[i] = (Context.root_block._id, target[1])
 ```
 
-> 为什么还能工作？因为即使 target 的 block_id 仍是子 Blocks 的 `_id`，这个 `_id` 已经通过 `root_context.blocks.update(self.blocks)` 被合并到父的 blocks 字典中。前端仍然能找到这个 block_id 对应的组件（子 Blocks 本身也是一个 Block 实例），并将 load 事件绑定到它上面。事件仍然能触发，只是触发者是子 Blocks 而不是根 Blocks。
+**3b. 之前"兜底路径"的结论为何错误**
+
+之前的分析认为：即使 target 没被改写，子 Blocks 的 `_id` 已经通过 `root_context.blocks.update(self.blocks)` 被合并到父的 blocks 字典中，所以前端仍能找到。**这个推断是错的**，原因如下：
+
+`self.blocks`（即 `self.default_config.blocks`）中**不包含 Blocks 实例自身**。
+
+追溯 `Block.__init__`（[blocks.py#L115-L167](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L115-L167)）：当 `render=True` 时，调用 `self.render()` → `root_context.blocks[self._id] = self`，将自身注册到 blocks 字典。但 `Blocks.__init__`（[blocks.py#L1131-L1132](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1131-L1132)）明确传入 `render=False`：
+
+```python
+self.default_config = BlocksConfig(self)
+super().__init__(render=False, **kwargs)
+```
+
+因此 Blocks 实例的 `_id` **不会**出现在 `self.default_config.blocks` 字典中。`self.blocks` 中只包含在 `with self:` 内部通过 `Block.render()` 注册的组件（Textbox、Button、Row、Column 等）和布局容器（BlockContext 子类）。
+
+`root_context.blocks.update(self.blocks)` 合并的只是这些内部组件，**不包含子 Blocks 的 `_id`**。合并后，子 Blocks 的 `_id` 不在 `root_context.blocks` 中。
+
+**3c. `self._id` 单独冲突检查的原因**
+
+[blocks.py#L1460-L1463](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1460-L1463) 的检查：
+
+```python
+if self._id in root_context.blocks:
+    raise DuplicateBlockError(...)
+```
+
+这个检查和 L1464 的 `overlapping_ids` 检查是分开的。`overlapping_ids` 检查 `self.blocks` 与 `root_context.blocks` 的交集，而 `self._id` 检查的是子 Blocks **自身**的 `_id` 是否已经在父的 blocks 字典中。
+
+由于 `self._id` 不在 `self.blocks` 中，它不会被 `overlapping_ids` 覆盖。需要单独检查是因为 Blocks 也是 `Block` 的子类，拥有一个全局唯一的 `_id`。如果这个 `_id` 恰好与父 blocks 字典中某个组件的 `_id` 相同（极端情况，理论上 `Context.id` 自增机制避免了这种情况），就会产生冲突。正常情况下这个检查不会触发。
+
+**3d. target 未改写时的真实后果**
+
+当 `Blocks.load()` 事件的 target 仍指向子 Blocks 的 `_id` 时：
+
+1. **后端**：不受影响。后端通过 `fn_index` 查找 `BlockFunction`，不依赖 target。target 仅用于前端确定哪个 DOM 元素触发事件。
+
+2. **前端**：target 中的 `block_id` 指向子 Blocks 的 `_id`。这个 `_id` **不在** `root_context.blocks` 字典中，因此不在序列化后的 `components` 数组中。但它**存在于 layout JSON 中**——`BlocksConfig.get_config()` 的 `get_layout()` 递归函数（[blocks.py#L940-L948](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L940-L948)）会遍历 `root_block.children`（其中包含子 Blocks 的 children），并且子 Blocks 自身的 `_id` 作为布局节点也可能出现。
+
+   但实际上，在 `Blocks.render()` 合并时（[blocks.py#L1514-L1516](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1514-L1516)）：
+
+   ```python
+   render_context.children.extend(self.children)
+   ```
+
+   是将子 Blocks 的 `children` 直接追加到父的渲染上下文的 `children` 中，**跳过了子 Blocks 自身这一层**。这意味着子 Blocks 的 `_id` **不会出现在 layout 树中**。
+
+   因此，前端既无法从 `components` 数组中找到子 Blocks 的 `_id`，也无法从 `layout` 树中找到它。target 指向了一个**前端不存在的节点**。
+
+3. **实际影响**：load 事件的 target 指向前端不存在的节点，前端**无法正确绑定该事件的触发器**。但由于 load 事件的特殊性——它由页面加载时自动触发而非由用户操作触发——前端通常通过 `dependencies` 数组中的 `trigger_after` 和全局 load 机制来处理，不完全依赖 target 定位 DOM 元素。因此实际运行中可能不会出现明显故障，但这确实是一个**代码缺陷**。
+
+**3e. 合理结论**
+
+target 重写循环是一个**有效的 bug**——代码意图正确（将子 Blocks 的 load 事件重定向到根 Blocks），但实现完全无效（Python 语义导致列表未被修改），且不存在兜底路径（子 Blocks 的 `_id` 不在合并后的 blocks 字典中，也不在 layout 树中）。正确的修复是使用索引原地修改 `dependency.targets[i]`。
 
 ---
 
