@@ -578,12 +578,12 @@ finally:
 ### 三套核心数据结构
 
 | 数据结构 | 类型 | 作用 | 存活周期 |
-|---------|------|------|--------|
-| `event_ids_to_events` | `dict[str, Event]` | event_id → Event 对象的全局映射 | 最长，入队时添加，取消/移除，正常完成**不**删除 |
-| `pending_event_ids_session` | `dict[str, set[str]]` | 每个会话待处理事件 ID 集合 | 入队时添加，SSE 消费完成消息时移除 |
-| `pending_messages_per_session` | `LRUCache[str, AsyncQueue[EventMessage]]` | 每个会话的 SSE 消息队列 | 入队时创建，SSE 流 CancelledError 时删除 |
+|---------|------|------|---------|
+| `event_ids_to_events` | `dict[str, Event]` | event_id → Event 对象的全局映射 | 最长：入队时添加，仅取消/断开时移除，**正常完成不删除** |
+| `pending_event_ids_session` | `dict[str, set[str]]` | 每个会话待处理事件 ID 集合 | 入队时添加，SSE 消费端消费完成消息时移除 |
+| `pending_messages_per_session` | `LRUCache[str, AsyncQueue[EventMessage]]` | 每个会话的 SSE 消息队列 | 会话首次入队时创建，SSE 流收到 CancelledError 时删除 |
 
-**反直觉的一点：**事件正常完成后，`event_ids_to_events` 中的映射并不会被删除。**只有取消路径（`remove_from_queue` / `clean_events`）才会从映射中删除事件。
+> **反直觉的一点**：事件正常完成后，`event_ids_to_events` 中的映射不会被删除。只有取消路径（`remove_from_queue` 或 `clean_events`）才会从映射中移除事件。
 
 ---
 
@@ -594,23 +594,23 @@ finally:
 **执行顺序**：
 
 ```
-① 创建 Event 对象 (L373-L379
+① 创建 Event 对象 (L373-L379)
     │
     ▼
 ② pending_messages_per_session[session_hash] = AsyncQueue()  (L383-L384)
-    └─ 仅当该会话首次入队首次创建，后续复用
+    └─ 仅当该会话首次入队时创建，后续复用
     │
     ▼
 ③ pending_event_ids_session[session_hash].add(event._id)  (L387)
-    └─ 入待处理集合
+    └─ 加入待处理事件 ID 集合
     │
     ▼
 ④ event_ids_to_events[event._id] = event  (L388)
-    └─ 入全局事件映射
+    └─ 加入全局事件映射
     │
     ▼
 ⑤ event_queue.queue.append(event)  (L458)
-    └─ 入等待队列
+    └─ 加入等待队列
     │
     ▼
 ⑥ event_analytics[event._id] = {status: "queued", ...}  (L459-L465)
@@ -623,10 +623,10 @@ finally:
 | `EventQueue.queue` | ✅ 添加（append） | L458 |
 | `event_ids_to_events` | ✅ 添加 | L388 |
 | `pending_event_ids_session` | ✅ 添加（add） | L387 |
-| `pending_messages_per_session` | ✅ 创建（首次） | L383-L384 |
+| `pending_messages_per_session` | ✅ 创建（会话首次） | L383-L384 |
 | `Event.alive` | — | 初始值 True |
 
-**注意①：事件一创建就加入了三套数据结构，而不是等进入执行阶段。这就是为什么 `/cancel` 可以通过 event_id 找到事件。
+> **要点**：事件一创建就加入了三套数据结构，而非等到进入执行阶段。这就是为什么 `/cancel` 路由可以通过 event_id 立即找到事件。
 
 ---
 
@@ -657,13 +657,13 @@ start_processing():
 | 数据结构 | 操作 | 代码位置 |
 |---------|------|---------|
 | `EventQueue.queue` | ❌ 移除 | L517 |
-| `event_ids_to_events` | — 保留 | **不修改 |
-| `pending_event_ids_session` | — 保留 | **不修改 |
-| `pending_messages_per_session` | — 保留 | 不修改（后续 send_message 往里面塞消息 |
+| `event_ids_to_events` | — 保留 | 不修改 |
+| `pending_event_ids_session` | — 保留 | 不修改 |
+| `pending_messages_per_session` | — 保留 | 不修改（后续 `send_message()` 向其中投递消息） |
 | `active_jobs` | ✅ 加入 | L538 |
 | `Event.alive` | — | 仍为 True |
 
-**关键发现**：事件从等待队列取出后，**仍然保留在 `event_ids_to_events` 和 `pending_event_ids_session` 中**。这两套数据结构在执行阶段只增不减（除非取消）。
+> **关键发现**：事件从等待队列取出后，仍然保留在 `event_ids_to_events` 和 `pending_event_ids_session` 中。这两套数据结构在执行阶段**只增不减**，除非遇到取消或断开。
 
 ---
 
@@ -674,21 +674,25 @@ start_processing():
 **执行顺序**：
 
 ```
-① cancel_tasks({session_hash_fn_index})  (L1403)
-    └─ 向 asyncio task 发送 CancelledError 信号
+① cancel_tasks({session_hash}_{fn_index})  (L1403)
+    └─ 向匹配的 asyncio task 发送 CancelledError 信号
     │
     ▼
 ② remove_from_queue(event_id)  (L1413)
-    │  ├─ 从 event_queue.queue 移除事件   ← 仅当事件还在等待队列
+    │  ├─ 从 event_queue.queue 移除事件   ← 仅当事件仍在等待队列
     │  └─ event_ids_to_events.pop(event_id)  ← 从全局映射删除
     │
     ▼
-③ pending_messages_per_session[session_hash].put_nowait(ProcessCompletedMessage)  (L1418-L1420)
-    └─ 塞入一条空的完成消息，让 SSE 消费端正常结束
+③ pending_messages_per_session[session_hash].put_nowait(ProcessCompletedMessage)
+    │  (L1418-L1420)
+    ├─ 塞入一条空的完成消息，让 SSE 消费端正常断开
     └─ 仅当 session_open 且 event_running 时执行
     │
     ▼
-④ 迭代器清理：safe_aclose_iterator + del app.iterators + iterators_to_reset.add  (L1421-L1428)
+④ 迭代器清理 (L1421-L1428)
+    ├─ safe_aclose_iterator(app.iterators[event_id])
+    ├─ del app.iterators[event_id]
+    └─ app.iterators_to_reset.add(event_id)
 ```
 
 **各数据结构的变化**（分两种情况）：
@@ -697,26 +701,26 @@ start_processing():
 
 | 数据结构 | 操作 | 代码位置 |
 |---------|------|---------|
-| `EventQueue.queue` | ❌ 移除 | remove_from_queue L476 |
-| `event_ids_to_events` | ❌ 移除（pop） | remove_from_queue L477 |
-| `pending_event_ids_session` | — 保留 | **不修改** ← 关键！ |
+| `EventQueue.queue` | ❌ 移除 | `remove_from_queue` L476 |
+| `event_ids_to_events` | ❌ 移除（pop） | `remove_from_queue` L477 |
+| `pending_event_ids_session` | — 保留 | **不修改** |
 | `pending_messages_per_session` | ✅ 塞入完成消息 | L1418-L1420 |
-| `Event.alive` | — | 仍为 True（不修改）|
+| `Event.alive` | — 保留 | 不修改，仍为 True |
 
 #### 情况 B：事件已在执行中
 
 | 数据结构 | 操作 | 代码位置 |
 |---------|------|---------|
-| `EventQueue.queue` | —（已不在队列） | remove_from_queue 捕获 ValueError 静默跳过 |
-| `event_ids_to_events` | — 保留 | **不修改** ← 关键！事件已不在 event_queue.queue 里，remove_from_queue 找不到 |
+| `EventQueue.queue` | —（已不在队列） | `ValueError` 被静默捕获 |
+| `event_ids_to_events` | — 保留 | **不修改** |
 | `pending_event_ids_session` | — 保留 | 不修改 |
 | `pending_messages_per_session` | ✅ 塞入完成消息 | L1418-L1420 |
-| `Event.alive` | — | 仍为 True（不修改）|
+| `Event.alive` | — 保留 | 不修改，仍为 True |
 
-**最反直觉的发现**：
-- `/cancel` 不修改 `pending_event_ids_session`！事件的 ID 仍然留在待处理集合里
-- 对于执行中事件，`event_ids_to_events` 也**不会被删除`
-- 这两套数据结构的真正清理，发生在**SSE 消费端消费掉那条塞入的完成消息时
+> **最反直觉的发现**：
+> - `/cancel` 路由不修改 `pending_event_ids_session`，事件的 ID 仍然留在待处理集合中
+> - 对于执行中事件，`event_ids_to_events` 也不会被删除
+> - 这两套数据结构的真正清理，发生在 **SSE 消费端消费掉那条被塞入的完成消息时**
 
 ---
 
@@ -732,19 +736,19 @@ start_processing():
     ▼
 ② clean_events(session_hash=session_hash)  (L1495)
     │
-    ├─ 遍历 active_jobs，匹配事件 alive=False  (L634-L638)
+    ├─ 遍历 active_jobs，匹配事件设 alive=False  (L634-L638)
     │   └─ 标记执行中事件为死亡
     │
-    ├─ 遍历所有 event_queue.queue，收集匹配事件到 events_to_remove  (L642-L645)
-    │   └─ 只收集等待队列中的事件
+    ├─ 遍历所有 event_queue.queue，收集匹配事件到 events_to_remove (L642-L645)
+    │   └─ 仅收集等待队列中的事件，不包含执行中的
     │
     ├─ 对 events_to_remove 中的每个事件：
     │   ├─ event_queue.queue.remove(event)  ← 出等待队列
     │   └─ event_ids_to_events.pop(event._id)  ← 出全局映射
     │
     └─ pending_event_ids_session[session_hash] -= removed_ids  (L655)
-        └─ 只减去等待队列中的事件 ID
-        └─ 如果集合为空则删除整个会话条目
+        ├─ 仅减去等待队列中的事件 ID
+        └─ 若集合为空则删除整个会话条目
     │
     ▼
 ③ heartbeat_task.cancel()  (L1496)
@@ -759,23 +763,23 @@ start_processing():
 
 | 数据结构 | 操作 | 代码位置 |
 |---------|------|---------|
-| `EventQueue.queue` | ❌ 移除 | clean_events L648 |
-| `event_ids_to_events` | ❌ 移除 | clean_events L651 |
-| `pending_event_ids_session` | ❌ 移除（集合减法） | clean_events L655 |
+| `EventQueue.queue` | ❌ 移除 | `clean_events` L648 |
+| `event_ids_to_events` | ❌ 移除（pop） | `clean_events` L651 |
+| `pending_event_ids_session` | ❌ 移除（集合减法） | `clean_events` L655 |
 
 #### 执行中的事件
 
 | 数据结构 | 操作 | 代码位置 |
 |---------|------|---------|
 | `EventQueue.queue` | —（已不在队列） | — |
-| `event_ids_to_events` | — 保留 | **不修改** ← 关键！ |
-| `pending_event_ids_session` | — 保留 | **不修改** ← 关键！ |
-| `Event.alive` | ❌ 设为 False | clean_events L638 |
-| `active_jobs` | — 仍在列表中 | 不删除，只是 alive 变了 |
+| `event_ids_to_events` | — 保留 | **不修改** |
+| `pending_event_ids_session` | — 保留 | **不修改** |
+| `Event.alive` | ❌ 设为 False | `clean_events` L638 |
+| `active_jobs` | — 仍在列表中 | 不删除，仅 alive 标志变化 |
 
-**重要发现**：`clean_events()` 对**只清理了等待队列中的事件。执行中的事件只是被标记了 `alive=False`，但它们的 ID 仍然保留在 `event_ids_to_events` 和 `pending_event_ids_session` 中。这些"死了但还在集合里。
-
-原因是 `clean_events` 的 `events_to_remove` 只从 `event_queue.queue` 里收集，而执行中的事件已经不在 `event_queue.queue` 里了（已被 `get_events()` 取走了）。
+> **重要发现**：`clean_events()` 只清理等待队列中的事件。执行中的事件仅被标记 `alive=False`，但它们的 ID 仍然保留在 `event_ids_to_events` 和 `pending_event_ids_session` 中——事件被"杀死"了，但映射还在。
+>
+> 原因在于 `clean_events()` 的 `events_to_remove` 只从 `event_queue.queue` 列表中收集，而执行中的事件已被 `get_events()` 取出，不在此列表内。
 
 ---
 
@@ -813,7 +817,7 @@ start_processing():
 | `Event.signal` | ✅ set() | L1101 |
 | `Event.alive` | — | 仍为 True |
 
-这是最"轻量级"的取消方式，只修改 Event 对象内部状态，不碰任何集合/映射。事件仍然在所有数据结构里。
+这是最"轻量级"的取消方式，只修改 Event 对象的内部状态，不触碰任何集合或映射。事件在所有数据结构中仍然保留。
 
 ---
 
@@ -821,7 +825,7 @@ start_processing():
 
 代码位置：[routes.py L1525-L1559](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1525-L1559)
 
-这是最容易被忽略的清理点——`pending_event_ids_session` 的真正移除发生在这里，而不是在队列/process_events 端。
+这是最容易被忽略的清理点：`pending_event_ids_session` 的真正移除发生在这里，而非队列或 `process_events()` 端。
 
 **执行顺序**：
 
@@ -829,22 +833,22 @@ start_processing():
 sse_stream() 循环消费 pending_messages_per_session[session_hash].get()
     │
     ▼
-收到 ProcessCompletedMessage（带 event_id
+收到 ProcessCompletedMessage（携带 event_id）
     │
     ▼
 ① 检查 event_id 是否在 pending_event_ids_session[session_hash] 中  (L1532-L1538)
-    │   └─ 注释说明：可能已被移除，比如重复 /cancel 请求
+    │  └─ 注释说明：可能已被移除，例如重复发送 /cancel 请求
     │
     ▼
 ② pending_event_ids_session[session_hash].remove(event_id)  (L1540-L1542)
     └─ 从待处理集合中移除
     │
     ▼
-③ 如果 pending_event_ids_session[session_hash] 为空  (L1543-L1553)
-    │   └─ 或收到 server_stopped 消息
+③ 若 pending_event_ids_session[session_hash] 为空，或收到 server_stopped
+    │  (L1543-L1553)
     │
     ▼
-④ CloseStreamMessage + heartbeat_task.cancel() + return  (L1554-L1559)
+④ 发送 CloseStreamMessage + heartbeat_task.cancel() + return  (L1554-L1559)
     └─ 关闭 SSE 流
 ```
 
@@ -854,16 +858,16 @@ sse_stream() 循环消费 pending_messages_per_session[session_hash].get()
 |---------|------|---------|
 | `event_ids_to_events` | — 保留 | **不删除** |
 | `pending_event_ids_session` | ❌ 移除（remove） | L1540-L1542 |
-| `pending_messages_per_session` | —（消息被消费取出） | messages.get() |
+| `pending_messages_per_session` | —（消息被消费取出） | `messages.get()` |
 | `Event.alive` | — | 不修改 |
 
-**最关键的发现**：`event_ids_to_events` 在事件正常完成后**永远不会被删除**！它只在取消路径（`remove_from_queue` / `clean_events`）中被删除。
-
-这意味着：
-- 正常完成的事件，`event_ids_to_events` 中一直保留着 Event 对象的引用
-- 只有取消的事件，才会从 `event_ids_to_events` 中被移除
-
-这是 Gradio 事件生命周期管理中非常反直觉的设计。
+> **最关键的发现**：`event_ids_to_events` 在事件正常完成后**永远不会被删除**！它只在取消路径（`remove_from_queue` 和 `clean_events`）中被删除。
+>
+> 这意味着：
+> - 正常完成的事件，其 Event 对象引用会一直保留在 `event_ids_to_events` 中
+> - 只有被取消的事件，才会从 `event_ids_to_events` 中被移除
+>
+> 这是 Gradio 事件生命周期管理中非常反直觉的设计。
 
 ---
 
@@ -875,30 +879,30 @@ sse_stream() 循环消费 pending_messages_per_session[session_hash].get()
 |------|---------------------|------------------------|---------------------------|---------------|
 | **事件入队** | ✅ 添加 | ✅ 添加 | ✅ 添加 | True |
 | **取出执行** | ❌ 移除 | — 保留 | — 保留 | True |
-| **用户取消（等待中）** | ❌ 移除 | ❌ 移除 | — 保留 | True（不修改） |
-| **用户取消（执行中）** | —（不在队列） | — 保留 | — 保留 | True（不修改） |
-| **客户端断开（等待中）** | ❌ 移除 | ❌ 移除 | ❌ 移除 | —（已移除） |
-| **客户端断开（执行中）** | —（不在队列） | — 保留 | — 保留 | ❌ False |
-| **流式关闭** | — | — 保留 | — 保留 | True（closed=True） |
+| **用户取消（等待中）** | ❌ 移除 | ❌ 移除 | — 保留 | 不修改，仍为 True |
+| **用户取消（执行中）** | —（已不在队列） | — 保留 | — 保留 | 不修改，仍为 True |
+| **客户端断开（等待中）** | ❌ 移除 | ❌ 移除 | ❌ 移除 | —（对象已被移除） |
+| **客户端断开（执行中）** | —（已不在队列） | — 保留 | — 保留 | ❌ False |
+| **流式关闭** | — | — 保留 | — 保留 | True，`closed=True` |
 | **完成消息消费** | — | — 保留（关键） | ❌ 移除 | — |
 
 符号说明：✅ 添加 / ❌ 移除 / — 不修改
 
 ---
 
-### 为什么 `event_ids_to_events` 为什么不清理？
+### 为什么 `event_ids_to_events` 不清理？
 
-从代码来看，`event_ids_to_events` 的删除只有两条路径：
+从代码来看，`event_ids_to_events` 中键的删除只有两条路径：
 
-1. `remove_from_queue()` — 仅 `/cancel` 调用
-2. `clean_events()` — 仅客户端断开调用
+1. `remove_from_queue()` — 仅被 `/cancel` 路由调用
+2. `clean_events()` — 仅被客户端断开检测逻辑调用
 
-而事件正常完成后，`event_ids_to_events` 中的 Event 对象**不会被删除**。这可能是设计上的权衡：
+事件正常完成后，`event_ids_to_events` 中的 Event 对象**不会被删除**。这可能是设计上的权衡：
 
-- **流式事件（streaming 场景下，`/stream/{event_id}` 和 `/stream/{event_id}/close` 路由需要通过 event_id 查找 Event 对象
-- 事件完成后，客户端可能还有后续的流操作需要访问事件信息（尽管从代码看，正常完成后 event_ids_to_events 中的事件对象似乎没有明确的清理机制，可能依赖于 LRU 或其他机制间接清理？也可能是一个潜在的内存泄漏点。
+- 在流式事件（`connection="stream"`）场景下，`/stream/{event_id}` 和 `/stream/{event_id}/close` 路由需要通过 event_id 查找 Event 对象
+- 事件完成后，客户端可能还有后续的流操作需要访问事件信息
 
-不过，事件数量不多（每个会话几个事件的话，可以接受。但如果是高并发量大，这可能是一个问题。
+> **潜在问题**：从代码看，正常完成后的 `event_ids_to_events` 条目没有明确的清理机制，也不依赖 LRU 或其他间接清理。在低并发、短会话的场景下可以接受，但在高并发长运行环境下可能成为内存泄漏点。
 
 ---
 
