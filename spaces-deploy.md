@@ -81,25 +81,27 @@ def is_zero_gpu_space() -> bool:
 
 #### `config.space_id` 控制的分支（服务端可信）
 
-仅在应用**实际运行在 Spaces 环境**时才有值。代码中使用的位置：
+仅在应用**实际运行在 Spaces 环境**时才有值，从 `/config` API 下发。代码中使用的位置：
 
 | 位置 | 分支逻辑 |
 |------|---------|
-| [Login.svelte#L45-L49](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/core/src/Login.svelte#L45-L49) | `{#if space_id}` → 登录页面提示"请启用 Cookie" |
 | [Settings.svelte#L76](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/core/src/api_docs/Settings.svelte#L76) | `{#if space_id === null}` → 在非 Space 环境才显示主题切换按钮（Space 上主题由 HF 设置统一管理） |
 | [CopyMarkdown.svelte#L45](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/core/src/api_docs/CopyMarkdown.svelte#L45) | API 文档标题用 `space_id \|\| root`，并提示 Private Space 需要 token |
 | [SkillSnippet.svelte#L5-L10](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/core/src/api_docs/SkillSnippet.svelte#L5-L10) | Skill 安装命令中的 space 标识 |
 | [client.ts#L248-L272](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/client/js/src/client.ts#L248-L272) | 心跳 URL 附加 `__sign` JWT 参数 |
+| [api_info.ts#L36-L71](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/client/js/src/helpers/api_info.ts#L36-L71) | `process_endpoint()` 从 URL/space name 自动推断 space_id，供 Space 状态轮询使用 |
 
 #### `space`（入口 Props）控制的分支（嵌入者指定）
 
-仅在 SPA/SSR 入口显式传入时才有值。代码中使用的位置：
+在 SPA 中由 `<gradio-app space="...">` 属性传入，在 SSR 中由上层 Props 传入。**与 `config.space_id` 是两套独立来源。** 代码中使用的位置：
 
 | 位置 | 分支逻辑 |
 |------|---------|
-| [Embed.svelte#L134-L154](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/core/src/Embed.svelte#L134-L154) | `{#if display && space && info}` → 显示底部"Hosted on Spaces"信息栏，并渲染 `<a href="https://huggingface.co/spaces/{space}">` |
+| [Embed.svelte#L134-L154](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/core/src/Embed.svelte#L134-L154) | `{#if display && space && info}` → 显示底部"Hosted on Spaces"信息栏，链接指向 `https://huggingface.co/spaces/{space}` |
 | [Index.svelte#L529](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/spa/src/Index.svelte#L529) | `info={!!space && info}` → SPA 入口对 info 做 space 前置短路过滤，无 space 则 info 强制 false |
-| [Index.svelte#L568-L579](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/spa/src/Index.svelte#L568-L579) | `<a href="https://huggingface.co/spaces/{space}/discussions/new?...">` → 联系作者的 Discussion 链接 |
+| [Index.svelte#L568-L579](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/spa/src/Index.svelte#L568-L579) | `https://huggingface.co/spaces/{space}/discussions/new?...` → 联系作者的 Discussion 链接 |
+| [Index.svelte#L591](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/spa/src/Index.svelte#L591) | `space_id={space}` → Login 组件的 Cookie 提示使用入口 space，**非 config.space_id** |
+| [+page.svelte#L453](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/app/src/routes/[...catchall]/+page.svelte#L453) | SSR 入口的 Login 同样使用入口 Props 的 space |
 | [+page.svelte#L365-L383](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/app/src/routes/[...catchall]/+page.svelte#L365-L383) | 顶层窗口时 `init(space_id)` 加载 HF Space Header（导航栏） |
 
 > ⚠️ **关键区分**：`space` 是嵌入视角的参数（我嵌入的是哪个 Space），`config.space_id` 是运行视角的参数（我自己运行在哪个 Space）。两者在同一场景下可能相同也可能不同：
@@ -362,46 +364,129 @@ api_url = BUILD_MODE === "dev" || gradio_dev_mode === "dev"
 
 #### 差异二：联系作者入口（Space Error / Paused 时）
 
-当 Space 返回 `space_error` 或 `paused` 状态且 `discussions_enabled` 为 true 时，错误面板中会渲染联系作者链接。链接使用的是 `space` Props（[Index.svelte#L568-L579](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/spa/src/Index.svelte#L568-L579)）：
+当 Space 返回 `space_error` 或 `paused` 状态且 `discussions_enabled` 为 true 时，错误面板中会渲染联系作者链接。
 
+---
+
+##### ✅ 代码审查：状态来源完整链路
+
+`status.discussions_enabled` 由客户端内部链路自动检测，**完全不依赖入口传入的 `space` Props**。完整调用链：
+
+1. **URL 推断**：`Client.connect(api_url, ...)` → `_resolve_config()` → `process_endpoint(app_reference)`
+   - space 嵌入（`"a/b"`）：匹配 `RE_SPACE_NAME` → `space_id = "a/b"`（[api_info.ts#L36-L47](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/client/js/src/helpers/api_info.ts#L36-L47)）
+   - src 嵌入（`https://xxx.hf.space`）：匹配 `RE_SPACE_DOMAIN` → `space_id = host.replace(".hf.space", "")`（[api_info.ts#L55-L61](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/client/js/src/helpers/api_info.ts#L55-L61)）
+   - 非 Space 域名：`space_id = false`，跳过所有 Space 状态检测
+
+2. **状态检测**：`check_and_wake_space(space_id, status_callback)`（[client.ts#L337](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/client/js/src/client.ts#L337)）→ 轮询 `check_space_status()`
+
+3. **discussions_enabled 赋值**（[spaces.ts#L64, L106](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/client/js/src/helpers/spaces.ts#L64)）：
+   ```typescript
+   case "PAUSED":
+       status_callback({
+           status: "paused",
+           load_status: "error",
+           detail: stage,
+           discussions_enabled: await discussions_enabled(space_name)
+       });
+   ```
+   这里的 `space_name` 来自 **HF API 返回的 `response.id`**（[spaces.ts#L40](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/client/js/src/helpers/spaces.ts#L40)），是目标 Space 的**真实 ID**。
+
+4. **discussions_enabled 检测**：向 `https://huggingface.co/api/spaces/${space_id}/discussions` 发 HEAD 请求，通过 `x-error-message` 响应头判断（[spaces.ts#L155-L171](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/client/js/src/helpers/spaces.ts#L155-L171)）。
+
+---
+
+##### ✅ 代码审查：Discussion 链接生成
+
+**渲染条件**（[Index.svelte#L568-L569](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/spa/src/Index.svelte#L568-L569)）：
 ```svelte
 {#if (status.status === "space_error" || status.status === "paused")
      && status.discussions_enabled && discussion_message}
-    Please <a
-        href="https://huggingface.co/spaces/{space}/discussions/new?title=..."
-        target="_blank" rel="noopener">contact the author</a> to let them know.
-{/if}
 ```
+⚠️ **关键事实**：这里**没有** `space &&` 前置判断。只要 `discussions_enabled=true`，不管 `space` Props 是否为 null，段落都会渲染。
 
-讨论区是否启用由 `discussions_enabled(space_name)` 函数（[spaces.ts#L155-L171](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/client/js/src/helpers/spaces.ts#L155-L171)）调用 Hugging Face API 检测，`space_name` 来自 API 返回的 Space 元数据而非入口 Props，因此两种嵌入都能检测。
+**链接生成**（[Index.svelte#L571-L576](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/spa/src/Index.svelte#L571-L576)）：
+```svelte
+href="https://huggingface.co/spaces/{space}/discussions/new?
+    title={discussion_message.title(status?.detail)}&
+    description={discussion_message.description(status?.detail, location.origin)}"
+```
+这里的 `{space}` 使用的是**入口 Props 传入的 `space`**（嵌入者通过 `space="..."` HTML 属性指定）。**不是**自动推断的 space_id，**不是** API 返回的 space_name。
 
-但**联系作者链接本身**完全依赖入口传入的 `space`：
+---
 
-| 嵌入方式 | 联系作者链接 |
-|---------|------------|
-| `<gradio-app space="a/b">` | `https://huggingface.co/spaces/a/b/discussions/new?...` ✅ |
-| `<gradio-app src="https://xxx.hf.space">` | `https://huggingface.co/spaces/null/discussions/new?...` ❌ 链接无效，页面整个段落不渲染（因为 `space &&` 前置判断为 false） |
+##### ❌ 不一致的根因
 
-#### 差异三：登录页面 Cookie 提示（由 `config.space_id` 控制）
+| 层级 | 数据来源 | 依赖入口 `space` Props？ |
+|------|---------|-------------------------|
+| **状态层**（discussions_enabled） | `process_endpoint()` 从 `api_url` 自动推断 + HF API 返回的真实 `space_name` | ❌ 完全不依赖 |
+| **链接层**（Discussion URL） | 嵌入者手动传入的 `space` Props | ✅ 完全依赖 |
 
-登录页面的 Cookie 提示显示条件为 `{#if space_id}`（[Login.svelte#L45-L49](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/core/src/Login.svelte#L45-L49)）。此处使用的 `space_id` 来自 `config.space_id`（服务端可信，从 `/config` API 下发），**与入口传入的 `space` 无关**：
+两套来源完全独立，当只传 `src` 不传 `space` 时就会出现：
 
-| 嵌入方式 | 目标服务端运行环境 | `config.space_id` 值 | Cookie 提示 |
-|---------|-----------------|---------------------|------------|
-| `<gradio-app space="a/b">` | 实际运行在 Spaces | `"a/b"` | ✅ 显示"请启用 Cookie" |
-| `<gradio-app src="https://xxx.hf.space">` | 实际运行在 Spaces | `"a/b"`（由服务端下发） | ✅ 同样显示 |
-| `<gradio-app space="a/b">` | 本地运行（`SYSTEM!=spaces`） | `null` | ❌ 不显示（即使入口传了 space） |
+> **状态检测能正常工作（知道讨论区已启用），但链接却指向 `spaces/null/...`**
+
+---
+
+##### 不同嵌入方式下的实际表现
+
+| 嵌入方式 | discussions_enabled 状态 | 渲染条件 | 链接中的 space | 实际表现 |
+|---------|-------------------------|---------|---------------|---------|
+| `<gradio-app space="a/b">` | ✅ 从 space name 推断，有效 | ✅ 满足 | `space="a/b"` | ✅ 段落渲染，链接正确指向 Space A |
+| `<gradio-app src="https://xxx.hf.space">` | ✅ 从 URL 域名解析，有效（`RE_SPACE_DOMAIN` 匹配） | ✅ 满足 | `space=null`（未传） | ⚠️ **段落渲染了，但链接是 `spaces/null/...`（无效链接，点击 404）** |
+| `<gradio-app src="https://custom.com">` | ❌ 非 hf.space 域名，`space_id=false`，不检测 | ❌ 不满足 | `null` | ❌ 段落不渲染 |
+| `<gradio-app src="https://a.hf.space" space="b/c">` | ✅ 检测 Space A 的讨论区 | ✅ 满足 | `space="b/c"` | ⚠️ **段落渲染了，但链接指向 Space B（完全错位）** |
+
+#### 差异三：登录页面 Cookie 提示
+
+登录页面的 Cookie 提示显示条件为 `{#if space_id}`（[Login.svelte#L45-L49](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/core/src/Login.svelte#L45-L49)）。
+
+⚠️ **此前结论有误**：Login 组件的 `space_id` **不是来自** `config.space_id`（服务端下发），而是来自入口 Props 传入的 `space`。证据：
+- SPA 入口：[Index.svelte#L591](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/spa/src/Index.svelte#L591) → `space_id={space}`
+- SSR 入口：[+page.svelte#L453](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/app/src/routes/[...catchall]/+page.svelte#L453) → `space_id={space}`
+
+因此 **src 嵌入时不会显示 Cookie 提示**，即使目标服务端确实运行在 Space 环境中：
+
+| 嵌入方式 | 传入 Login 的 space_id 值 | 目标服务端 space_id | Cookie 提示 |
+|---------|-------------------------|-------------------|------------|
+| `<gradio-app space="a/b">` | `"a/b"`（入口 Props） | `"a/b"`（服务端下发） | ✅ 显示 |
+| `<gradio-app src="https://xxx.hf.space">` | `null`（入口 Props） | `"a/b"`（服务端下发，存在但未被使用） | ❌ **不显示** |
+| `<gradio-app space="a/b">` 本地应用 | `"a/b"`（入口 Props） | `null`（非 Space 环境） | ✅ **仍然显示**（只要入口传了 space 就显示，与服务端环境无关） |
+
+> 这是另一处"两套来源"的不一致：Login 的 Cookie 提示完全信任入口传入的 `space`（嵌入者可伪造），而不是使用服务端下发的 `config.space_id`（可信）。
 
 #### 差异汇总表
 
-| 功能点 | 受哪个参数控制 | space 嵌入 | src 嵌入 |
-|-------|--------------|-----------|---------|
-| API 请求目标 URL | `space \|\| src` | ✅ 使用 `https://huggingface.co/spaces/{space}` 代理 | ✅ 使用 `src` 指定的 URL |
-| Embed 信息栏（Hosted on Spaces） | 入口 `space` Props | ✅ 显示（默认） | ❌ 不显示（`!!space` 为 false 短路） |
-| 联系作者 Discussion 链接 | 入口 `space` Props | ✅ 有效链接 | ❌ 不渲染段落 |
-| 登录页面 Cookie 提示 | `config.space_id`（服务端） | ✅ 目标运行在 Space 时显示 | ✅ 同样显示（不依赖入口参数） |
-| Space 状态轮询（building/sleeping） | `config.space_id`（由 Client 判断） | ✅ 显示构建/唤醒进度 | ✅ 同样显示 |
-| Footer Links（类型 B） | `is_embed`（两种入口代码相同） | ❌ 嵌入时清空 | ❌ 嵌入时清空 |
+| 功能点 | 控制来源 | space 嵌入 | src 嵌入（*.hf.space 域名） |
+|-------|---------|-----------|----------------------------|
+| API 请求目标 URL | `space \|\| src` | ✅ 使用 HF 代理 | ✅ 使用 src 指定的 URL |
+| Embed 信息栏（Hosted on Spaces） | 入口 `space` Props（先做 `!!space` 过滤） | ✅ 显示（默认） | ❌ 不显示（`!!space` 为 false 短路） |
+| 联系作者 Discussion 链接 | 状态：自动推断 space_id / 链接：入口 `space` Props（无 `space &&` 过滤，**存在 bug**） | ✅ 有效链接 | ⚠️ **段落渲染，但链接是 `spaces/null/...`（点击 404）** |
+| 登录页面 Cookie 提示 | 入口 `space` Props（**非** `config.space_id`） | ✅ 显示 | ❌ **不显示** |
+| Space 状态轮询（building/sleeping） | `process_endpoint()` 自动推断 space_id | ✅ 显示构建/唤醒进度 | ✅ 同样显示 |
+| Footer Links（类型 B） | `is_embed`（两种入口代码逐字相同） | ❌ 嵌入时清空 | ❌ 嵌入时清空 |
+
+#### 两套识别来源的全景图
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  来源 A：入口 Props 的 `space`（手动指定，嵌入者可控）       │
+│    → Embed 信息栏显示与链接（先做 !!space 过滤）            │
+│    → 联系作者 Discussion 链接（无 space && 过滤，有 bug）    │
+│    → Login Cookie 提示                                      │
+│    → Space Header 加载                                      │
+├─────────────────────────────────────────────────────────────┤
+│  来源 B：process_endpoint() 自动推断 space_id               │
+│        （从 api_url / space name 解析，不可直接控制）        │
+│    → Space 状态轮询（building/sleeping/paused/error）       │
+│    → discussions_enabled 讨论区启用状态检测                 │
+│    → check_and_wake_space 唤醒逻辑                          │
+│    → HF API 返回的真实 space_name（最终状态判断依据）        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**典型错位场景**：
+1. 只传 `src` 不传 `space`：状态能检测到，信息栏不显示，联系作者链接生成 `/spaces/null/...`（404）
+2. `space` 与 `src` 不匹配：联系作者链接指向错误的 Space，Cookie 提示显示的是入口指定的 Space 而非实际运行的 Space
 
 ---
 
@@ -683,14 +768,14 @@ async def login(request, form_data):
 │   │       │   └─ URL 构造：space 优先于 src
 │   │       └─ src="https://xxx.hf.space"（无 space 属性）
 │   │           ├─ info 前置短路：!!null && info = false → 不显示信息栏
-│   │           └─ Error/Paused 时联系作者段落不渲染（space=null 短路）
+│   │           └─ Error/Paused 时联系作者**段落渲染但链接是 spaces/null/...**（渲染条件无 space &&）
 │   │
 │   ├─ space Props 与 config.space_id 双轨制
-│   │   ├─ space（入口 Props，嵌入者指定）
+│   │   ├─ space（入口 Props，嵌入者指定，可控）
 │   │   │   ├─ Embed.svelte info 栏：display && space && info
-│   │   │   └─ SPA 联系作者 Discussion 链接
-│   │   └─ config.space_id（服务端下发，SYSTEM=spaces 环境变量）
-│   │       ├─ Login.svelte：space_id != null → 显示 Cookie 提示
+│   │   │   ├─ SPA 联系作者 Discussion 链接（渲染条件无 space &&，存在 bug）
+│   │   │   └─ Login.svelte：space_id != null → 显示 Cookie 提示（入口传入，非 config.space_id）
+│   │   └─ config.space_id（服务端下发，SYSTEM=spaces 环境变量，可信）
 │   │       ├─ Settings.svelte：space_id == null → 才显示主题切换
 │   │       ├─ CopyMarkdown API 文档标题和 Private Space 提示
 │   │       ├─ SkillSnippet Skill 安装命令中的 space 标识
@@ -754,7 +839,7 @@ async def login(request, form_data):
 | 环境探测 | [gradio/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/gradio/utils.py) | L563-L570 |
 | Space ID 注入 | [gradio/blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/gradio/blocks.py) | L1140-L1142, L2396, L2822 |
 | 嵌入组件 Props & 信息栏 | [js/core/src/Embed.svelte](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/core/src/Embed.svelte) | L99-L157 |
-| 登录页面 Cookie 提示（config.space_id） | [js/core/src/Login.svelte](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/core/src/Login.svelte) | L7-L49 |
+| 登录页面 Cookie 提示（入口 space Props，非 config.space_id） | [js/core/src/Login.svelte](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/core/src/Login.svelte) | L7-L49 |
 | 设置面板主题切换（config.space_id） | [js/core/src/api_docs/Settings.svelte](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/core/src/api_docs/Settings.svelte) | L14-L84 |
 | API 文档标题（config.space_id） | [js/core/src/api_docs/CopyMarkdown.svelte](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/core/src/api_docs/CopyMarkdown.svelte) | L20-L54 |
 | Skill 安装命令（config.space_id） | [js/core/src/api_docs/SkillSnippet.svelte](file:///d:/fz/0601/solo-dogfeeding/code/255-gradio/js/core/src/api_docs/SkillSnippet.svelte) | L5-L10 |
