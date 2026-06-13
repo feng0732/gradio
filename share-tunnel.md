@@ -2,12 +2,11 @@
 
 ## 概述
 
-Gradio 的分享链接功能基于 **FRP（Fast Reverse Proxy）** 实现，通过在本地启动 FRP 客户端（frpc），与远程 FRP 服务器建立隧道连接，从而将本地服务暴露到公网。整个流程涉及三个核心阶段：**隧道启动**、**握手连接**、**地址生成**。
+Gradio 的分享链接功能基于 FRP（Fast Reverse Proxy）实现，通过在本地启动 frpc 子进程，与远程服务器建立隧道，将本地服务暴露到公网。
 
-本文重点分析三个关键概念的关系：
-1. **代理标识**（`share_token`）：隧道的唯一身份标识
-2. **服务端分配地址**：FRP 服务端返回的公网访问地址
-3. **最终链接协议**：根据配置确定的最终 URL 协议（http/https）
+本文严格区分两类信息：
+- **代码事实**：从本仓库 Python 代码中可以直接观察和确认的行为
+- **FRP 语义推断**：根据 frpc 命令行参数名称和开源 FRP 项目语义所做的合理推测，**本仓库代码不直接可见**
 
 ---
 
@@ -15,148 +14,200 @@ Gradio 的分享链接功能基于 **FRP（Fast Reverse Proxy）** 实现，通�
 
 | 文件 | 作用 |
 |------|------|
-| [gradio/tunneling.py](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py) | 隧道核心逻辑，封装了 `Tunnel` 类，负责 frpc 下载、启动、地址读取 |
-| [gradio/networking.py](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py) | 网络辅助层，`setup_tunnel()` 函数协调隧道建立 |
-| [gradio/blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py) | 应用入口，`launch()` 方法触发隧道创建，生成 `share_token` 并处理最终 URL |
+| [gradio/tunneling.py](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py) | 隧道核心逻辑：`Tunnel` 类，负责 frpc 下载、子进程启动、stdout 解析 |
+| [gradio/networking.py](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py) | 网络辅助层：`setup_tunnel()` 函数协调服务器发现和隧道创建 |
+| [gradio/blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py) | 应用入口：`launch()` 触发隧道创建、生成 `share_token`、改写最终 URL |
 
 ---
 
-## 一、代理标识（share_token）的生命周期
+## 一、代理标识（share_token）的代码事实
 
-### 1.1 生成时机与算法
+### 1.1 生成
 
-`share_token` 是隧道的唯一身份标识，在 Blocks 初始化时生成，见 [blocks.py#L143](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L143-L143)：
+> **代码事实**，见 [blocks.py#L143](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L143-L143)
 
 ```python
 self.share_token = secrets.token_urlsafe(32)
 ```
 
-- **生成时机**：用户创建 `gr.Blocks()` 对象时
-- **算法**：Python 标准库 `secrets.token_urlsafe(32)`
-- **长度**：32 字节随机数 → Base64 URL 编码后约 43 个字符
-- **随机性**：密码学安全的随机数，不可预测
+- 生成时机：`Blocks.__init__` 时
+- 算法：Python 标准库 `secrets.token_urlsafe(32)`，密码学安全随机数
+- 32 字节 → URL-safe Base64 编码后约 43 个字符
 
-### 1.2 在握手中的作用
+### 1.2 传递给 frpc
 
-`share_token` 通过 `-n` 参数传递给 frpc，作为代理名称（proxy name）：
+> **代码事实**，见 [tunneling.py#L128-L129](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L128-L129)
 
 ```python
-command = [
-    binary,
-    "http",                  # HTTP 代理模式
-    "-n", self.share_token,  # 代理名称 = share_token
-    ...
-]
+"-n",
+self.share_token,
 ```
 
-**核心作用**：
-1. **隧道身份标识**：FRP 服务端用它来区分不同的隧道连接
-2. **代理注册标识**：注册 HTTP 代理时的唯一名称
-3. **安全隔离**：足够长的随机字符串防止猜测和冲突
+`share_token` 作为 frpc 命令的 `-n` 参数值传入。Python 代码**只知道**这是传给 frpc 的一个命令行参数，名为 `-n`。
 
-### 1.3 与子域名的关系
+> **FRP 语义推断**：`-n` 在 FRP 中代表 proxy name（代理名称），服务端用它区分不同隧道的代理注册。但本仓库 Python 代码中没有任何代码读取、验证或依赖 `-n` 的 FRP 语义，只是原样传递。
 
-重要：`share_token` **不等于** 最终的子域名。子域名由 FRP 服务端根据 `--sd random` 参数随机生成，与 `share_token` 没有直接的数学关联。
+### 1.3 share_token 与子域名的关系
+
+> **代码事实**：Python 代码中没有任何逻辑将 `share_token` 映射到子域名。两者的生成路径完全独立：`share_token` 在本地生成，子域名地址从 frpc stdout 中读取。
+
+> **FRP 语义推断**：根据 FRP 项目设计，`--sd random` 参数请求服务端随机分配子域名，该子域名与 `-n` 指定的代理名称是独立的两个概念。
 
 ---
 
-## 二、握手阶段：各参数的职责
+## 二、frpc 子进程启动的代码事实
 
-### 2.1 frpc 启动命令详解
+### 2.1 完整命令构造
 
-隧道启动的核心在 `Tunnel._start_tunnel()` 方法（[tunneling.py#L123-L154](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L123-L154)），通过子进程启动 frpc：
+> **代码事实**，见 [tunneling.py#L125-L141](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L125-L141)
 
 ```python
 command = [
-    binary,
-    "http",                  # [1] 代理类型
-    "-n", self.share_token,  # [2] 代理名称 = share_token
-    "-l", str(self.local_port),   # [3] 本地端口
-    "-i", self.local_host,        # [4] 本地主机
-    "--uc",                  # [5] 启用自定义子域名
-    "--sd", "random",        # [6] 子域名策略：随机
-    "--ue",                  # [7] 启用数据加密
-    "--server_addr", f"{self.remote_host}:{self.remote_port}",  # [8] 服务器地址
-    "--disable_log_color",   # [9] 禁用日志颜色（便于解析）
+    binary,                                                    # frpc 可执行文件路径
+    "http",                                                    # 子命令
+    "-n", self.share_token,                                    # 参数 -n
+    "-l", str(self.local_port),                                # 参数 -l
+    "-i", self.local_host,                                     # 参数 -i
+    "--uc",                                                    # 开关 --uc
+    "--sd", "random",                                          # 参数 --sd，值为 random
+    "--ue",                                                    # 开关 --ue
+    "--server_addr", f"{self.remote_host}:{self.remote_port}", # 参数 --server_addr
+    "--disable_log_color",                                     # 开关 --disable_log_color
 ]
 ```
 
-### 2.2 参数职责明细
+以上是代码中**可直接确认的全部事实**：构造了一个命令行参数列表并启动子进程。
 
-| 参数 | 全称 | 职责 | 与其他概念的关系 |
-|------|------|------|----------------|
-| `http` | - | 代理类型，指定为 HTTP 反向代理模式 | 决定了服务端如何处理流量 |
-| `-n` | proxy name | 代理名称，使用 `share_token` 作为唯一标识 | **代理标识**的传递载体 |
-| `-l` | local port | 本地服务端口 | 指向要暴露的 Gradio 本地服务 |
-| `-i` | local host | 本地服务主机地址 | 指向要暴露的 Gradio 本地服务 |
-| `--uc` | use custom subdomain | 启用自定义子域名功能 | 告诉服务端需要分配子域名 |
-| `--sd` | subdomain | 子域名策略，`random` 表示请求随机分配 | 决定**服务端分配地址**的生成方式 |
-| `--ue` | use encryption | 启用 frp 协议层的数据加密 | 保障隧道内传输安全 |
-| `--server_addr` | server address | FRP 服务端地址和端口 | 握手的目标服务器 |
-| `--disable_log_color` | - | 禁用彩色日志输出 | 便于后续正则解析地址 |
+### 2.2 各参数的代码可见职责
 
-### 2.3 TLS 握手参数
+下表严格区分代码事实与 FRP 语义推断：
 
-如果提供了 TLS 证书（默认官方服务器都会提供），则追加以下参数：
+| 参数 | 代码可见事实 | FRP 语义推断（本仓库不可见） |
+|------|-------------|--------------------------|
+| `http` | 作为 frpc 的第一个子命令参数传入 | FRP 的代理类型，表示 HTTP 反向代理模式 |
+| `-n <token>` | 将 `share_token` 作为 `-n` 的值传入 | FRP 中代表 proxy name（代理名称） |
+| `-l <port>` | 将 `local_port` 转字符串后作为 `-l` 的值传入 | FRP 中代表 local port（本地监听端口） |
+| `-i <host>` | 将 `local_host` 作为 `-i` 的值传入 | FRP 中代表 local IP（本地绑定地址） |
+| `--uc` | 作为开关传入，无值 | FRP 中代表 use custom subdomain（启用自定义子域名） |
+| `--sd random` | `--sd` 参数的值固定为 `"random"` | FRP 中代表 subdomain 策略，random 请求随机子域名 |
+| `--ue` | 作为开关传入，无值 | FRP 中代表 use encryption（启用加密） |
+| `--server_addr <addr>` | 拼接 `remote_host:remote_port` 作为值传入 | FRP 中代表 FRP 服务端地址 |
+| `--disable_log_color` | 作为开关传入，无值 | 禁用日志彩色输出（代码中有正则解析 stdout 的需求，这是可推断的原因） |
+
+### 2.3 TLS 相关参数
+
+> **代码事实**，见 [tunneling.py#L142-L149](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L142-L149)
 
 ```python
 if self.share_server_tls_certificate is not None:
     command.extend([
-        "--tls_enable",                     # 启用 TLS 加密连接
-        "--tls_trusted_ca_file",            # 指定 CA 证书文件路径
-        self.share_server_tls_certificate,  # 从 API 服务器获取的根证书
+        "--tls_enable",
+        "--tls_trusted_ca_file",
+        self.share_server_tls_certificate,
     ])
 ```
 
-**注意**：`--ue` 和 `--tls_enable` 是两层不同的加密：
-- `--ue`：FRP 协议层面的加密
-- `--tls_enable`：传输层的 TLS 加密
+**代码可见行为**：当 `share_server_tls_certificate` 不为 None 时，追加 `--tls_enable` 开关和 `--tls_trusted_ca_file` 参数。Python 代码**不直接观察** TLS 握手过程。
 
-### 2.4 握手完整流程
+> **FRP 语义推断**：`--tls_enable` 启用 frpc 到 frps 的 TLS 连接；`--tls_trusted_ca_file` 指定受信 CA 证书文件用于验证服务端。
 
-握手过程包括以下步骤：
+### 2.4 子进程启动与生命周期
 
+> **代码事实**，见 [tunneling.py#L150-L154](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L150-L154)
+
+```python
+self.proc = subprocess.Popen(
+    command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+)
+atexit.register(self.kill)
 ```
-本地 frpc                         FRP 服务端
-   |                                 |
-   | 1. TCP 连接                     |
-   |------------------------------->|
-   |                                 |
-   | 2. TLS 握手（如果启用）         |
-   |<========= 加密通道 ==========>|
-   |                                 |
-   | 3. 登录请求                     |
-   |   (携带 share_token)            |
-   |------------------------------->|
-   |                                 |
-   | 4. 登录响应                     |
-   |<-------------------------------|
-   |                                 |
-   | 5. 代理注册请求                 |
-   |   类型: http                    |
-   |   名称: share_token             |
-   |   子域名: random                |
-   |------------------------------->|
-   |                                 |
-   | 6. 代理注册响应                 |
-   |   分配子域名: abc123            |
-   |   访问地址: http://abc123.gradio.live
-   |<-------------------------------|
-   |                                 |
-   | 7. 输出日志                     |
-   |   "start proxy success: http://abc123.gradio.live"
-   |<--- 本地 Python 进程解析此输出
+
+- `stdout` 被管道重定向，用于后续逐行读取
+- `stderr` 被管道重定向但代码**从未读取** stderr
+- `atexit.register(self.kill)` 确保进程退出时终止 frpc
+
+> **代码事实**，见 [tunneling.py#L124](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L124-L124) 和 [blocks.py#L3369-L3370](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L3369-L3370)
+
+```python
+CURRENT_TUNNELS.append(self)  # 注册到全局列表
+# ...
+for tunnel in CURRENT_TUNNELS:
+    tunnel.kill()  # KeyboardInterrupt 时逐一终止
 ```
 
 ---
 
-## 三、服务端分配地址的实际格式
+## 三、frpc 输出解析的代码事实
 
-### 3.1 地址来源
+### 3.1 输出读取机制
 
-服务端分配的地址通过 frpc 进程的标准输出返回，由 `_read_url_from_tunnel_stream()` 方法解析（[tunneling.py#L156-L193](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L156-L193)）。
+> **代码事实**，见 [tunneling.py#L156-L193](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L156-L193)
 
-**解析逻辑**：
+Python 代码**唯一可观察 frpc 内部状态的方式**是读取子进程的 stdout。代码在一个 while 循环中逐行读取，关注两个字符串模式：
+
+```python
+if "start proxy success" in line:
+    result = re.search("start proxy success: (.+)\n", line)
+    if result is None:
+        _raise_tunnel_error()
+    else:
+        url = result.group(1)
+elif "login to server failed" in line:
+    _raise_tunnel_error()
+```
+
+### 3.2 代码可见的 frpc 输出阶段
+
+**这两个匹配模式是 Python 代码对 frpc 进程状态的全部认知**：
+
+| stdout 中的字符串 | 代码的处理行为 | 推断的 frpc 阶段 |
+|------------------|--------------|----------------|
+| `"login to server failed"` | 立即抛出异常，视为致命错误 | frpc 与服务端之间的登录/认证阶段失败 |
+| `"start proxy success: <url>"` | 正则提取 `: ` 后面的内容作为 URL，返回 | frpc 代理建立成功，返回公网访问地址 |
+
+> **关键区分**：
+> - `"login to server failed"` 的存在证实 frpc 有一个"登录"阶段，但**代码不可见**登录的具体协议、报文格式和认证机制
+> - `"start proxy success"` 的存在证实 frpc 有一个"代理建立"阶段，且成功时返回一个 URL，但**代码不可见**代理注册的具体过程
+
+### 3.3 日志收集与错误处理
+
+> **代码事实**
+
+```python
+log = []
+# ...
+log.append(line.strip())  # 每一行 stdout 都被收集
+```
+
+所有 frpc 输出行都被收集到 `log` 列表中。当超时或遇到错误时，完整日志会输出到 stderr：
+
+```python
+def _raise_tunnel_error():
+    log_text = "\n".join(log)
+    print(log_text, file=sys.stderr)
+    raise ValueError(f"{TUNNEL_ERROR_MESSAGE}\n{log_text}")
+```
+
+### 3.4 超时机制
+
+> **代码事实**，见 [tunneling.py#L54](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L54-L54) 和 [tunneling.py#L169-L170](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L169-L170)
+
+```python
+TUNNEL_TIMEOUT_SECONDS = 30
+# ...
+if time.time() - start_timestamp >= TUNNEL_TIMEOUT_SECONDS:
+    _raise_tunnel_error()
+```
+
+30 秒内未匹配到 `"start proxy success"` 或 `"login to server failed"` 则超时。
+
+---
+
+## 四、服务端返回地址的代码事实
+
+### 4.1 地址提取
+
+> **代码事实**，见 [tunneling.py#L184-L189](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L184-L189)
 
 ```python
 if "start proxy success" in line:
@@ -164,45 +215,52 @@ if "start proxy success" in line:
     url = result.group(1)
 ```
 
-### 3.2 实际格式验证
+**代码可见行为**：从 frpc 输出中，取 `"start proxy success: "` 之后到行尾的内容作为 `url`。
 
-通过 `urlparse` + `urlunparse` 的组合使用方式，可以推断出服务端返回的实际格式。让我们验证两种可能性：
+### 4.2 返回地址的格式推断
+
+> **以下为基于代码行为逻辑的推断，不是直接可见事实**
+
+Python 代码随后对 `url` 执行 `urlparse()` 和 `urlunparse()`（见 [blocks.py#L3129-L3132](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L3129-L3132)）：
 
 ```python
-from urllib.parse import urlparse, urlunparse
-
-# 情况 1：返回带协议的完整 URL
-share_url = "http://abc123.gradio.live"
-parsed = urlparse(share_url)
-# scheme='http', netloc='abc123.gradio.live', path=''
-new_url = urlunparse(('https',) + parsed[1:])
-# 结果: 'https://abc123.gradio.live'  ✓ 正确
-
-# 情况 2：返回纯域名
-share_url = "abc123.gradio.live"
-parsed = urlparse(share_url)
-# scheme='', netloc='', path='abc123.gradio.live'
-new_url = urlunparse(('https',) + parsed[1:])
-# 结果: 'https:abc123.gradio.live'  ✗ 错误（缺少 //）
+parsed_url = urlparse(share_url)
+self.share_url = urlunparse(
+    (self.share_server_protocol,) + parsed_url[1:]
+)
 ```
 
-**结论**：服务端返回的是**带协议的完整 URL**，格式为 `http://<随机子域名>.gradio.live`。
+如果 frpc 返回的是纯域名（如 `abc123.gradio.live`），`urlparse` 会将其解析为 `path` 而非 `netloc`，导致 `urlunparse` 改写后生成错误的 URL（如 `https:abc123.gradio.live`，缺少 `//`）。
 
-### 3.3 子域名的生成
+经实际验证：
 
-子域名由 FRP 服务端生成，与 `--sd random` 参数相关：
-- 客户端请求 `--sd random` 表示"请给我一个随机子域名"
-- 服务端生成一个随机字符串（如 `abc123`）作为子域名
-- 最终地址格式：`http://abc123.gradio.live`
-- 子域名与 `share_token` 没有直接关联
+```
+urlparse("http://abc123.gradio.live")
+  → scheme='http', netloc='abc123.gradio.live', path=''
+  → urlunparse(('https',)+parsed[1:]) = 'https://abc123.gradio.live'  ✓
+
+urlparse("abc123.gradio.live")
+  → scheme='', netloc='', path='abc123.gradio.live'
+  → urlunparse(('https',)+parsed[1:]) = 'https:abc123.gradio.live'  ✗
+```
+
+**推断结论**：frpc 返回的地址**必须**是带 `http://` 前缀的完整 URL（如 `http://abc123.gradio.live`），否则后续改写逻辑无法正确工作。
+
+> **注意**：这一推断的依据是代码中 `urlparse`+`urlunparse` 的组合行为。代码本身没有对 `share_url` 格式做任何显式校验或注释说明。
+
+### 4.3 子域名从何而来
+
+> **代码事实**：Python 代码中**没有任何逻辑**生成或选择子域名。frpc 命令中 `--sd random` 是传给 frpc 的参数，子域名的生成发生在 frpc 进程与服务端的交互中，对 Python 代码来说是**黑箱**。
+
+> **FRP 语义推断**：`--sd random` 请求服务端随机分配子域名，`--uc` 启用自定义子域名功能。但子域名的具体生成算法、分配策略完全在 frpc/frps 的 Go 代码中，本仓库不可见。
 
 ---
 
-## 四、本地 URL 改写与协议转换
+## 五、本地 URL 改写的代码事实
 
-### 4.1 协议选择逻辑
+### 5.1 协议选择逻辑
 
-最终 URL 的协议由 `share_server_protocol` 决定，其初始化逻辑在 [blocks.py#L2966-L2968](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L2966-L2968)：
+> **代码事实**，见 [blocks.py#L2966-L2968](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L2966-L2968)
 
 ```python
 self.share_server_protocol = share_server_protocol or (
@@ -210,236 +268,230 @@ self.share_server_protocol = share_server_protocol or (
 )
 ```
 
-**规则**：
+这是纯粹的 Python 三元逻辑：
 
-| 场景 | share_server_protocol 默认值 | 原因 |
-|------|----------------------------|------|
-| 使用官方服务器（无自定义地址） | `https` | 官方服务器配置了 TLS 证书，提供安全连接 |
-| 使用自定义服务器 | `http` | 自定义服务器可能未配置 TLS，默认使用明文 |
-| 用户显式指定参数 | 用户指定值 | 优先级最高，覆盖默认值 |
+| 条件 | `share_server_protocol` 值 |
+|------|--------------------------|
+| 用户显式传了 `share_server_protocol` 参数 | 使用用户指定值 |
+| `share_server_address is not None`（即使用了自定义服务器） | `"http"` |
+| `share_server_address is None`（即使用官方服务器） | `"https"` |
 
-### 4.2 URL 改写过程
+### 5.2 URL 改写过程
 
-在 [blocks.py#L3129-L3132](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L3129-L3132) 中完成最终 URL 的构造：
+> **代码事实**，见 [blocks.py#L3129-L3132](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L3129-L3132)
 
 ```python
-share_url = networking.setup_tunnel(...)  # 返回 "http://abc123.gradio.live"
 parsed_url = urlparse(share_url)
 self.share_url = urlunparse(
     (self.share_server_protocol,) + parsed_url[1:]
 )
 ```
 
-**详细步骤**：
+**代码可见行为**：
+1. 将 `setup_tunnel()` 返回的字符串用 `urlparse` 分解为 6 元组 `(scheme, netloc, path, params, query, fragment)`
+2. 保留后 5 个部分不变，仅将 `scheme` 替换为 `share_server_protocol`
+3. 用 `urlunparse` 重新组合
 
-1. **获取服务端地址**：`setup_tunnel()` 返回 `http://abc123.gradio.live`
-2. **URL 解析**：`urlparse()` 将 URL 分解为 6 个组成部分：
-   ```
-   scheme   = 'http'
-   netloc   = 'abc123.gradio.live'
-   path     = ''
-   params   = ''
-   query    = ''
-   fragment = ''
-   ```
-3. **替换协议**：用 `share_server_protocol` 替换原来的 `scheme`
-4. **重新组合**：`urlunparse()` 将各部分重新组合成完整 URL
+**效果**：将 frpc 返回的 URL 的协议部分替换为 `share_server_protocol`，其他部分原样保留。
 
-**示例**：
+### 5.3 官方服务器场景的完整示例
 
-| 场景 | 服务端返回 | share_server_protocol | 最终 URL |
-|------|-----------|----------------------|----------|
-| 官方服务器 | `http://abc123.gradio.live` | `https` | `https://abc123.gradio.live` |
-| 自定义服务器（默认） | `http://xyz.local:8080` | `http` | `http://xyz.local:8080` |
-| 自定义服务器（指定 https） | `http://xyz.local:8080` | `https` | `https://xyz.local:8080` |
+> **基于代码逻辑的推演**
 
-### 4.3 为什么需要改写协议？
+```
+setup_tunnel() 返回:  "http://abc123.gradio.live"
+                     ↓ urlparse
+scheme='http', netloc='abc123.gradio.live', path='', params='', query='', fragment=''
+                     ↓ urlunparse 以 'https' 替换 scheme
+最终 share_url:      "https://abc123.gradio.live"
+```
 
-frpc 返回的地址使用 `http` 协议（因为 frp 内部通信使用 http），但：
-1. 官方服务器在网关层提供了 TLS 终结，所以对外应该使用 `https`
-2. 自定义服务器可能有也可能没有 TLS，所以给用户选择权
-3. 协议改写只修改 URL 的 scheme 部分，不影响其他部分
+### 5.4 自定义服务器场景的完整示例
+
+```
+setup_tunnel() 返回:  "http://xyz.local:8080"
+                     ↓ urlparse
+scheme='http', netloc='xyz.local:8080', path='', params='', query='', fragment=''
+                     ↓ urlunparse 以 'http' 替换 scheme（share_server_address != None → 默认 http）
+最终 share_url:      "http://xyz.local:8080"
+```
+
+### 5.5 为什么需要改写
+
+> **FRP 语义推断**：frpc 返回的地址始终以 `http://` 开头，因为 frp 内部只处理 HTTP 流量。官方服务器在网关层有 TLS 终结，对外应使用 `https`，因此需要在 Python 层改写协议。自定义服务器可能没有 TLS，所以默认保持 `http`。
 
 ---
 
-## 五、三者关系的完整视图
+## 六、服务器发现的代码事实
 
+### 6.1 默认路径：请求 Gradio API
+
+> **代码事实**，见 [networking.py#L35-L53](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L35-L53)
+
+```python
+if share_server_address is None:
+    response = httpx.get(GRADIO_API_SERVER, timeout=30)
+    payload = response.json()[0]
+    remote_host, remote_port = payload["host"], int(payload["port"])
+    certificate = payload["root_ca"]
+    # ...
+    with open(CERTIFICATE_PATH, "w") as f:
+        f.write(certificate)
+    share_server_tls_certificate = CERTIFICATE_PATH
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      概念关系与数据流                                │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  1. 代理标识 (share_token)                                          │
-│     ┌─────────────────────────────────────────┐                    │
-│     │ 生成: secrets.token_urlsafe(32)         │                    │
-│     │ 位置: Blocks.__init__                   │                    │
-│     │ 作用: 隧道唯一身份标识                   │                    │
-│     └───────────────┬─────────────────────────┘                    │
-│                     │                                              │
-│                     ▼                                              │
-│     ┌─────────────────────────────────────────┐                    │
-│     │ frpc -n <share_token> --sd random       │  ◄── 握手阶段      │
-│     └───────────────┬─────────────────────────┘                    │
-│                     │                                              │
-│  2. 服务端分配地址                                                 │
-│     ┌───────────────▼─────────────────────────┐                    │
-│     │ FRP 服务端生成随机子域名                 │                    │
-│     │ 返回: http://abc123.gradio.live          │                    │
-│     └───────────────┬─────────────────────────┘                    │
-│                     │                                              │
-│                     ▼                                              │
-│     ┌─────────────────────────────────────────┐                    │
-│     │ parsed_url = urlparse(share_url)        │  ◄── 解析阶段      │
-│     │  scheme: 'http'                         │                    │
-│     │  netloc: 'abc123.gradio.live'           │                    │
-│     └───────────────┬─────────────────────────┘                    │
-│                     │                                              │
-│  3. 最终链接协议                                                   │
-│     ┌───────────────▼─────────────────────────┐                    │
-│     │ share_server_protocol                   │                    │
-│     │  官方服务器: 'https'                    │                    │
-│     │  自定义服务器: 'http'                   │  ◄── 协议选择      │
-│     └───────────────┬─────────────────────────┘                    │
-│                     │                                              │
-│                     ▼                                              │
-│     ┌─────────────────────────────────────────┐                    │
-│     │ urlunparse(                             │  ◄── 最终生成      │
-│     │   (share_server_protocol,)              │                    │
-│     │   + parsed_url[1:]                      │                    │
-│     │ )                                       │                    │
-│     └───────────────┬─────────────────────────┘                    │
-│                     │                                              │
-│                     ▼                                              │
-│     ┌─────────────────────────────────────────┐                    │
-│     │ 最终 share_url: https://abc123.gradio.live │                 │
-│     └─────────────────────────────────────────┘                    │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
+
+**代码可见行为**：
+1. 向 `https://api.gradio.app/v3/tunnel-request` 发 GET 请求
+2. 从 JSON 响应的 `[0]` 中取 `host`、`port`、`root_ca` 三个字段
+3. 将 `root_ca` 写入本地 `.gradio/certificate.pem`
+4. 将证书路径赋给 `share_server_tls_certificate`
+
+### 6.2 自定义路径：用户指定服务器
+
+> **代码事实**，见 [networking.py#L55-L57](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L55-L57)
+
+```python
+else:
+    remote_host, remote_port = share_server_address.split(":")
+    remote_port = int(remote_port)
 ```
+
+**代码可见行为**：按 `:` 分割用户提供的地址字符串为 host 和 port。此时**不**请求 API、**不**获取证书、`share_server_tls_certificate` 保持为用户传入的原始值（通常为 None）。
 
 ---
 
-## 六、完整流程时序图
+## 七、frpc 二进制下载的代码事实
+
+### 7.1 下载与校验
+
+> **代码事实**，见 [tunneling.py#L83-L110](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L83-L110)
+
+- 下载地址根据 `platform.system()` 和 `platform.machine()` 动态拼接
+- 下载源：`https://cdn-media.huggingface.co/frpc-gradio-0.3/frpc_{os}_{arch}[.exe]`
+- 存储位置：`{HF_HOME}/gradio/frpc/frpc_{os}_{arch}_v0.3`
+- 已存在的文件**不重新下载**（`if not Path(BINARY_PATH).exists()`）
+- 下载后做 SHA-256 校验，与硬编码的 `CHECKSUMS` 字典比对
+- 校验失败抛出 `ChecksumMismatchError`
+
+---
+
+## 八、三者关系的数据流总结
 
 ```
-用户代码            Blocks        networking.py       tunneling.py       frpc 进程      FRP 服务器
-   |                  |               |                   |                |              |
-   | Blocks()         |               |                   |                |              |
-   |----------------->|               |                   |                |              |
-   |                  | 生成 share_token                   |                |              |
-   |                  | secrets.token_urlsafe(32)          |                |              |
-   |                  |               |                   |                |              |
-   | launch(share=True)|               |                   |                |              |
-   |----------------->|               |                   |                |              |
-   |                  | 确定 share_server_protocol        |                |              |
-   |                  | (官方->https, 自定义->http)       |                |              |
-   |                  |               |                   |                |              |
-   |                  | setup_tunnel()|                   |                |              |
-   |                  |-------------->|                   |                |              |
-   |                  |               | 请求隧道服务器信息 |                |              |
-   |                  |               | api.gradio.app    |                |              |
-   |                  |               |------------------->|                |              |
-   |                  |               |<-------------------|                |              |
-   |                  |               | host/port/ca      |                |              |
-   |                  |               |                   |                |              |
-   |                  |               | 创建 Tunnel 对象  |                |              |
-   |                  |               |------------------>|                |              |
-   |                  |               |                   |                |              |
-   |                  |               | start_tunnel()    |                |              |
-   |                  |               |------------------>|                |              |
-   |                  |               |                   | 下载 frpc      |              |
-   |                  |               |                   | SHA256 校验    |              |
-   |                  |               |                   |                |              |
-   |                  |               |                   | 启动子进程     |              |
-   |                  |               |                   | [http,         |              |
-   |                  |               |                   |  -n token,     |              |
-   |                  |               |                   |  --uc,         |              |
-   |                  |               |                   |  --sd random,  |              |
-   |                  |               |                   |  --ue, ...]    |              |
-   |                  |               |                   |--------------->|              |
-   |                  |               |                   |                |  TCP 连接    |
-   |                  |               |                   |                |------------->|
-   |                  |               |                   |                |  TLS 握手    |
-   |                  |               |                   |                |<============>|
-   |                  |               |                   |                |  登录(token) |
-   |                  |               |                   |                |------------->|
-   |                  |               |                   |                |  注册代理    |
-   |                  |               |                   |                | (random 子域)|
-   |                  |               |                   |                |------------->|
-   |                  |               |                   |                |  分配子域名  |
-   |                  |               |                   |                |<-------------|
-   |                  |               |                   |  读取 stdout   |              |
-   |                  |               |                   |<---------------|              |
-   |                  |               |                   |  "start proxy  |              |
-   |                  |               |                   |   success:     |              |
-   |                  |               |                   |   http://abc123|              |
-   |                  |               |                   |   .gradio.live"|              |
-   |                  |               |                   |  正则提取      |              |
-   |                  |               |                   |  url = "http://|              |
-   |                  |               |                   |  abc123.gradio.|              |
-   |                  |               |                   |  live"         |              |
-   |                  |               |<------------------|                |              |
-   |                  |<--------------| 返回原始 URL       |                |              |
-   |                  |               |                   |                |              |
-   |                  |  urlparse("http://abc123...")      |                |              |
-   |                  |  scheme='http', netloc='abc...'    |                |              |
-   |                  |               |                   |                |              |
-   |                  |  urlunparse(                       |                |              |
-   |                  |    ('https',) + parsed[1:]         |                |              |
-   |                  |  )                                 |                |              |
-   |                  |               |                   |                |              |
-   |                  |  最终 URL:                         |                |              |
-   |                  |  https://abc123.gradio.live        |                |              |
-   |<-----------------| 返回 share_url                     |                |              |
+┌──────────────────────────────────────────────────────────────────────┐
+│                       代码事实（本仓库可见）                          │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  share_token                                                         │
+│  生成: secrets.token_urlsafe(32)  [blocks.py:143]                   │
+│  传递: frpc -n <share_token>      [tunneling.py:128-129]            │
+│                                                                      │
+│         ↓ frpc 子进程内部（黑箱，代码不可见）                        │
+│                                                                      │
+│  frpc stdout 输出                                                    │
+│  可见模式1: "login to server failed"   [tunneling.py:190]           │
+│  可见模式2: "start proxy success: http://xxx.gradio.live"            │
+│             [tunneling.py:184-189]                                   │
+│                                                                      │
+│         ↓ Python 代码处理                                            │
+│                                                                      │
+│  地址提取: 正则 "start proxy success: (.+)\n" → url                 │
+│            [tunneling.py:185-189]                                    │
+│                                                                      │
+│  协议改写: urlparse + urlunparse                                    │
+│            scheme 替换为 share_server_protocol                       │
+│            [blocks.py:3129-3132]                                    │
+│                                                                      │
+│  最终 URL: https://xxx.gradio.live（官方服务器）                     │
+│           http://xxx:port（自定义服务器）                             │
+│                                                                      │
+├──────────────────────────────────────────────────────────────────────┤
+│                       FRP 语义推断（本仓库不可见）                    │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  frpc 内部行为:                                                      │
+│  - TCP 连接到 server_addr                                            │
+│  - TLS 握手（如果 --tls_enable）                                     │
+│  - 登录认证（"login to server failed" 证实此阶段存在）               │
+│  - 代理注册（-n 指定名称，--uc/--sd random 请求子域名）              │
+│  - 服务端分配子域名并返回完整 URL                                    │
+│                                                                      │
+│  上述步骤的具体协议和报文格式在 Go 代码中，Python 代码不可见         │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 七、关键设计要点
+## 九、完整流程时序图（区分代码事实与推断）
 
-### 7.1 安全性
+```
+用户/Python代码                          frpc子进程                   外部服务
+    │                                       │                           │
+    │ Blocks.__init__()                     │                           │
+    │ share_token = secrets.token_urlsafe() │                           │
+    │───────────────────────────            │                           │
+    │                                       │                           │
+    │ launch(share=True)                    │                           │
+    │ 确定 share_server_protocol            │                           │
+    │───────────────────────────            │                           │
+    │                                       │                           │
+    │ networking.setup_tunnel()             │                           │
+    │───────────────────────────            │                           │
+    │ httpx.get(api.gradio.app)  ──────────────────────────────────>   │
+    │ <─── {host, port, root_ca}  ──────────────────────────────────   │
+    │ 写入证书文件                          │                           │
+    │───────────────────────────            │                           │
+    │ Tunnel.start_tunnel()                 │                           │
+    │ download_binary()                     │                           │
+    │ httpx.get(cdn-media.huggingface) ────────────────────────────>   │
+    │ SHA256 校验                           │                           │
+    │───────────────────────────            │                           │
+    │ subprocess.Popen([frpc, ...])  ──────>│                           │
+    │                                       │                           │
+    │  ╔════════════════════════════════════╗                           │
+    │  ║ 以下为 frpc 黑箱行为（代码不可见）  ║                           │
+    │  ║                                  ║                           │
+    │  ║  frpc ──TCP/TLS──> FRP服务器     ║                           │
+    │  ║  frpc ──登录────> FRP服务器      ║                           │
+    │  ║  frpc ──注册代理─> FRP服务器      ║                           │
+    │  ║  frpc <──分配地址── FRP服务器     ║                           │
+    │  ╚════════════════════════════════════╝                           │
+    │                                       │                           │
+    │  ← stdout: "login to server failed"  │  (若登录失败)             │
+    │    → 抛出异常                         │                           │
+    │                                       │                           │
+    │  ← stdout: "start proxy success:      │                           │
+    │             http://xxx.gradio.live"   │                           │
+    │    → 正则提取 url                     │                           │
+    │───────────────────────────            │                           │
+    │ urlparse + urlunparse 改写协议        │                           │
+    │ 最终 share_url 生成                   │                           │
+    │───────────────────────────            │                           │
+```
 
-- **TLS 加密**：官方服务器默认使用 TLS 加密隧道连接，防止中间人攻击
-- **CA 证书验证**：通过服务端下发的根证书验证服务端身份
-- **随机 Token**：`share_token` 使用密码学安全随机数，长度足够（32字节），难以猜测
-- **SHA-256 校验**：frpc 二进制文件下载后进行完整性校验，防止篡改
-- **双层加密**：`--ue`（FRP 协议加密）+ `--tls_enable`（传输层加密）
-
-### 7.2 协议设计的权衡
-
-| 决策 | 原因 | 潜在问题 |
-|------|------|----------|
-| frpc 返回 `http://` | frp 内部通信使用 http | 需要在 Python 层改写协议 |
-| 官方服务器改写为 `https` | 网关层有 TLS 终结 | 依赖基础设施配置 |
-| 自定义服务器默认为 `http` | 不确定自定义服务器是否有 TLS | 可能导致不安全连接（用户需显式指定 https） |
-
-### 7.3 可扩展性
-
-- **自定义服务器**：支持通过 `share_server_address` 指定自建 FRP 服务器
-- **自定义协议**：支持 `share_server_protocol` 显式指定 http/https
-- **自定义证书**：支持 `share_server_tls_certificate` 指定 TLS 证书
+图中实线框为代码可见行为，虚线框 `║` 内为 frpc 黑箱行为。
 
 ---
 
-## 八、相关环境变量
+## 十、关键边界总结
 
-| 变量名 | 作用 |
-|--------|------|
-| `GRADIO_SHARE_SERVER_ADDRESS` | 自定义 FRP 分享服务器地址（格式: host:port） |
-| `HF_HOME` | frpc 二进制文件存储根目录，默认为 `~/.cache/huggingface` |
+| 行为 | 代码是否可见 | 证据来源 |
+|------|-------------|---------|
+| `share_token` 生成算法 | ✅ 可见 | [blocks.py#L143](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L143-L143) |
+| `share_token` 传给 frpc 的 `-n` 参数 | ✅ 可见 | [tunneling.py#L128-L129](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L128-L129) |
+| frpc 有"登录"阶段 | ✅ 可推断 | stdout 中检查 `"login to server failed"` [tunneling.py#L190](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L190-L190) |
+| 登录的具体协议和认证方式 | ❌ 不可见 | frpc 内部 Go 代码 |
+| frpc 有"代理建立"阶段 | ✅ 可推断 | stdout 中检查 `"start proxy success"` [tunneling.py#L184](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/tunneling.py#L184-L184) |
+| 代理注册的具体过程 | ❌ 不可见 | frpc 内部 Go 代码 |
+| `-n` 在 FRP 中的语义为 proxy name | ❌ 不可见 | FRP 开源项目约定 |
+| `--uc` 启用自定义子域名 | ❌ 不可见 | FRP 开源项目约定 |
+| `--sd random` 请求随机子域名 | ❌ 不可见 | FRP 开源项目约定 |
+| `--ue` 启用加密 | ❌ 不可见 | FRP 开源项目约定 |
+| 服务端返回地址格式为 `http://...` | ⚠️ 间接推断 | `urlparse`+`urlunparse` 改写逻辑要求此格式 |
+| 子域名由服务端生成 | ⚠️ 间接推断 | Python 代码不生成子域名，只能从 frpc 输出获取 |
+| URL 协议改写逻辑 | ✅ 可见 | [blocks.py#L3129-L3132](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L3129-L3132) |
+| `share_server_protocol` 默认值逻辑 | ✅ 可见 | [blocks.py#L2966-L2968](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/blocks.py#L2966-L2968) |
+| API 服务器返回 host/port/root_ca | ✅ 可见 | [networking.py#L37-L40](file:///d:/fz/0601/solo-dogfeeding/code/244-gradio/gradio/networking.py#L37-L40) |
 
----
-
-## 九、常见问题
-
-**Q: `share_token` 和子域名有什么关系？**
-A: 没有直接关系。`share_token` 是隧道的内部标识，子域名由 FRP 服务端随机生成。
-
-**Q: 为什么不直接让 frpc 返回 `https://` 地址？**
-A: frp 是通用的反向代理工具，不感知上层的 TLS 配置。官方服务器的 TLS 终结在网关层，frp 本身只处理 http 流量。
-
-**Q: 自定义服务器时如何使用 https？**
-A: 需要同时满足两个条件：(1) 自定义服务器配置了 TLS 证书；(2) 在 `launch()` 时显式指定 `share_server_protocol="https"` 和 `share_server_tls_certificate`。
-
-**Q: 为什么需要 `--uc` 和 `--sd random` 两个参数？**
-A: `--uc` 启用子域名功能，`--sd random` 指定子域名的生成策略为随机。两者配合使用实现随机子域名分配。
+图例：✅ 直接可见 | ⚠️ 间接推断（基于代码逻辑的必要前提） | ❌ 完全不可见
