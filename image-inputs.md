@@ -10,17 +10,6 @@
 
 [Image.preprocess()](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/components/image.py#L194-L209) 将所有逻辑委托给 [image_utils.preprocess_image()](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L264-L325)。
 
----
-
-## 一、输入源分类
-
-前端可能传入两种 `ImageData` 结构：
-
-| 输入源 | payload 特征 | 示例场景 |
-|--------|-------------|---------|
-| **base64 data URL** | `payload.url` 以 `data:` 开头 | 前端 canvas 裁剪、webcam 快照、剪贴板粘贴 |
-| **服务端临时文件** | `payload.path` 非空，`payload.url` 不以 `data:` 开头 | 文件上传（已由前端上传到服务端 tmp 目录） |
-
 `ImageData` 数据结构定义在 [data_classes.py#L429-L442](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/data_classes.py#L429-L442)：
 
 ```python
@@ -35,7 +24,7 @@ class ImageData(GradioModel):
 
 ---
 
-## 二、图片归一化（preprocess_image）
+## 一、preprocess_image 完整执行顺序
 
 函数签名：
 
@@ -49,7 +38,18 @@ def preprocess_image(
 ) -> np.ndarray | PIL.Image.Image | str | None
 ```
 
-### 2.1 base64 分支（[image_utils.py#L277-L283](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L277-L283)）
+以下是 **逐行** 的执行分支：
+
+### 1. payload 为 None（[L275-L276](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L275-L276)）
+
+```python
+if payload is None:
+    return payload
+```
+
+- 用户没有上传图片时直接返回 None
+
+### 2. base64 data URL 分支（[L277-L283](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L277-L283)）
 
 ```python
 if payload.url and payload.url.startswith("data:"):
@@ -61,19 +61,41 @@ if payload.url and payload.url.startswith("data:"):
         return decode_base64_to_file(payload.url, cache_dir, format)
 ```
 
-- **pil**：`base64 → bytes → PIL.Image.open()`，并通过 `ImageOps.exif_transpose()` 修正 EXIF 旋转（[L191-L203](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L191-L203)）
-- **numpy**：先解码为 PIL，再 `np.asarray()`（[L206-L208](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L206-L208)）
-- **filepath**：先解码为 PIL，再调用 `save_image()` 保存到缓存目录（[L211-L213](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L211-L213)）
+**触发场景**：前端 canvas 裁剪、webcam 快照、剪贴板粘贴
 
-> ⚠️ base64 分支**不做** `image_mode` 转换，也不做 EXIF 旋转以外的归一化。
+**子分支处理**：
 
-### 2.2 文件路径分支（[image_utils.py#L284-L325](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L284-L325)）
+| type | 处理流程 | EXIF 旋转 | image_mode 转换 | 重编码 |
+|------|---------|-----------|----------------|--------|
+| `pil` | `base64 → bytes → PIL.Image.open()` | ✅ 有（在 `decode_base64_to_image` 内） | ❌ 无 | ❌ 无 |
+| `numpy` | 先解码为 PIL，再 `np.asarray()` | ✅ 有 | ❌ 无 | ❌ 无 |
+| `filepath` | 解码为 PIL → `save_image()` 存缓存 → 返回路径 | ✅ 有 | ❌ 无 | ✅ 有（按 `format` 参数） |
 
-此分支处理已上传到服务端临时目录的文件，流程如下：
+**EXIF 旋转实现**（[L191-L203](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L191-L203)）：
+```python
+def decode_base64_to_image(encoding):
+    img = PIL.Image.open(BytesIO(base64.b64decode(...)))
+    if hasattr(ImageOps, "exif_transpose"):
+        img = ImageOps.exif_transpose(img)
+    return img
+```
 
-#### Step 1：解析原始文件名与格式后缀
+⚠️ **注意**：base64 分支 **不做** `image_mode` 转换。如果 `image_mode="RGB"` 而 base64 图片是 RGBA，返回的仍然是 RGBA。
+
+### 3. 路径缺失检查（[L284-L285](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L284-L285)）
 
 ```python
+if payload.path is None:
+    raise ValueError("Image path is None.")
+```
+
+- 如果 payload 既不是 base64 data URL，也没有 `path`，抛出 **`ValueError`**
+- 这是一个内部异常，不会显示给最终用户
+
+### 4. 解析文件名与格式后缀（[L286-L295](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L286-L295)）
+
+```python
+file_path = Path(payload.path)
 if payload.orig_name:
     p = Path(payload.orig_name)
     name = p.stem
@@ -89,7 +111,7 @@ else:
 - `jpg` 统一归一化为 `jpeg`
 - 无 `orig_name` 时默认后缀为 `webp`
 
-#### Step 2：SVG 特殊处理
+### 5. SVG 特殊处理（[L297-L300](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L297-L300)）
 
 ```python
 if suffix.lower() == "svg":
@@ -98,44 +120,70 @@ if suffix.lower() == "svg":
     raise Error("SVG files are not supported as input images for this app.")
 ```
 
-- SVG 仅在 `type="filepath"` 时直接返回路径
-- 其他 type 抛出 `Error`
+| 条件 | 行为 |
+|------|------|
+| `suffix == "svg"` 且 `type == "filepath"` | 直接返回原文件路径 |
+| `suffix == "svg"` 且 `type != "filepath"` | 抛出 **`gr.Error`** —— 这是用户可见的模态框错误 |
 
-#### Step 3：用 PIL 打开并 EXIF 旋转
+⚠️ **注意**：这里抛出的是 `gradio.exceptions.Error`（[exceptions.py#L69](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/exceptions.py#L69)），不是普通的 `ValueError`。`gr.Error` 会在前端显示为红色模态框。
+
+### 6. 用 PIL 打开文件（[L302](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L302)）
 
 ```python
 im = PIL.Image.open(file_path)
-...
-exif = im.getexif()
-if exif.get(274, 1) != 1 and hasattr(ImageOps, "exif_transpose"):
-    im = ImageOps.exif_transpose(im)
 ```
 
-- EXIF tag 274 即 Orientation，值为 1 表示方向正确
-- 方向不正确时用 `exif_transpose` 自动旋转
-
-#### Step 4：image_mode 转换
-
-```python
-if suffix.lower() != "gif" and im is not None:
-    if image_mode is not None:
-        im = im.convert(image_mode)
-```
-
-- **GIF 跳过**：动图不转换模式，保留原始帧结构
-- **image_mode=None 时不转换**：保留原始色彩模式（如 PNG 的 RGBA）
-- **image_mode="RGB"（默认）**：将 RGBA/L/P 等全部转为 RGB
-
-#### Step 5：快速路径 — filepath + 无需转换
+### 7. 快速路径 —— 直接返回原路径（[L303-L304](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L303-L304)）
 
 ```python
 if type == "filepath" and (image_mode in [None, im.mode]):
     return str(file_path)
 ```
 
-- 如果用户要求 `filepath` 且图片本身已处于目标模式，直接返回原路径，避免不必要的重编码
+**触发条件**：
+- `type == "filepath"`
+- `image_mode` 为 `None`，或 `image_mode` 与图片实际 mode 相同
 
-#### Step 6：format_image 统一输出
+**⚠️ 关键行为**：
+- ✅ **直接返回原文件路径**，不做任何处理
+- ❌ **跳过 EXIF 旋转**（如果图片有 EXIF 旋转信息，用户拿到的是方向不正确的原图）
+- ❌ **跳过 image_mode 转换**
+- ❌ **跳过重编码**
+
+**设计权衡**：这是为了避免不必要的文件 I/O 和重编码，但代价是可能返回方向不正确的图片。例如用户上传一张手机拍摄的竖版照片（EXIF 标记为旋转 90°），当 `type="filepath"` 且 `image_mode="RGB"`（默认值，而 JPEG 本身就是 RGB）时，会触发快速路径，用户函数拿到的文件方向是错误的。
+
+### 8. EXIF 旋转（[L306-L312](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L306-L312)）
+
+```python
+exif = im.getexif()
+if exif.get(274, 1) != 1 and hasattr(ImageOps, "exif_transpose"):
+    try:
+        im = ImageOps.exif_transpose(im)
+    except Exception:
+        warnings.warn(f"Failed to transpose image {file_path} based on EXIF data.")
+```
+
+- EXIF tag 274 = Orientation，值为 1 表示方向正确
+- 方向不正确时用 `ImageOps.exif_transpose` 自动旋转
+- 旋转失败仅发出 `warnings.warn`，不中断流程
+
+### 9. image_mode 转换（[L313-L317](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L313-L317)）
+
+```python
+if suffix.lower() != "gif" and im is not None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if image_mode is not None:
+            im = im.convert(image_mode)
+```
+
+| 条件 | 行为 |
+|------|------|
+| `suffix == "gif"` | **跳过**转换，保留原始帧结构和模式 |
+| `image_mode is None` | **跳过**转换，保留原始模式（如 PNG 的 RGBA） |
+| `image_mode` 非 None 且非 GIF | 转换为目标模式（默认 `"RGB"`，会将 RGBA/L/P 等转为 RGB） |
+
+### 10. format_image 统一输出（[L319-L325](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L319-L325)）
 
 ```python
 return format_image(im, type=type, cache_dir=cache_dir, name=name, format=suffix)
@@ -151,9 +199,22 @@ return format_image(im, type=type, cache_dir=cache_dir, name=name, format=suffix
 
 ---
 
+## 二、异常处理汇总
+
+| 异常场景 | 异常类型 | 抛出位置 | 用户可见 |
+|---------|---------|---------|---------|
+| `payload.path is None`（非 base64 分支） | `ValueError("Image path is None.")` | L285 | ❌ 内部错误 |
+| SVG 输入且 `type != "filepath"` | `gr.Error("SVG files are not supported...")` | L300 | ✅ 模态框 |
+| base64 EXIF 旋转失败 | `print()`（不是 warn） | L198-201 | ❌ 仅日志 |
+| 文件路径 EXIF 旋转失败 | `warnings.warn()` | L312 | ❌ 仅日志 |
+| `format_image` 未知 type | `ValueError` | L77 | ❌ 内部错误 |
+| `open_image` 未知类型 | `ValueError` | L41 | ❌ 内部错误 |
+
+---
+
 ## 三、文件保存逻辑
 
-### 3.1 save_image（[image_utils.py#L84-L110](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L84-L110)）
+### 3.1 save_image（[L84-L110](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L84-L110)）
 
 ```python
 def save_image(y, cache_dir, format="webp"):
@@ -187,17 +248,7 @@ def save_pil_to_cache(img, cache_dir, name="image", format="webp"):
 - **内容寻址**：用 `SHA-256(bytes + hash_seed)` 生成目录名，相同内容 → 相同路径 → 天然去重
 - **格式处理**：GIF 保留所有帧（`save_all=True`），PNG 保留元数据，其他格式保留 EXIF
 
-### 3.3 save_img_array_to_cache（[processing_utils.py#L174-L179](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/processing_utils.py#L174-L179)）
-
-```python
-def save_img_array_to_cache(arr, cache_dir, format="webp"):
-    pil_image = Image.fromarray(_convert(arr, np.uint8, force_copy=False))
-    return save_pil_to_cache(pil_image, cache_dir, format=format)
-```
-
-- 先将数组转换为 `uint8`（防溢出），再转 PIL，最后复用 `save_pil_to_cache`
-
-### 3.4 format_image 中的保存回退
+### 3.3 保存回退机制（format_image 中）
 
 ```python
 elif type == "filepath":
@@ -212,53 +263,64 @@ elif type == "filepath":
 
 ---
 
-## 四、返回格式逻辑
-
-### 4.1 preprocess 返回类型
-
-| Image.type | 返回类型 | 说明 |
-|------------|---------|------|
-| `"numpy"` | `np.ndarray` 或 `None` | shape=(H,W,3)，uint8，值域 [0,255] |
-| `"pil"` | `PIL.Image.Image` 或 `None` | 已转换为目标 image_mode |
-| `"filepath"` | `str` 或 `None` | 缓存文件绝对路径 |
-
-### 4.2 postprocess 返回类型
-
-[postprocess_image()](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L328-L359) 将用户函数返回的图片转为 `ImageData`：
+## 四、完整流程图
 
 ```
-用户返回值 → save_image() → 缓存文件路径 → ImageData(path=..., orig_name=...)
+preprocess_image(payload, ...)
+    │
+    ├─ payload is None → return None
+    │
+    ├─ payload.url starts with "data:" (base64 分支)
+    │    ├─ type=pil   → decode_base64_to_image()          → PIL.Image
+    │    │                  └─ 有 EXIF 旋转，无 mode 转换
+    │    ├─ type=numpy → decode_base64_to_image_array()    → np.ndarray
+    │    │                  └─ 有 EXIF 旋转，无 mode 转换
+    │    └─ type=filepath → decode_base64_to_file()         → 保存为缓存文件 → str
+    │                       └─ 有 EXIF 旋转，无 mode 转换，有重编码
+    │
+    ├─ payload.path is None → raise ValueError("Image path is None.")
+    │
+    ├─ 解析 orig_name → name, suffix
+    │
+    ├─ suffix == "svg"
+    │    ├─ type == "filepath" → return str(file_path)
+    │    └─ 否则 → raise gr.Error("SVG files are not supported...")
+    │
+    ├─ im = PIL.Image.open(file_path)
+    │
+    ├─ type == "filepath" AND (image_mode is None OR image_mode == im.mode)
+    │    └─ 【快速路径】return str(file_path)
+    │       └─ ⚠️ 跳过 EXIF 旋转，跳过 mode 转换，跳过重编码
+    │
+    ├─ EXIF 旋转 (exif tag 274 != 1)
+    │
+    ├─ suffix != "gif" AND image_mode is not None
+    │    └─ im = im.convert(image_mode)
+    │
+    └─ format_image(im, type, ...)
+         ├─ type=pil   → PIL.Image
+         ├─ type=numpy → np.array(im) → np.ndarray
+         └─ type=filepath → save_pil_to_cache() → str（优先 suffix，失败回退 png）
 ```
-
-特殊情况：
-- **SVG 文件**：不保存，直接内联为 `data:image/svg+xml,...` URL
-- **水印**：在保存前调用 `add_watermark()` 叠加水印
-
-### 4.3 Streaming 模式
-
-当 `streaming=True` 时，输出使用 `Base64ImageData`（仅含 `url` 字段），前端直接渲染 base64 图片。
 
 ---
 
-## 五、完整流程图
+## 五、关键设计问题与权衡
 
-```
-前端输入
-  ├─ base64 data URL (canvas/webcam/clipboard)
-  │    ├─ type=pil   → decode_base64_to_image()          → PIL.Image
-  │    ├─ type=numpy → decode_base64_to_image_array()    → np.ndarray
-  │    └─ type=filepath → decode_base64_to_file()         → 保存为缓存文件 → str
-  │
-  └─ 服务端临时文件 (文件上传)
-       ├─ SVG + type=filepath → 直接返回路径
-       ├─ SVG + 其他 type     → 抛出 Error
-       ├─ type=filepath + mode匹配 → 直接返回原路径（快速路径）
-       └─ 通用路径:
-            PIL.Image.open()
-            → EXIF 旋转
-            → image_mode 转换 (非GIF且mode非None)
-            → format_image():
-                ├─ type=pil   → PIL.Image
-                ├─ type=numpy → np.array(im)
-                └─ type=filepath → save_pil_to_cache() → str
-```
+### 问题 1：快速路径跳过 EXIF 旋转
+
+当 `type="filepath"` 且 `image_mode` 与图片 mode 匹配时，**快速路径直接返回原文件，不做 EXIF 旋转**。这意味着：
+- 用户上传的手机照片（通常带 EXIF 旋转标记）方向可能不正确
+- 这是性能（避免重编码）与正确性的权衡
+
+### 问题 2：base64 分支与文件路径分支的归一化不一致
+
+| 处理 | base64 分支 | 文件路径分支（非快速路径） |
+|------|------------|------------------------|
+| EXIF 旋转 | ✅ 有 | ✅ 有 |
+| image_mode 转换 | ❌ 无 | ✅ 有（非 GIF 且 mode 非 None） |
+| GIF 特殊处理 | ❌ 无 | ✅ 跳过 mode 转换 |
+
+### 问题 3：SVG 仅支持 filepath 模式
+
+SVG 是矢量图，无法转为 numpy 数组或 PIL Image，因此仅在 `type="filepath"` 时允许输入。
