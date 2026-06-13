@@ -695,13 +695,20 @@ while True:
 | **asyncio Task** | `_cancel_asyncio_tasks()` 批量取消所有后台任务 |
 
 #### 实际效果
-- SSE 流会不断循环，每次都注入 `UnexpectedErrorMessage` 发给客户端
-- 客户端收到 `unexpected_error` 消息后，由前端逻辑自行处理关闭（`handle_message()` → `fire_event(stage="error")` → `close()`）
-- 服务端最终会因为外层连接断开或进程退出而终止
+
+- **服务端侧**：SSE 流会不断循环（每次等 10s 超时 → 注入 `UnexpectedErrorMessage` → yield），直到连接被底层 TCP 断开或进程退出
+- **客户端侧**，分两层：
+  - **事件层（每个事件）**：`handle_message()` → `fire_event(stage="error")` → `delete event_callbacks[event_id]` → `delete pending_diff_streams[event_id]` → `close()`（iterator 标记 `done=true`，所有 `await next()` 立即返回结束）
+  - **连接层（全局 SSE）**：**不会**调用 `close_stream()` → `stream_status.open` 仍为 `true` → SSE 连接**保持打开**，物理连接是否最终断开取决于服务端进程状态
+
+> **精确区分（与第 11 节一致）**：
+> - `close()` 是 **iterator 级别**的结束（把 `for-await-of` 循环终止）
+> - `close_stream()` 才是 **SSE 连接级别**的关闭（`stream_status.open = false` + `abort_controller.abort()`）
+> - `unexpected_error` 只触发前者，不触发后者
 
 ---
 
-### 7.4 三条路径状态对比总表
+### 7.4 三条路径状态对比总表（与第 10 节边界场景速查表保持一致）
 
 | 状态结构 | /cancel 路径 | SSE 断开路径 | 服务端停止路径 |
 |---------|-------------|-------------|---------------|
@@ -711,7 +718,8 @@ while True:
 | **pending_messages_per_session** | 注入 `ProcessCompletedMessage` | **完全不碰** | 注入 `UnexpectedErrorMessage` |
 | **event.alive** | 不修改（cancel_tasks 触发 CancelledError） | 正在执行的标记为 False | 不修改 |
 | **asyncio Task** | `cancel_tasks()` 精准取消（按 task name） | 不取消（自然完成） | `_cancel_asyncio_tasks()` 批量取消所有 |
-| **SSE 关闭方式** | `CloseStreamMessage`（当 pending 变空时） | 直接 `return`（无 CloseStreamMessage） | 注入 `UnexpectedErrorMessage`（关闭条件永不触发，前端自行关闭） |
+| **服务端是否发 CloseStreamMessage** | ✅ 是（若 pending 变空） | ❌ 否（直接 return） | ❌ 否（server_stopped 条件永不触发） |
+| **前端 SSE 连接状态** | ✅ 关闭（收到 CloseStreamMessage） | ✅ 物理连接已断 | ❌ 保持打开（仅 iterator 结束） |
 | **关闭条件触发** | `process_completed + pending == 0` | 不触发（直接 return） | `server_stopped` 条件永不触发 |
 | **消息队列是否残留** | 无（优雅关闭） | 有（僵尸 AsyncQueue） | 有（不断注入错误消息） |
 | **pending_event_ids_session 是否残留** | 无（清空后 pop） | 有（执行中的 event_id 残留） | 有（全部残留） |
@@ -849,11 +857,19 @@ sse_stream() 收到 ProcessCompletedMessage(event_id=xxx):
 
 所以**实际生效的关闭条件只有一个**：当且仅当收到 `ProcessCompletedMessage` 且 `pending_event_ids_session[session_hash]` 变为空集时，才发送 `CloseStreamMessage` 关闭 SSE。
 
-**关闭触发时机**：
-- 正常完成：process_events 发送 ProcessCompletedMessage → SSE 消费 → 移除 event_id → 集合变空 → CloseStreamMessage
-- 主动取消：/cancel 注入 ProcessCompletedMessage → SSE 消费 → 移除 event_id → 集合变空 → CloseStreamMessage
-- 连接断开：不触发 CloseStreamMessage，直接 return
-- 服务端停止：不触发 CloseStreamMessage，前端收到 unexpected_error 自行关闭
+**关闭触发时机（严格分两层，与第 7 节和第 11 节一致）**：
+
+**服务端侧（是否主动发送 CloseStreamMessage）**：
+- 正常完成：process_events 发送 ProcessCompletedMessage → SSE 消费 → 移除 event_id → 集合变空 → **发送** CloseStreamMessage
+- 主动取消：/cancel 注入 ProcessCompletedMessage → SSE 消费 → 移除 event_id → 集合变空 → **发送** CloseStreamMessage
+- 连接断开（is_disconnected）：不发送 CloseStreamMessage，**直接 return**
+- 服务端停止：不发送 CloseStreamMessage，**持续发送 UnexpectedErrorMessage**
+
+**客户端侧（SSE 连接状态）**：
+- 收到 CloseStreamMessage → 调用 `close_stream()` → `stream_status.open = false` → 连接**关闭**
+- 连接断开（is_disconnected）→ 服务端直接 return → 物理连接**已断**
+- 收到 unexpected_error → **不会**调用 `close_stream()` → `stream_status.open` 仍为 true → 连接**保持**（仅 iterator 结束）
+- broken_connection（SSE onerror）→ 物理连接**已断**，但 `stream_status.open` 仍为 true（状态不一致）
 
 前端收到 `close_stream` 后：
 ```typescript
@@ -967,7 +983,9 @@ function close(): void {
 
 close() 后，`done=true` 使后续的 `next()` 调用直接返回 `{done: true}`，所有 for-await-of 循环正常终止。
 
-### 9.6 完整收尾状态变迁图
+### 9.6 完整收尾状态变迁图（正常完成路径，与 unexpected_error 路径不同）
+
+> **与第 11 节区分**：本图描述的是收到 `ProcessCompletedMessage` 后的正常收尾流程，会发送 `CloseStreamMessage` 并关闭 SSE 连接。`unexpected_error` 路径不会走这个流程。
 
 ```
 事件执行完毕 (成功/失败/取消)
@@ -1010,25 +1028,29 @@ sse_stream() 取出消息
 
 ---
 
-## 10. 边界场景速查表
+## 10. 边界场景速查表（与第 7.4 节三条路径对比表保持一致）
 
-| 场景 | 触发路径 | pending_event_ids_session | pending_messages_per_session | SSE 关闭方式 | 消息回传 |
-|------|---------|--------------------------|-----------------------------|-------------|---------|
-| 用户点击取消 | POST /cancel | **SSE 消费时才 remove** | 注入 ProcessCompletedMessage(success=True) | CloseStreamMessage（集合变空时） | 伪造的 success=True 完成消息 |
-| 关闭浏览器标签 | SSE is_disconnected | 仅移除等待中的，**执行中的保留** | **完全不碰**（僵尸队列） | 直接 return（无 CloseStreamMessage） | 无（连接已断） |
-| 用户函数 raise | process_events except | SSE 消费 ProcessCompletedMessage 时 remove | 注入 ProcessCompletedMessage(success=False) | CloseStreamMessage（若集合变空） | error 内容（受 show_error 控制） |
-| 生成式函数迭代异常 | while 循环内 except | SSE 消费时 remove | 注入 ProcessCompletedMessage(success=False) | CloseStreamMessage（若集合变空） | 使用 old_err 兜底 |
-| 服务端停止 | Queue.stopped | **不修改（全部保留）** | 不断注入 UnexpectedErrorMessage | 不触发（前端自行关闭） | "Server stopped unexpectedly." |
-| SSE 连接异常 | except BaseException | CancelledError 触发 clean_events | 非 CancelledError 保留，CancelledError 直接 del | 异常 return | UnexpectedErrorMessage(str(e)) |
-| SSE CancelledError | except CancelledError | clean_events 移除 | **直接 del** 整个 AsyncQueue | 异常 return + re-raise | UnexpectedErrorMessage 后 re-raise |
-| Session 不存在 | HTTPException(404) | 无（本就无状态） | 无 | 异常 return | UnexpectedErrorMessage(session_not_found=True) |
-| 前端 SSE 断连 | stream.onerror | 不修改（服务端不知情） | 不修改（服务端不知情） | 前端 close_stream() | 前端构造 broken_connection，广播给所有 callbacks |
-| 队列满 | push() 返回 queue_full | 不入队，不修改 | 不入队，不修改 | 无（不入队） | HTTP 503 + 前端 fire_error |
-| 验证失败 | push() 返回 validator_error | 不入队，不修改 | 不入队，不修改 | 无（不入队） | HTTP 422 + 前端 fire_error |
+> **关键区分**：所有场景统一按"服务端是否发 CloseStreamMessage"和"前端 SSE 连接状态"两列来描述，避免混淆。
+
+| 场景 | 触发路径 | pending_event_ids_session | pending_messages_per_session | 服务端是否发 CloseStreamMessage | 前端 SSE 连接状态 | 消息回传 |
+|------|---------|--------------------------|-----------------------------|-------------------------------|------------------|---------|
+| 用户点击取消 | POST /cancel | **SSE 消费时才 remove** | 注入 ProcessCompletedMessage(success=True) | ✅ 是（若集合变空） | ✅ 关闭（收到 CloseStreamMessage） | 伪造的 success=True 完成消息 |
+| 关闭浏览器标签 | SSE is_disconnected | 仅移除等待中的，**执行中的保留** | **完全不碰**（僵尸队列） | ❌ 否（直接 return） | ✅ 物理连接已断 | 无（连接已断） |
+| 用户函数 raise | process_events except | SSE 消费 ProcessCompletedMessage 时 remove | 注入 ProcessCompletedMessage(success=False) | ✅ 是（若集合变空） | ✅ 关闭（若最后一个事件） | error 内容（受 show_error 控制） |
+| 生成式函数迭代异常 | while 循环内 except | SSE 消费时 remove | 注入 ProcessCompletedMessage(success=False) | ✅ 是（若集合变空） | ✅ 关闭（若最后一个事件） | 使用 old_err 兜底 |
+| 服务端停止 | Queue.stopped | **不修改（全部保留）** | 不断注入 UnexpectedErrorMessage | ❌ 否（server_stopped 条件永不触发） | ❌ 保持打开（仅 iterator 结束） | "Server stopped unexpectedly." |
+| SSE 连接异常 | except BaseException | CancelledError 触发 clean_events | 非 CancelledError 保留，CancelledError 直接 del | ❌ 否（异常 return） | ✅ 异常退出（连接已断开） | UnexpectedErrorMessage(str(e)) |
+| SSE CancelledError | except CancelledError | clean_events 移除 | **直接 del** 整个 AsyncQueue | ❌ 否（异常 return + re-raise） | ✅ 异常退出（连接已断开） | UnexpectedErrorMessage 后 re-raise |
+| Session 不存在 | HTTPException(404) | 无（本就无状态） | 无 | ❌ 否（异常 return） | ✅ 异常退出（连接已断开） | UnexpectedErrorMessage(session_not_found=True) |
+| 前端 SSE 断连 | stream.onerror | 不修改（服务端不知情） | 不修改（服务端不知情） | 不涉及（前端侧） | ✅ 物理已断，stream_status.open 仍 true | 前端构造 broken_connection，广播给所有 callbacks |
+| 队列满 | push() 返回 queue_full | 不入队，不修改 | 不入队，不修改 | 不涉及（不入队） | 不涉及 | HTTP 503 + 前端 fire_error |
+| 验证失败 | push() 返回 validator_error | 不入队，不修改 | 不入队，不修改 | 不涉及（不入队） | 不涉及 | HTTP 422 + 前端 fire_error |
 
 ---
 
 ## 11. 前端 unexpected_error 收尾的精确状态变化
+
+> **与前文保持一致的核心结论**：本节是第 7.3 节（服务端停止路径）和第 10 节（边界场景速查表）中"前端 SSE 连接状态 = ❌ 保持打开"的精确展开。`unexpected_error` 触发的是**事件层**的清理，不是**连接层**的关闭。
 
 `unexpected_error` 是**框架层**错误，不是单个事件的业务错误。它的消息结构特殊（无 event_id），导致分发和清理逻辑也与普通错误不同。
 
