@@ -10,6 +10,9 @@
 - [三、前端集成与加载](#三前端集成与加载)
 - [四、后端路由与静态文件服务](#四后端路由与静态文件服务)
 - [五、开发模式](#五开发模式)
+- [六、回退逻辑详解](#六回退逻辑详解)
+- [七、组件未渲染原因分析](#七组件未渲染原因分析)
+- [八、浏览器与服务端集成路径差异](#八浏览器与服务端集成路径差异)
 
 ---
 
@@ -461,6 +464,436 @@ FRONTEND_DIR = "../../frontend/"                # 前端源码目录
 
 ---
 
+## 六、回退逻辑详解
+
+Gradio 中的回退（Fallback）机制分为两类：**组件加载失败时的 fallback 组件** 和 **作为空白模板的 Fallback 组件**。两者同名但用途不同。
+
+### 6.1 Fallback 组件本身
+
+Fallback 是 Gradio 内置的一个特殊组件，用于：
+1. 作为自定义组件的**空白模板**（创建组件时默认基于 Fallback）
+2. 作为**组件加载失败时的降级显示**（仅 example 变体）
+
+**Python 端实现**：[fallback.py](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/gradio/components/fallback.py)
+
+```python
+class Fallback(Component):
+    EVENTS = [Events.change]
+
+    def preprocess(self, payload):
+        return payload
+
+    def postprocess(self, value):
+        return value
+
+    def example_payload(self):
+        return {"foo": "bar"}
+
+    def example_value(self):
+        return {"foo": "bar"}
+
+    def api_info(self):
+        return {"type": {}, "description": "any valid json"}
+```
+
+**前端 Svelte 实现**：[Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/fallback/Index.svelte)
+
+```svelte
+<Block visible={gradio.shared.visible} ...>
+    {#if gradio.shared.loading_status}
+        <StatusTracker ... />
+    {/if}
+    <!-- 使用 JsonView 以 JSON 形式展示原始 value -->
+    <JsonView json={gradio.props.value} />
+</Block>
+```
+
+Fallback 组件的核心特点：
+- 对数据不做任何转换，`preprocess`/`postprocess` 直接透传
+- 前端使用 `JsonView` 以 JSON 格式渲染任意数据
+- 支持 `change` 事件和加载状态显示
+
+### 6.2 组件加载失败时的回退逻辑
+
+核心回退代码位于 [component_loader.js](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/component_loader.js) 中。
+
+#### 6.2.1 Example 变体回退
+
+当**示例组件**（example variant）加载失败时，自动回退到 `@gradio/fallback/example`：
+
+```javascript
+// component_loader.js 第 55-63 行
+export async function load_component(id, variant, api_url) {
+    // ... 尝试各种加载方式 ...
+    // 最终兜底：只有 example 变体支持 fallback
+    if (variant === "example") {
+        request_map[`${_id}-${variant}`] = import("@gradio/fallback/example");
+        return [request_map[`${_id}-${variant}`], Promise.resolve(false)];
+    }
+    throw new Error(`Could not load component ${id} variant ${variant}`);
+}
+```
+
+**注意**：主组件（`variant === "component"`）加载失败时**不会**使用 fallback，而是直接抛出错误。这意味着：
+- `gr.Examples` 中展示的示例组件加载失败 → 使用 JSON 形式兜底显示
+- 用户界面中的实际组件加载失败 → 页面报错，组件不可用
+
+#### 6.2.2 SSR 模式下的强制回退
+
+在**服务端渲染（SSR）**环境中，自定义组件会被强制回退：
+
+```javascript
+// component_loader.js 第 89-98 行
+function get_component_type(_id, variant, api_url) {
+    const environment = is_browser ? "client" : "server";
+
+    if (environment === "server") {
+        // Fall back to @gradio/fallback during SSR; the real component
+        // will be loaded client-side.
+        return [import("@gradio/fallback"), Promise.resolve(false)];
+    }
+    // ... 浏览器环境正常加载 ...
+}
+```
+
+SSR 回退策略的设计意图：
+1. **避免 Node.js 环境问题**：自定义组件的 JS 可能依赖浏览器 API，在 Node SSR 环境中无法运行
+2. **两阶段渲染**：SSR 阶段先渲染 Fallback（JSON 占位），客户端水化（hydration）阶段再加载真实组件
+3. **自定义组件 SSR 尚未支持**：路由代码中有注释 `// Uncomment when we support custom component SSR`，表明未来可能支持
+
+### 6.3 回退触发场景总结
+
+| 场景 | 回退组件 | 是否用户可见 | 说明 |
+|------|---------|------------|------|
+| `gradio cc create` 空白模板 | `gradio.components.Fallback` | 否 | 创建时基于其复制代码 |
+| Example 组件加载失败 | `@gradio/fallback/example` | 是 | 示例区以 JSON 显示 |
+| SSR 服务端渲染 | `@gradio/fallback` | 短暂可见 | 客户端水化后替换为真实组件 |
+| 主组件加载失败 | 无回退 | 是（报错） | 直接抛出错误 |
+
+---
+
+## 七、组件未渲染原因分析
+
+组件在界面上"看不见"可能由多个层面的原因造成，从 Python 后端到前端 Svelte，按层级梳理如下：
+
+### 7.1 后端层面：`render=False`
+
+**触发位置**：[blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/gradio/blocks.py#L165-L166)
+
+```python
+# Block.__init__ 第 165-166 行
+if render:
+    self.render()
+```
+
+当 `render=False` 时：
+- 组件的 `render()` 方法不会被调用
+- `self.is_rendered` 保持为 `False`
+- 组件不会被添加到当前 `Blocks` 的 `blocks` 字典中
+- 前端完全**不会收到**该组件的配置
+
+**组件加入布局的关键代码**：[render()](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/gradio/blocks.py#L197-L222)
+
+```python
+def render(self):
+    root_context = get_blocks_context()
+    render_context = get_render_context()
+    self.rendered_in = LocalContext.renderable.get(None)
+    # ...
+    if render_context is not None:
+        render_context.add(self)       # 加入父容器的 children
+        self.parent = render_context
+    if root_context is not None:
+        root_context.blocks[self._id] = self  # 注册到 Blocks 全局
+        self.is_rendered = True
+    return self
+```
+
+`render=False` 的典型用途：
+- 在 `gr.render()` 装饰器中动态创建组件
+- 组件仅作为数据载体，不需要显示（如 `gr.State`）
+- 稍后通过代码手动调用 `.render()` 加入布局
+
+### 7.2 配置层面：`get_config()` 过滤
+
+在 [get_config()](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/gradio/blocks.py#L309) 方法中，`render` 参数会被主动排除：
+
+```python
+config.pop("render", None)
+```
+
+这意味着前端**永远不会收到** `render` 字段，可见性完全由 `visible` 控制。
+
+### 7.3 前端全局层面：MountComponents 渲染条件
+
+**关键入口**：[MountComponents.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/MountComponents.svelte#L9-L30)
+
+```svelte
+{#if node && component}
+    {#if node.props.shared_props.visible && !node.runtime}
+        <!-- 内置组件：直接使用 svelte:component -->
+        <svelte:component this={component.default} ... />
+    {:else if node.props.shared_props.visible && node.runtime}
+        <!-- 自定义组件：使用 MountCustomComponent 挂载 -->
+        <MountCustomComponent {...rest} {node}>...</MountCustomComponent>
+    {/if}
+{/if}
+```
+
+**两层渲染条件**：
+1. **外层**：`node && component` —— 组件对象存在且 JS 模块已成功加载
+2. **内层**：`node.props.shared_props.visible` —— 只有 visible 为 truthy 才渲染
+
+这里隐含的未渲染原因：
+- **组件加载中**：`component` 是 Promise，尚未 resolve → 外层 `{#if}` 不满足 → 空白
+- **组件加载失败**：`component` 为 `null`/undefined → 外层 `{#if}` 不满足 → 空白
+- **visible 为 falsy** → 内层 `{#if}` 不满足 → 不进入挂载分支
+
+### 7.4 组件个体层面：`visible` 的三种取值
+
+`visible` 属性有三种取值，行为在 [Block.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/atoms/src/Block.svelte#L91-L98) 中统一处理：
+
+```svelte
+{#if visible === true || visible === "hidden"}
+    <svelte:element ...
+        class:hidden={visible === "hidden"}
+        ...
+    >
+```
+
+| visible 值 | 是否在 DOM 中 | 视觉可见性 | 说明 |
+|-----------|-------------|----------|------|
+| `true` | ✅ 是 | ✅ 可见 | 正常渲染 |
+| `"hidden"` | ✅ 是 | ❌ 不可见 | DOM 存在，添加 `class:hidden`（`display: none`） |
+| `false` | ❌ 否 | ❌ 不可见 | 整个组件从 DOM 中移除 |
+
+**设计意图区别**：
+- `visible=false`：完全卸载组件，释放资源（如视频播放器、WebSocket 连接）
+- `visible="hidden"`：仅视觉隐藏，保留 DOM 状态和事件监听（如 Tab 切换、暂存表单输入）
+
+### 7.5 各组件实现的不一致问题
+
+由于历史原因，不同组件对 `visible` 的处理存在差异，这是排查"不显示"问题时容易忽略的点：
+
+| 处理方式 | 组件示例 | `visible=false` 行为 | `visible="hidden"` 行为 |
+|---------|---------|--------------------|----------------------|
+| **标准 Block.svelte** | Textbox, Image, Slider 等大多数 | 不在 DOM | CSS 隐藏 |
+| **{#if gradio.shared.visible}** | [Sidebar](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/sidebar/Index.svelte#L18) | 不在 DOM | **仍在 DOM 且可见**（字符串 `"hidden"` 是 truthy） |
+| **class:hide={!visible}** | [Row](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/row/Index.svelte#L50) | CSS 隐藏（`!false = true`） | **仍可见**（`!"hidden" = false`） |
+| **Tab 逻辑** | [TabItem](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/tabitem/shared/TabItem.svelte#L53) | `display:none` | **仍显示**（只检查 `!== false`） |
+
+**典型陷阱**：使用 `visible="hidden"` 在 Row、Sidebar、TabItem 上**不会生效**，因为它们的实现不支持这种模式。
+
+### 7.6 动态渲染层面：`rendered_in` 匹配
+
+在 [_init.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/_init.ts#L291-L315) 中，动态渲染（`gr.render()` 装饰器）有一段清理逻辑：
+
+```javascript
+Object.entries(instance_map).forEach(([id, component]) => {
+    let _id = Number(id);
+    if (component.rendered_in === render_id) {
+        let replacement_component = replacement_components.find(
+            (c) => c.key === component.key
+        );
+        if (component.key != null && replacement_component !== undefined) {
+            // 有 key → 更新 props
+        } else {
+            // 无 key 或找不到匹配 → 从 instance_map 中删除
+            if (instance_map) delete instance_map[_id];
+            if (_component_map.has(_id)) {
+                _component_map.delete(_id);
+            }
+        }
+    }
+});
+```
+
+动态渲染导致组件消失的常见原因：
+1. **未设置 `key`**：每次 render 重新创建时，旧组件会被直接删除
+2. **`key` 不匹配**：前后两次 render 的 key 对不上，旧组件被删除
+3. **`rendered_in` 对不上**：新渲染的 render_id 与旧组件不匹配
+
+### 7.7 组件未渲染排查清单
+
+按优先级顺序排查：
+
+| 层级 | 排查项 | 验证方法 |
+|------|-------|---------|
+| Python | `render=False` 未手动调用 `.render()` | 检查 `comp.is_rendered` 属性 |
+| Python | 组件在 Blocks 上下文外创建 | 检查是否在 `with gr.Blocks():` 内 |
+| 配置 | `visible=False` | 浏览器 F12 搜索组件 ID，看是否在 DOM |
+| 配置 | `visible="hidden"` + 不支持该模式的组件 | 查看组件源码对 visible 的处理 |
+| 前端 | 组件 JS 加载失败 | 浏览器 Console 看 404/import 错误 |
+| 前端 | 动态渲染 key 不匹配 | 检查 render 装饰器设置的 key 参数 |
+| SSR | 服务端回退到 Fallback | 检查 SSR 模式，查看 hydration 后是否正常 |
+
+---
+
+## 八、浏览器与服务端集成路径差异
+
+Gradio 在浏览器和服务端（SSR/Node.js 环境）对自定义组件的处理存在显著差异，核心原因是：**Node.js 环境缺少浏览器 DOM API，且自定义组件可能依赖浏览器特性**。
+
+### 8.1 组件加载路径：environment 参数
+
+路由定义中的 `environment` 参数是区分两者的关键：
+
+```python
+# routes.py 第 984 行
+environment: Literal["client", "server"],
+```
+
+#### 8.1.1 浏览器环境（environment="client"）
+
+[component_loader.js](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/component_loader.js#L92) 通过 `is_browser` 判断：
+
+```javascript
+const environment = is_browser ? "client" : "server";
+```
+
+浏览器环境的完整加载路径：
+1. `load_component()` → `get_component_type()`
+2. 检查 `window.__GRADIO__CC__`（开发模式自定义组件）
+3. 检查内置 `component_map`
+4. **动态 HTTP 加载**：向 `/custom_component/{id}/client/{variant}/index.js` 发起请求
+5. `import()` 动态加载 ES Module
+6. 返回 `[component_promise, runtime_promise]`
+
+#### 8.1.2 服务端环境（environment="server"）
+
+SSR 模式下走完全不同的路径：
+
+```javascript
+// component_loader.js 第 94-98 行
+if (environment === "server") {
+    // Fall back to @gradio/fallback during SSR;
+    // the real component will be loaded client-side.
+    return [import("@gradio/fallback"), Promise.resolve(false)];
+}
+```
+
+关键点：
+- **不发起任何 HTTP 请求**，直接返回 `@gradio/fallback`
+- `runtime` 返回 `false`（表示不需要独立的 Svelte 运行时）
+- 真实组件完全不参与 SSR
+
+对应后端路由中也有相关注释：
+```python
+# routes.py 第 1025-1026 行
+# Uncomment when we support custom component SSR
+# if environment == "server":
+```
+
+表明自定义组件的 SSR 支持目前处于**未实现状态**。
+
+### 8.2 两阶段渲染流程（SSR + 客户端水化）
+
+当 `ssr_mode=True` 时，页面渲染分为两个阶段：
+
+```
+阶段 1：SSR (Node.js 环境)
+    ├─ SvelteKit +page.ts 的 load() 执行
+    ├─ 调用 Client.connect() 获取 config
+    ├─ 自定义组件 → 强制回退为 @gradio/fallback
+    ├─ Fallback 以 JSON 形式渲染 value（空壳）
+    └─ 生成 HTML 发送给浏览器
+
+阶段 2：客户端水化 (Browser 环境)
+    ├─ 浏览器接收 HTML 并渲染（看到 Fallback 的 JSON）
+    ├─ Svelte hydration 启动
+    ├─ 重新执行 load_component() → environment="client"
+    ├─ 发起 /custom_component/{id}/client/... 请求
+    ├─ 加载真实组件并替换 Fallback
+    └─ 用户看到真实组件界面（可能有闪烁）
+```
+
+**用户可见影响**：开启 SSR 后，自定义组件区域会先显示 JSON 内容，闪烁后才变为真实组件。
+
+### 8.3 API URL 构造差异
+
+在 SvelteKit 页面加载器 [+page.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/app/src/routes/%5B...catchall%5D/%2Bpage.ts#L32-L47) 中，API URL 构造方式不同：
+
+```typescript
+const api_url =
+    browser && !local_dev_mode && root_url
+        ? new URL(mount_path || "/", root_url).href   // 浏览器：使用 root_url（绝对路径）
+        : server;                                       // SSR：使用 server（可能是 localhost）
+
+const headers = new Headers();
+if (!browser) {
+    // SSR 环境：附加服务端专用 header
+    headers.append("x-gradio-server", root_url);
+    if (cookie) {
+        headers.append("Cookie", cookie);            // 转发浏览器 Cookie
+    }
+} else {
+    // 浏览器环境：基于当前 origin
+    headers.append(
+        "x-gradio-server",
+        new URL(mount_path, location.origin).href
+    );
+}
+```
+
+| 维度 | 浏览器环境 | 服务端环境 (SSR) |
+|------|----------|---------------|
+| API URL 基准 | `root_url` / 当前页面 origin | `server`（内部通信地址） |
+| Cookie 传递 | 浏览器自动附带 | 手动从 load 参数转发 |
+| Header 标识 | `x-gradio-server: 当前页面 origin` | `x-gradio-server: root_url` |
+
+### 8.4 鉴权处理差异
+
+在 [+page.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/app/src/routes/%5B...catchall%5D/%2Bpage.ts#L50-L93) 中，SSR 阶段如果检测到需要鉴权，会**跳过 Client.connect**：
+
+```typescript
+// If the server-side check determined auth is required, skip Client.connect
+// This prevents the 401 error on the client during hydration
+if (auth_required) {
+    await setupi18n(undefined, accept_language);
+    return {
+        config: {
+            auth_required: true,         // 标记需要鉴权
+            components: [],              // 空组件列表
+            dependencies: [],
+            layout: {},
+            // ... 其余字段占位
+        },
+        api_url,
+        layout: {},
+        app: null                        // app 实例为 null
+    };
+}
+```
+
+这意味着：
+- **SSR 阶段**：遇到鉴权不返回真实 config，页面不渲染任何组件
+- **客户端阶段**：重新发起 connect，获取登录表单或跳转鉴权页面
+- **设计目的**：避免 SSR 阶段出现 401 错误，导致 hydration 前后 HTML 不一致
+
+### 8.5 自定义组件：开发模式 vs 生产模式
+
+| 维度 | 开发模式 (gradio cc dev) | 生产模式 (pip install) |
+|------|------------------------|---------------------|
+| 组件来源 | `window.__GRADIO__CC__` 全局变量 | `/custom_component/{id}/client/...` HTTP 请求 |
+| Svelte 运行时来源 | `window.__GRADIO__CC__RUNTIMES__` | `/custom_component/{id}/client/.../svelte_runtime_entry.js` |
+| 热更新 | ✅ Vite HMR 直接生效 | ❌ 需重新安装包 |
+| SSR 行为 | 同样回退到 Fallback | 同样回退到 Fallback |
+| 组件 JS 构建 | ❌ 不需要构建（Vite 按需编译） | ✅ 必须先 gradio cc build |
+
+### 8.6 差异总结
+
+| 层面 | 浏览器 (Client) | 服务端 (SSR) |
+|-----|---------------|------------|
+| 自定义组件加载 | HTTP 动态加载真实组件 | 强制回退 Fallback |
+| 自定义组件 SSR | N/A（运行时） | 尚未支持 |
+| environment 参数 | `"client"` | `"server"` |
+| runtime 返回值 | 组件独立的 Svelte 运行时 | `false` |
+| API URL | root_url / location.origin | server 内部地址 |
+| Cookie 传递 | 自动附带 | 手动转发 |
+| 组件挂载方式 | MountCustomComponent mount API | 直接 svelte:component |
+| 鉴权失败处理 | 显示登录 UI | 返回空 config 避免 hydration 错误 |
+
+---
+
 ## 关键文件索引
 
 | 功能 | 文件路径 |
@@ -476,7 +909,13 @@ FRONTEND_DIR = "../../frontend/"                # 前端源码目录
 | 组件加载器 (运行时) | [component_loader.js](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/component_loader.js) |
 | 组件加载器 (构建插件) | [index.js](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/index.js) |
 | 组件挂载组件 | [MountCustomComponent.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/MountCustomComponent.svelte) |
+| 组件树渲染入口 | [MountComponents.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/MountComponents.svelte) |
+| 动态渲染/初始化逻辑 | [_init.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/core/src/_init.ts) |
+| Block 原子组件 | [Block.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/atoms/src/Block.svelte) |
+| Fallback 组件 (Python) | [fallback.py](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/gradio/components/fallback.py) |
+| Fallback 组件 (Svelte) | [Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/fallback/Index.svelte) |
 | 后端路由 | [routes.py](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/gradio/routes.py#L981-L1044) |
+| SSR 页面加载器 | [+page.ts](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/app/src/routes/%5B...catchall%5D/%2Bpage.ts) |
 | 组件基类 | [base.py](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/gradio/components/base.py) |
 | Block 基类 | [blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/gradio/blocks.py) |
 | pyproject.toml 模板 | [pyproject_.toml](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/gradio/cli/commands/components/files/pyproject_.toml) |
