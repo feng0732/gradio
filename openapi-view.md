@@ -624,6 +624,128 @@ View API 页面使用两套数据源分别展示 Python 和 JavaScript 类型：
 {/if}
 ```
 
+### 6.7 版本阶段深度分析
+
+#### 6.7.1 当前代码的版本定位
+
+当前仓库代码处于 **Gradio 4.x 过渡阶段**，具有以下典型特征：
+
+| 维度 | 状态 | 证据 |
+|------|------|------|
+| 后端 api_info 生成 | ✅ 已迁移到 data_model | `base.py` 中 `api_info()` 默认通过 `model_json_schema()` 生成 |
+| 后端 serializer 字段 | ❌ 已移除 | `blocks.py` 的 `get_api_info()` 组装的 ParameterInfo 不含 serializer |
+| 前端类型定义 | ⚠️ 保留 serializer 字段 | `types.ts` 中 `ApiData` 和 `JsApiData` 仍有 `serializer: string` |
+| 前端 get_type 逻辑 | ⚠️ 保留 serializer 分支 | 6 层判断中有 3 层依赖 serializer |
+| Image 组件前端 | ✅ 已迁移到 component 判断 | `component === "Image"` 硬编码 |
+| File 组件前端 | ❌ 未迁移，依赖 serializer | `serializer === "FileSerializable"` 分支 |
+| Gallery 组件前端 | ❌ 未迁移，依赖 serializer | `serializer === "GallerySerializable"` 分支 |
+
+#### 6.7.2 过渡阶段的设计意图
+
+**为什么保留 serializer 分支？**
+
+1. **向后兼容旧版本 Gradio**
+   - 通过 `gr.load()` 加载 Hugging Face Spaces 上的旧版本应用时，可能返回带 serializer 字段的 API 信息
+   - 前端代码需要同时支持新旧两种格式
+
+2. **渐进式迁移策略**
+   - Image 组件作为先行者，率先从 serializer 判断迁移到 component 名称判断
+   - File、Gallery 等组件可能计划后续迁移，或保留 serializer 作为补充判断维度
+
+3. **测试数据保留历史格式**
+   - `test_data/blocks_configs.py` 中的测试数据仍包含 serializer 字段
+   - 这些测试数据用于验证配置解析等底层功能，不代表当前 API 输出格式
+
+#### 6.7.3 版本演进路径
+
+```
+Gradio 3.x                        Gradio 4.x (当前)
+─────────                        ───────────────
+
+组件配置:                          组件配置:
+  serializer: "StringSerializable"    data_model = SomeModel
+  api_info: {type: "string"}           api_info: {type: "string"}
+       ↓                                     ↓
+       ↓ /info 接口返回                      ↓ /info 接口返回
+       ↓ 携带 serializer 字段                ↓ 无 serializer 字段
+       ↓                                     ↓
+前端 get_type():                      前端 get_type():
+  - 走 serializer 分支                    - 部分走 component 分支 (Image)
+  - 所有组件类型准确                       - 部分组件显示为 any (File/Gallery)
+       ↓                                     ↓
+    正常显示                            部分降级显示
+```
+
+### 6.8 参数与返回值兜底行为对比
+
+当无法获取具体 JS 类型时（即 `get_type()` 返回 `undefined`），参数展示和返回值展示的行为**不一致**。
+
+#### 6.8.1 转换层的统一兜底
+
+在 `transform_api_info()` 的 `transform_type()` 函数中，参数和返回值使用**相同**的转换逻辑：
+
+```typescript
+type: get_type(data?.type, component, serializer, signature_type) || ""
+```
+
+- 如果 `get_type()` 无匹配返回 `undefined`
+- 通过 `|| ""` 统一转为空字符串 `""`
+- 参数和返回值在转换层的结果是**一致的**，都是空字符串
+
+#### 6.8.2 展示层的差异兜底
+
+**ParametersSnippet（参数展示）** —— 有 "any" 兜底：
+
+```svelte
+<!-- ParametersSnippet.svelte 第 36-38 行 -->
+{js_returns[i].type || "any"}
+```
+
+| js_returns[i].type 的值 | 显示结果 |
+|------------------------|---------|
+| `"string"` | "string" |
+| `""`（空字符串） | "any" |
+| `undefined` | "any" |
+
+**ResponseSnippet（返回值展示）** —— 无兜底，直接显示：
+
+```svelte
+<!-- ResponseSnippet.svelte 第 39-41 行 -->
+{js_returns[i].type}
+```
+
+| js_returns[i].type 的值 | 显示结果 |
+|------------------------|---------|
+| `"string"` | "string" |
+| `""`（空字符串） | 空（什么都不显示） |
+| `undefined` | 空（什么都不显示） |
+
+#### 6.8.3 对比总结
+
+| 维度 | 参数展示 (ParametersSnippet) | 返回值展示 (ResponseSnippet) |
+|------|---------------------------|---------------------------|
+| JS 类型表达式 | `js_returns[i].type \|\| "any"` | `js_returns[i].type` |
+| 空字符串时 | 显示 "any" | 显示空 |
+| undefined 时 | 显示 "any" | 显示空 |
+| 有无兜底 | ✅ 有兜底 | ❌ 无兜底 |
+| 代码位置 | 第 36-38 行 | 第 39-41 行 |
+
+#### 6.8.4 实际影响
+
+在当前版本中，以下组件的 JS 类型会触发兜底：
+
+| 组件 | 参数显示 | 返回值显示 | 原因 |
+|------|---------|-----------|------|
+| Textbox | `string` | `string` | 基本类型 switch 匹配 |
+| Number | `number` | `number` | 基本类型 switch 匹配 |
+| Checkbox | `boolean` | `boolean` | 基本类型 switch 匹配 |
+| Image | `Blob \| File \| Buffer` | `string` | component === "Image" 匹配 |
+| File | `any` | （空） | 无匹配，触发兜底差异 |
+| Gallery | `any` | （空） | 无匹配，触发兜底差异 |
+| JSON | `any` | （空） | 无匹配，触发兜底差异 |
+
+**注意：** 这是一个代码不一致性问题。参数显示 "any" 而返回值什么都不显示，可能是开发时的疏漏，而非有意设计。
+
 ---
 
 ## 七、后端 Python 类型转换
@@ -945,6 +1067,9 @@ Gradio 3.x 时代                          Gradio 4.x 时代
 | [external.py](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/gradio/external.py) | `load_openapi()` 从 OpenAPI 生成 Gradio 应用 |
 | [external_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/gradio/external_utils.py) | `component_from_parameter_schema()`、`component_from_request_body_schema()` |
 | [client/python/gradio_client/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/client/python/gradio_client/utils.py) | `json_schema_to_python_type()`、Python 类型转换 |
-| [client/js/src/helpers/api_info.ts](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/client/js/src/helpers/api_info.ts) | `transform_api_info()`、`get_type()`、`get_description()` |
-| [client/js/src/utils/view_api.ts](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/client/js/src/utils/view_api.ts) | 前端 API 信息获取与转换入口 |
-| [js/core/src/api_docs/ApiDocs.svelte](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/js/core/src/api_docs/ApiDocs.svelte) | View API 页面组件 |
+| [api_info.ts](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/client/js/src/helpers/api_info.ts) | `transform_api_info()`、`get_type()`、`get_description()` |
+| [view_api.ts](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/client/js/src/utils/view_api.ts) | 前端 API 信息获取与转换入口 |
+| [ParametersSnippet.svelte](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/js/core/src/api_docs/ParametersSnippet.svelte) | 参数展示组件（含 "any" 兜底） |
+| [ResponseSnippet.svelte](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/js/core/src/api_docs/ResponseSnippet.svelte) | 返回值展示组件（无兜底） |
+| [ApiDocs.svelte](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/js/core/src/api_docs/ApiDocs.svelte) | View API 页面主组件 |
+| [types.ts](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/client/js/src/types.ts) | `ApiData`、`JsApiData` 类型定义 |
