@@ -1,5 +1,14 @@
 # Gradio Themes 主题系统代码解析
 
+> **2026-06-13 勘误更新**：经过第二轮代码核查，发现并修正了第十一章中关于独立/嵌入模式样式链路的多处不准确描述，包括：
+> - ✅ 修正用户自定义 CSS 的注入路径（独立模式实际由 `<Blocks>` 内部注入）
+> - ✅ 修正 `.theme-loaded` 类的使用差异（嵌入模式 `apply_theme` 缺失该类）
+> - ✅ 修正防闪屏机制的实际参与情况（仅独立模式有效）
+> - ✅ 发现并记录了 3 个代码 Bug（本地 stylesheets 注入失效、`prefix_css` 冗余 `remove()`）
+> - ✅ 补充 `css_ready` 变量在两种模式下的不同作用
+> 
+> 第十一章已全部重写，新增了详细的调用时机、代码位置和 Bug 说明。
+
 ## 一、整体架构概览
 
 Gradio 的主题系统采用**四层架构 + 变量引用链**的设计模式，从 Python 后端的主题对象构造，到 CSS 变量生成，再到前端 Svelte 应用的消费，形成一条完整的管线。
@@ -655,9 +664,26 @@ import "@gradio/theme/gradio-style.scss"; // Gradio 组件样式
 **关键特点**：
 - `/theme.css` 由 SvelteKit 在 SSR/CSR 时作为普通 `<link>` 注入到 `document.head`
 - Google Fonts 等外链 stylesheets 同样走 `<link>` 静态注入
+- **⚠️ 相对路径 stylesheets 被完全忽略**（`{#if stylesheet.startsWith("http:") || stylesheet.startsWith("https:")}` 判断只保留绝对 URL）
 - 首屏即有样式，无 FOUC（无样式内容闪烁）
 
-**第 3 步：SSR 防闪屏内联样式**（[+layout.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/+layout.svelte) L12-L21）
+**第 3 步：Blocks 组件内联用户自定义 CSS**（[Blocks.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/core/src/Blocks.svelte) L463-L469）
+
+用户通过 `gr.Blocks(css="...")` 传入的自定义 CSS，是在 `<Blocks>` 组件内部通过 `<svelte:head>` 注入的：
+```svelte
+<svelte:head>
+    {#if control_page_title}
+        <title>{title}</title>
+    {/if}
+    {#if css}
+        {@html `<style>${prefix_css(css, version)}</style>`}
+    {/if}
+</svelte:head>
+```
+
+**注意**：`prefix_css(css, version)` 在这里只传了两个参数，`style_element` 参数为 `undefined`。`prefix_css` 内部会临时创建一个 `<style>` 元素用于 `CSSStyleSheet` 解析，解析完后立即 `remove()`，最终只返回处理后的字符串，由 `{@html}` 直接写入 `<style>` 标签。
+
+**第 4 步：SSR 防闪屏内联样式**（[+layout.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/+layout.svelte) L12-L21）
 
 ```css
 :global(body) {
@@ -691,8 +717,9 @@ await mount_css(ENTRY_CSS, document.head);               // 应用入口 CSS
 
 在 `mount_custom_css()` 中动态加载主题和用户自定义 CSS：
 ```javascript
+let css_text_stylesheet: HTMLStyleElement | null = null;
 async function mount_custom_css(css_string: string | null): Promise<void> {
-    // 1) 用户自定义 CSS: 走 prefix_css 加作用域前缀后内联
+    // 1) 用户自定义 CSS: 手动创建 <style> 标签，prefix_css 后写入 textContent
     if (css_string) {
         if (!css_text_stylesheet) {
             css_text_stylesheet = document.createElement("style");
@@ -709,7 +736,7 @@ async function mount_custom_css(css_string: string | null): Promise<void> {
         document.head
     );
 
-    // 3) stylesheets: 外链走 mount_css，本地 CSS 走 fetch + prefix_css 内联
+    // 3) stylesheets: 外链走 mount_css
     if (!config.stylesheets) return;
     await Promise.all(
         config.stylesheets.map((stylesheet) => {
@@ -717,25 +744,49 @@ async function mount_custom_css(css_string: string | null): Promise<void> {
             if (absolute_link) {
                 return mount_css(stylesheet, document.head);  // 绝对URL → <link>
             }
-            return fetch(config.root + "/" + stylesheet)      // 相对URL → fetch → 内联
+            // ⚠️ Bug: 相对 URL fetch 后 prefix_css 的返回值被丢弃，没有写入 DOM！
+            return fetch(config.root + "/" + stylesheet)
                 .then((response) => response.text())
                 .then((css_string) => {
-                    prefix_css(css_string, version);
+                    prefix_css(css_string, version);  // 只处理但不写入！
                 });
         })
     );
 }
 ```
 
+**嵌入模式的 Bug**：相对路径的 stylesheets 在 `fetch` 后调用了 `prefix_css(css_string, version)`，但返回值被直接丢弃，**没有被写入到任何 `<style>` 标签中**。因此，嵌入模式下的本地 stylesheets **实际上不会生效**。
+
+**第 3 步：`css_ready` 控制渲染时机**（[Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte) L288, L359-L361, L595）
+
+嵌入模式使用 `css_ready` 变量作为 `<Blocks>` 组件渲染的前置条件：
+```javascript
+let css_ready = false;
+// ...
+await mount_custom_css(config.css);
+await add_custom_html_head(config.head);
+css_ready = true;
+```
+
+在模板中：
+```svelte
+{:else if config && Blocks && css_ready}
+    <Blocks {app} {...config} ... />
+{/if}
+```
+
+这确保了在所有样式加载完成之前，不会渲染组件内容，避免 FOUC。
+
 **关键差异总结**：
 
 | 注入项 | 独立模式（App） | 嵌入模式（SPA） |
 |--------|-----------------|-----------------|
 | 主题 CSS `/theme.css` | `<svelte:head>` 静态 `<link>` | `mount_css()` 动态 `<link>` |
-| 重置/全局/排版样式 | 构建时静态 import 打包 | 无需（SPA 入口已包含） |
+| 重置/全局/排版样式 | 构建时静态 import 打包 | main.ts 启动时 `mount_css(ENTRY_CSS)` 预加载 |
 | Google Fonts 外链 | `<svelte:head>` 静态 `<link>` | `mount_css()` 动态 `<link>` |
-| 本地 stylesheets | **仅加载绝对 URL**，相对 URL 被忽略 | 所有 URL 都加载，相对 URL `fetch` 后 `prefix_css` 内联 |
-| 用户自定义 `css` | `<style>` 标签 `prefix_css` 后内联 | `<style>` 标签 `prefix_css` 后内联 |
+| 本地 stylesheets | **仅加载绝对 URL**，相对 URL 被 `{#if}` 过滤 | 所有 URL 都 fetch，但相对 URL 的 `prefix_css` 结果被丢弃（Bug） |
+| 用户自定义 `css` | `<Blocks>` 内部 `<svelte:head>` + `{@html}` 内联 | `Index.svelte` 手动创建 `<style>` 写入 `textContent` |
+| 渲染时机控制 | 无 `css_ready` 检查，`{:else if config && app}` 即渲染 | 有 `css_ready` 检查，`{:else if config && Blocks && css_ready}` 才渲染 |
 | SSR 防闪屏 | `+layout.svelte` 内联 body 背景 | 无 SSR，由嵌入方负责 |
 
 ---
@@ -805,7 +856,7 @@ export function mount_css(url: string, target: HTMLElement): Promise<void> {
 
 ### 11.4 暗色模式切换：两种模式下的 `.dark` 类挂载差异
 
-这是最容易混淆的部分。`apply_theme()` 在两种模式下把 `.dark` 类挂到**完全不同的 DOM 元素**上。
+这是最容易混淆的部分。`apply_theme()` 在两种模式下把 `.dark` 类挂到**完全不同的 DOM 元素**上，而且**独立模式多了一行 `.theme-loaded` 类的添加**。
 
 #### 核心代码对比
 
@@ -816,7 +867,7 @@ function apply_theme(target: HTMLElement, theme: "dark" | "light"): void {
     const bg_element = is_embed ? target : target.parentElement!;
 
     bg_element.style.background = "var(--body-background-fill)";
-    dark_class_element.classList.add("theme-loaded");
+    dark_class_element.classList.add("theme-loaded");  // ✓ 独立模式有这一行！
 
     if (theme === "dark")   dark_class_element.classList.add("dark");
     else                    dark_class_element.classList.remove("dark");
@@ -830,6 +881,7 @@ function apply_theme(target: HTMLDivElement, theme: "dark" | "light"): void {
     const bg_element = is_embed ? target : target.parentElement!;
 
     bg_element.style.background = "var(--body-background-fill)";
+    // ✗ 嵌入模式没有 .theme-loaded！
 
     if (theme === "dark") {
         dark_class_element.classList.add("dark");
@@ -839,7 +891,11 @@ function apply_theme(target: HTMLDivElement, theme: "dark" | "light"): void {
 }
 ```
 
-两份代码逻辑完全一致，只是调用时机略有不同（独立模式在模块初始化时调用，嵌入模式在 `onMount` 时调用）。
+**关键差异**：独立模式的 `apply_theme` 多了一行 `dark_class_element.classList.add("theme-loaded")`，这是防闪屏机制的核心开关。两份代码除了这一行之外逻辑一致，调用时机略有不同（独立模式在模块初始化时调用，嵌入模式在 `onMount` 时调用）。
+
+**调用时机对比**：
+- 独立模式：模块初始化时调用 `handle_theme_mode(document.body)`（[+page.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/[...catchall]/+page.svelte) L172-L174）
+- 嵌入模式：`onMount` 中调用 `handle_theme_mode(wrapper)`（[Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte) L306-L307）
 
 #### DOM 结构与挂载点
 
@@ -883,10 +939,15 @@ document.body                           ← .dark / .theme-loaded 挂在这里
 }
 ```
 
-- **独立模式**：`:root.dark` 匹配（`document.documentElement` 的子元素 body 有 `.dark` 类，`:root.dark` 实际匹配 html 上是否有 dark？不对，实际是 `body.dark` 让 `:root .dark` 匹配——因为 body 是 :root 的后代且有 .dark 类）
-- **嵌入模式**：`:root .dark` 匹配（`<gradio-app>` 是 `:root` 的后代且有 `.dark` 类）
+这是一个逗号分隔的复合选择器，包含两个部分：
+- `:root.dark`：匹配本身带有 `.dark` 类的根元素（`<html>`）
+- `:root .dark`：匹配根元素的**后代**中带有 `.dark` 类的任何元素
 
-两种模式都通过 `:root .dark` 这个后代选择器触发暗模式变量覆写。
+**两种模式的匹配路径**：
+- **独立模式**：`.dark` 挂在 `document.body` 上，body 是 `:root`（`<html>`）的后代 → 匹配 `:root .dark`
+- **嵌入模式**：`.dark` 挂在 `<gradio-app>` 自定义元素上，它也是 `:root` 的后代 → 匹配 `:root .dark`
+
+**巧妙之处**：无论 `.dark` 类挂在 DOM 树的哪个位置（只要在 `<html>` 之内），`":root .dark"` 这个后代选择器都能匹配并触发暗模式变量覆写。
 
 #### 模式优先级与切换流程
 
@@ -932,10 +993,17 @@ function sync_system_theme(target): "light" | "dark" {
 }
 ```
 
-#### theme-loaded 类的防闪屏作用
+#### theme-loaded 类的防闪屏作用（仅独立模式）
 
-`.theme-loaded` 类是 SSR 防闪屏机制的关键。在 [+layout.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/+layout.svelte) L17-L21：
+`.theme-loaded` 类是 SSR 防闪屏机制的关键，**仅在独立模式下工作**，嵌入模式完全不参与。
+
+**防闪屏 CSS**（[+layout.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/+layout.svelte) L12-L21）：
 ```css
+:global(body) {
+    background: var(--body-background-fill);
+    color: var(--body-text-color);
+}
+
 @media (prefers-color-scheme: dark) {
     :global(body:not(.theme-loaded)) {
         background: var(--neutral-950);
@@ -943,11 +1011,21 @@ function sync_system_theme(target): "light" | "dark" {
 }
 ```
 
-时序：
-1. 浏览器加载 HTML，系统是深色模式 → `body:not(.theme-loaded)` 生效，body 显示 `--neutral-950`（深色）
-2. JS 加载，`handle_theme_mode()` 调用 `apply_theme()` → 给 body 加 `.theme-loaded` 和 `.dark`
-3. `.theme-loaded` 加上后，`:not(.theme-loaded)` 规则失效，主题 CSS 的 `:root .dark` 规则接管
-4. 背景色平滑过渡，用户看不到白屏闪烁
+**独立模式时序**：
+1. 浏览器加载 SSR 输出的 HTML，此时 JS 尚未执行，body 上没有任何类
+2. 若系统是深色模式，`body:not(.theme-loaded)` 生效，body 背景强制设为 `--neutral-950`（深色），避免白色闪烁
+3. 同时 `body` 的默认背景是 `var(--body-background-fill)`，但此时主题 CSS 变量可能还未加载完成
+4. JS 加载完成，模块初始化时调用 `handle_theme_mode(document.body)` → 触发 `apply_theme()`
+5. `apply_theme()` 给 `document.body` 加上 `.theme-loaded` 和 `.dark` 两个类
+6. `.theme-loaded` 加上后，`:not(.theme-loaded)` 伪类不匹配，兜底深色背景规则失效
+7. 此时 `/theme.css` 已加载完成，主题 CSS 中的 `:root .dark` 规则接管，暗模式变量正常生效
+8. 背景色平滑过渡，用户看不到白屏闪烁
+
+**嵌入模式为什么不参与**：
+1. 嵌入模式是纯客户端渲染，没有 SSR 输出的 HTML，不存在"先看到 SSR 白色背景"的问题
+2. 嵌入模式的 `apply_theme()` 没有添加 `.theme-loaded` 类的代码（L269-278）
+3. 嵌入模式使用 `css_ready` 机制，`Blocks` 组件在 `css_ready === true` 时才渲染，从源头避免 FOUC
+4. `+layout.svelte` 属于 SvelteKit 项目，嵌入模式（SPA）根本不会加载这个文件
 
 ---
 
@@ -1038,8 +1116,45 @@ css_string += rule.cssText.replace(selector, new_selector);  // 追加前缀版�
 
 #### 调用时机与位置
 
-- **用户自定义 CSS**（`config.css`）：[Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte) L144，内联到 `<style>` 标签
-- **本地 stylesheets**（相对路径）：[Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte) L167，fetch 后 `prefix_css` 注入
+`prefix_css` 在两种模式下都被调用，但调用方式和注入路径不同：
+
+**独立模式**（[Blocks.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/core/src/Blocks.svelte) L463-L469）：
+```svelte
+<svelte:head>
+    {#if css}
+        {@html `<style>${prefix_css(css, version)}</style>`}
+    {/if}
+</svelte:head>
+```
+- 只传 2 个参数，`style_element` 为 `undefined`
+- 内部临时创建 `<style>` 解析 CSSOM，解析完 `remove()`
+- 返回字符串由 `{@html}` 直接写入 `<style>` 标签
+
+**嵌入模式**（[Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte) L139-L148）：
+```javascript
+if (css_string) {
+    if (!css_text_stylesheet) {
+        css_text_stylesheet = document.createElement("style");
+        document.head.appendChild(css_text_stylesheet);
+    }
+    css_text_stylesheet.textContent = prefix_css(
+        css_string, version, css_text_stylesheet
+    );
+}
+```
+- 传 3 个参数，传入已创建的 `<style>` 元素
+- `prefix_css` 内部先 `style_element.remove()` 从 DOM 中移除，避免解析过程中样式泄漏
+- 返回字符串赋值给 `style_element.textContent`，但元素已不在 DOM 中？实际上由于 Svelte 的 reactivity，赋值后元素可能被重新加入，或者这里存在设计上的冗余。
+
+**⚠️ 嵌入模式本地 stylesheets Bug**（[Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte) L164-L168）：
+```javascript
+return fetch(config.root + "/" + stylesheet)
+    .then((response) => response.text())
+    .then((css_string) => {
+        prefix_css(css_string, version);  // 返回值被丢弃！没有写入任何 <style>
+    });
+```
+`prefix_css` 的返回值没有被赋值给任何元素的 `textContent`，也没有创建新的 `<style>` 标签。相对路径的 stylesheets 在嵌入模式下**实际上不会生效**。
 
 ---
 
@@ -1095,27 +1210,50 @@ self.embed_radius = embed_radius or getattr(self, "embed_radius", "*radius_sm")
 |------|-----------------|-----------------|
 | **入口** | SvelteKit `/[...catchall]` 路由 | `<gradio-app>` 自定义元素 |
 | **`is_embed` 默认** | `false` | `true` |
-| **基础样式加载** | 构建时 import 打包进应用 | main.ts 启动时 `mount_css(ENTRY_CSS)` |
-| **主题 CSS `/theme.css`** | `<svelte:head>` 静态 `<link>` | `mount_css()` 动态 `<link>` |
-| **Google Fonts** | `<svelte:head>` 静态 `<link>` | `mount_css()` 动态 `<link>` |
-| **本地 stylesheets** | 仅加载绝对 URL，相对 URL 被忽略 | 所有 URL 都加载，相对 URL fetch 后 `prefix_css` 内联 |
-| **`.dark` 挂载点** | `document.body` | `<gradio-app>` 自定义元素 |
-| **背景色设置** | `.gradio-container` 容器 | `.main` 内部 div |
-| **`.theme-loaded`** | 有，用于 SSR 防闪屏 | 无（SSR 场景不适用） |
-| **防闪屏机制** | `+layout.svelte` 中 `@media` 兜底 + `body:not(.theme-loaded)` | 依赖嵌入方处理，通常无 |
-| **CSS 作用域隔离** | 不需要（独占页面） | `prefix_css()` 给所有选择器加 `.gradio-container.version .contain` 前缀 |
-| **CDN 适配** | SvelteKit 构建时处理 | `mount_css()` 运行时判断 origin，自动转绝对 URL |
+| **基础样式加载** | 构建时 import 打包进应用（`+layout.svelte` L1-L6） | main.ts 启动时 `mount_css(ENTRY_CSS)` + `mount_css(FONTS)` |
+| **主题 CSS `/theme.css`** | `<svelte:head>` 静态 `<link>`（`+page.svelte` L423） | `mount_css()` 动态 `<link>`（`Index.svelte` L150） |
+| **Google Fonts** | `<svelte:head>` 静态 `<link>`（`+page.svelte` L424-L428） | `mount_css()` 动态 `<link>`（`Index.svelte` L160-L161） |
+| **本地 stylesheets** | 仅加载绝对 URL，相对 URL 被 `{#if}` 过滤（`+page.svelte` L426） | 所有 URL 都 fetch，但相对 URL 的 `prefix_css` 结果被丢弃（Bug，L164-L168） |
+| **用户自定义 CSS** | `<Blocks>` 内部 `<svelte:head>` + `{@html}` 内联（`Blocks.svelte` L463-L469） | `Index.svelte` 手动创建 `<style>` 写入 `textContent`（`Index.svelte` L139-L148） |
+| **`.dark` 挂载点** | `document.body`（`+page.svelte` L159） | `<gradio-app>` 自定义元素（`Index.svelte` L270） |
+| **背景色设置** | `target.parentElement`（`.gradio-container`） | `target`（`.main` 内部 div） |
+| **`.theme-loaded`** | 有，`apply_theme` 中添加（`+page.svelte` L162） | 无，`apply_theme` 中缺失对应代码 |
+| **防闪屏机制** | `+layout.svelte` 中 `@media` 兜底 + `body:not(.theme-loaded)` | 无，使用 `css_ready` 机制延迟渲染避免 FOUC |
+| **`css_ready` 作用** | 标记变量，不阻塞渲染（`+page.svelte` L255, L299） | `<Blocks>` 渲染前置条件，等 CSS 加载完才渲染（`Index.svelte` L595） |
+| **CSS 作用域隔离** | `prefix_css()` 加前缀（`Blocks.svelte` L468） | `prefix_css()` 加前缀（`Index.svelte` L144） |
+| **CDN 适配** | SvelteKit 构建时处理 | `mount_css()` 运行时判断 origin，自动转绝对 URL（`css.ts` L16-L21） |
 | **SSR 支持** | 完整支持 | 不适用（客户端渲染） |
-| **自定义样式注入点** | `<style>` 标签 + `prefix_css` | `<style>` 标签 + `prefix_css` |
 
-### 关键理解点
+### 关键理解点（修正版）
 
-1. **两套 Svelte 入口**：Gradio 实际上有两个前端入口——`js/app`（SvelteKit SSR，独立模式）和 `js/spa`（纯客户端 SPA，嵌入模式），各自有独立的主题加载逻辑但共享 `@gradio/core` 工具。
+1. **两套 Svelte 入口 + 一套共享组件**：Gradio 有两个前端入口——`js/app`（SvelteKit SSR，独立模式）和 `js/spa`（纯客户端 SPA，嵌入模式），各自有独立的主题加载逻辑，但共享 `@gradio/core` 中的 `<Blocks>`、`prefix_css()`、`mount_css()` 等核心组件和工具。
 
 2. **CSS 变量的跨模式复用**：主题 CSS 中的 `:root.dark, :root .dark` 选择器设计非常巧妙——`.dark` 类挂在 body 上匹配 `:root .dark`，挂在自定义元素上也匹配 `:root .dark`，同一套 CSS 适配两种挂载模式。
 
-3. **prefix_css 的双重输出**：同时输出原始规则和前缀版本，保证了向后兼容——旧的自定义 CSS 即使不做前缀也能工作，同时新的前缀版本确保不污染宿主页面。
+3. **用户自定义 CSS 的两条注入路径**：
+   - 独立模式：`<Blocks>` 组件内部通过 `<svelte:head>` + `{@html}` 注入
+   - 嵌入模式：`Index.svelte` 中手动创建 `<style>` 元素并设置 `textContent`
 
-4. **CDN 适配的关键**：`mount_css()` 中的 origin 判断是嵌入模式下的隐形基础设施——当 Gradio 静态资源从 CDN 提供时，能正确把 `/theme.css` 转成 `https://cdn.xxx.com/theme.css`。
+4. **⚠️ 嵌入模式本地 stylesheets Bug**：相对路径的 stylesheets 在 `fetch` 后调用 `prefix_css()` 但返回值被丢弃，没有写入任何 `<style>` 标签，**实际上不会生效**。这是一个需要修复的代码 Bug。
 
-5. **防闪屏的三层防护**：独立模式下有三层防闪屏——① `+layout.svelte` 的媒体查询兜底、② `body:not(.theme-loaded)` 的过渡背景、③ 主题 CSS 尽早通过 `<link>` 加载，三者配合实现无缝的主题切换体验。
+5. **⚠️ prefix_css 中的冗余 remove()**：`prefix_css()` 内部会先调用 `style_element.remove()` 将传入的 `<style>` 从 DOM 中移除，但之后将处理后的字符串赋值给 `style_element.textContent`。在支持 `adoptedStyleSheets` 的浏览器中，元素已不在 DOM 中，样式可能无法生效。这可能是历史遗留的设计冗余。
+
+6. **两种防闪屏机制**：
+   - 独立模式：**`.theme-loaded` 类 + 媒体查询兜底** —— SSR 输出的 HTML 先显示深色背景，JS 执行后加 `.theme-loaded` 解除兜底
+   - 嵌入模式：**`css_ready` 延迟渲染** —— 等 CSS 全部加载完成后才渲染 `<Blocks>` 组件，从源头避免 FOUC
+
+7. **CDN 适配的关键**：`mount_css()` 中的 origin 判断是嵌入模式下的隐形基础设施——当 Gradio 静态资源从 CDN 提供时，能正确把 `/theme.css` 转成 `https://cdn.xxx.com/theme.css`。
+
+8. **prefix_css 的双重输出**：同时输出原始规则和前缀版本，保证了向后兼容——旧的自定义 CSS 即使不做前缀也能工作，同时新的前缀版本确保不污染宿主页面。
+
+---
+
+### 附：已确认的代码 Bug 列表
+
+| Bug 位置 | 问题描述 | 影响范围 |
+|---------|---------|---------|
+| [Index.svelte L164-L168](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte#L164-L168) | 相对路径 stylesheets 的 `prefix_css` 返回值被丢弃，没有写入 DOM | 嵌入模式下本地自定义样式表不生效 |
+| [+page.svelte L424-L428](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/[...catchall]/+page.svelte#L424-L428) | 相对路径 stylesheets 被 `{#if}` 过滤，完全不加载 | 独立模式下本地自定义样式表不生效 |
+| [css.ts L48](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/core/src/css.ts#L48) | `prefix_css` 内部 `style_element.remove()` 可能导致支持 `adoptedStyleSheets` 的浏览器中样式不生效 | 两种模式下自定义 CSS 可能失效 |
+
+> **说明**：独立模式下相对路径 stylesheets 被忽略可能是有意设计（SvelteKit 有自己的静态资源处理机制），但嵌入模式下的 Bug 明显是代码遗漏。
