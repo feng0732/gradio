@@ -144,30 +144,113 @@ if (
 
 ---
 
-## 3. 安全路径拼接 `safe_join`
+## 3. 安全路径拼接与异常转换
 
-**定义位置**:
-- `gradio/utils.py` L1767-L1785（`safe_join`）
-- `gradio/route_utils.py` L1179-L1180（`routes_safe_join` 包装）
+### 3.1 底层 `safe_join`
+
+**定义位置**: `gradio/utils.py` L1767-L1785
+
+```python
+def safe_join(directory: DeveloperPath, path: UserProvidedPath) -> str:
+```
+
+**防护措施**（任一条件成立即抛出 `InvalidPathError`）:
+- 文件名包含操作系统分隔符（Windows 的 `\`）
+- 是绝对路径（`/` 开头 或 `os.path.isabs()` 为真）
+- `filename == ".."` 或 `startswith("../")` 目录穿越
+
+### 3.2 HTTP 层包装 `routes_safe_join`
+
+**定义位置**: `gradio/route_utils.py` L1123-L1139
+
+这是 `safe_join` 的 HTTP 感知包装器，在**同一函数内**完成异常捕获与额外检查：
+
+```python
+def routes_safe_join(directory: DeveloperPath, path: UserProvidedPath) -> str:
+    if path == "":
+        raise fastapi.HTTPException(400)
+    if starts_with_protocol(path):
+        raise fastapi.HTTPException(403)
+    try:
+        fullpath = Path(utils.safe_join(directory, path))   # L1132: 调用底层 safe_join
+    except InvalidPathError as e:
+        raise fastapi.HTTPException(403) from e            # L1133-L1134: ← 异常在此转换为 403
+    if fullpath.is_dir():
+        raise fastapi.HTTPException(403)
+    if not fullpath.exists():
+        raise fastapi.HTTPException(404)
+    return str(fullpath)
+```
+
+### 3.3 `/static/`、`/assets/`、`favicon` 调用链
+
+以 `/static/{path:path}` 为例（`gradio/routes.py` L977-L979）：
+
+```
+请求 /static/..%2findex.html
+     ↓
+static_resource(path = "../index.html")
+     ↓
+file_response(STATIC_PATH_LIB, UserProvidedPath(path))   # gradio/route_utils.py L1179-L1180
+     ↓  直接 return FileResponse(routes_safe_join(...))
+routes_safe_join(directory, path)
+     ├─ 协议检查 → 不触发
+     ├─ try: utils.safe_join()
+     │      └─ filename.startswith("../") → 抛出 InvalidPathError
+     └─ except InvalidPathError:
+            raise HTTPException(403)   ← 异常在此被捕获并转为 403
+```
+
+**关键纠正**：`InvalidPathError → 403` 的转换发生在 `routes_safe_join` **内部**（L1133-L1134），并非在外层的 `file_response`。`file_response` 只是透传 `routes_safe_join` 的返回值给 `FileResponse` 构造函数。
+
+`/assets/` 和 `favicon` 路由走完全相同的调用链，只是根目录不同。
+
+### 3.4 `/custom_component/...` 调用链（两段 `safe_join` 分支）
+
+**定义位置**: `gradio/routes.py` L981-L1023
+
+此路由有**两次**路径安全拼接，分别在不同位置处理异常，因此有两条不同的状态码分支：
+
+```
+请求 /custom_component/{id}/client/templates/../../etc/passwd
+     ↓
+custom_component_path(...)
+     │
+     ├── 第 1 段 safe_join（L1010-L1018）
+     │     utils.safe_join(
+     │         location.TEMPLATE_DIR,
+     │         UserProvidedPath(f"templates/../../etc/passwd")
+     │     )
+     │     手动 try / except InvalidPathError
+     │     └─ 捕获 → HTTPException(404, "Component not found.")   ← 分支一：404
+     │
+     └── 若第 1 段通过，得到 requested_path 合法相对路径
+          │
+          └── 第 2 段 routes_safe_join（L1020-L1023）
+               routes_safe_join(
+                   DeveloperPath(str(Path(module_path).parent)),
+                   UserProvidedPath(requested_path)
+               )
+               └─ 内部转换逻辑同 3.2 节
+                  InvalidPathError → HTTPException(403)           ← 分支二：403
+                  文件不存在 → HTTPException(404)
+```
+
+**两段差异总结**:
+
+| 拼接阶段 | 使用函数 | 异常捕获位置 | 路径穿越状态码 | 文件不存在状态码 |
+|---------|---------|-------------|--------------|----------------|
+| 第 1 段（组件模板目录内） | `utils.safe_join` | 路由函数内手动 `try/except` | **404** Component not found | 不检查（交给第 2 段） |
+| 第 2 段（从模块目录出发） | `routes_safe_join` | `routes_safe_join` 内部 | **403** | **404** |
 
 > **重要**：`safe_join` **不用于** `/file=` 下载路由。`/file=` 使用 `abspath()` + `is_allowed_file()` 的包含关系判定。
 >
-> `safe_join` 仅用于以下已知根目录的静态资源路由：
+> `safe_join` / `routes_safe_join` 仅用于以下已知根目录的静态资源路由：
 > - `/static/{path:path}` — 库内置静态资源（根目录: `STATIC_PATH_LIB`）
 > - `/assets/{path:path}` — 前端构建产物（根目录: `BUILD_PATH_LIB`）
 > - `/favicon.ico` — favicon
-> - `/custom_component/...` — 自定义组件资源
+> - `/custom_component/...` — 自定义组件资源（两段 safe_join）
 > - `deep_links` 状态文件读取
-
-**防护措施**:
-- 禁止包含操作系统分隔符（Windows 的 `\`）
-- 禁止绝对路径（`/` 开头）
-- 禁止 `..` 目录穿越（`filename == ".."` 或 `startswith("../")`）
-- 违反任一条件抛出 `InvalidPathError`
-
-**异常处理**:
-- `file_response` 函数（`gradio/route_utils.py` L1133-L1134）捕获 `InvalidPathError` 并抛出 `HTTPException(403)`
-- 自定义组件路由（`gradio/routes.py` L1015-L1018）单独捕获 `InvalidPathError` 并抛出 `HTTPException(404, detail="Component not found.")`
 
 ---
 
@@ -371,8 +454,9 @@ payload.url = f"{url_prefix}{payload.path}"
 | `/file=` + `allowed_paths` 中的 HTML 文件 | 下载路由 | `reason == "allowed"` → `inline` | 200 内联显示（`text/html`） | `test_response_attachment_format` L318-L320 |
 | `/file=` + `upload_dir` 下的 HTML 文件 | 下载路由 | `reason == "created"` → 不在 `XSS_SAFE_MIMETYPES` → `attachment` | 200 强制下载（`application/octet-stream`） | `test_response_attachment_format` L322-L324 |
 | `/file=` + `upload_dir` 下的上传文件（非安全 MIME） | 下载路由 | `created_paths` 匹配 → 但不在安全 MIME 列表 | 200 强制下载 | 同上 |
-| `/static/..%2findex.html` | 静态资源路由 | `safe_join` 检测 `..` 穿越 → `InvalidPathError` → `file_response` 捕获转 403 | 403 拒绝 | `test_static_files_served_safely` L62-L67 |
-| `/custom_component/../../etc/passwd` | 自定义组件路由 | `safe_join` 异常被单独捕获 | 404 Not Found | `routes.py` L1015-L1018 |
+| `/static/..%2findex.html` | 静态资源路由 | `static_resource → file_response → routes_safe_join` 调用链中，`routes_safe_join` 内部捕获 `InvalidPathError` → 转 403 | 403 拒绝 | `test_static_files_served_safely` L62-L67 |
+| `/custom_component/{id}/client/templates/../../etc/passwd` | 自定义组件路由（第 1 段） | 路由函数内**手动** `try/except` 捕获 `utils.safe_join` 的 `InvalidPathError` → 转 404 "Component not found" | 404 Not Found | `routes.py` L1010-L1018 |
+| `/custom_component/{id}/client/{type}/{穿越路径}` 第 1 段通过但第 2 段触发 | 自定义组件路由（第 2 段） | 第 1 段通过后调用 `routes_safe_join`，其内部捕获 `InvalidPathError` → 转 403 | 403 拒绝 | `routes.py` L1020-L1023 + `route_utils.py` L1133-L1134 |
 | `ssrf_protected_download("http://169.254.169.254/...")` | SSRF 保护下载 | `safehttpx` 内部 IP 拦截 | 抛出异常拒绝下载 | — |
 | `ssrf_protected_download("https://huggingface.co/...")` | SSRF 保护下载 | `PUBLIC_HOSTNAME_WHITELIST` 跳过内网 IP 检查 | 正常下载 | — |
 | `/proxy=http://169.254.169.254/...` | 代理授权 | 第 2 层：非 `.hf.space` | `PermissionError` | `test_proxy_route_is_restricted_to_load_urls` |
