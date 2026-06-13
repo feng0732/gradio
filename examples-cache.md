@@ -51,49 +51,128 @@
 
 ---
 
-## 3. 参数解析与构造阶段
+## 3. 参数解析与构造阶段（完整决策树）
 
-### 3.1 cache_examples 参数判定 ([helpers.py:155-170](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L155-L170))
+### 3.0 关键参数概览
 
-```python
-self.cache_examples = False
-if cache_examples is None:
-    # 从环境变量 GRADIO_CACHE_EXAMPLES 读取
-    if os.getenv("GRADIO_CACHE_EXAMPLES", "").lower() in ["true", "lazy"] \
-       and fn is not None and outputs is not None:
-        self.cache_examples = True
-elif cache_examples in [True, False]:
-    self.cache_examples = cache_examples
+| 参数 | 类型 | 作用 | 文档说明的特殊点 |
+|------|------|------|----------------|
+| `cache_examples` | `bool \| None` | 是否启用缓存 | 文档说接受 `"lazy"`，但代码只接受 `True`/`False`/`None` |
+| `cache_mode` | `"eager" \| "lazy" \| None` | 缓存时机（eager=启动时，lazy=点击时） | 真正控制 eager/lazy 的开关 |
+| `GRADIO_CACHE_EXAMPLES` | 环境变量 | `cache_examples=None` 时的默认值 | `"true"`/`"lazy"` 都视为启用 |
+| `GRADIO_CACHE_MODE` | 环境变量 | `cache_mode=None` 时的默认值 | `"eager"`/`"lazy"` |
+| `GRADIO_EXAMPLES_CACHE` | 环境变量 | 缓存根目录 | 默认 `.gradio/cached_examples` |
+| `GRADIO_RESET_EXAMPLES_CACHE` | 环境变量 | 启动时是否清空缓存 | `"True"` 时删除整个缓存目录 |
+
+> **文档与代码的不一致：** [Interface 文档](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/interface.py#L136) 说 `cache_examples` 可以是 `"lazy"`，但 [Examples.__init__](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L155-L168) 代码中 `cache_examples` 只接受 `True`/`False`/`None`，`"lazy"` 实际是通过 `cache_mode` 参数控制的。
+
+---
+
+### 3.1 完整判断流程（严格顺序）
+
+**位置：** [helpers.py:155-185](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L155-L185)
+
+```
+                     开始
+                       │
+                       ▼
+        ┌─────────────────────────────┐
+        │ self.cache_examples = False │     # 初始默认值
+        └─────────────────────────────┘
+                       │
+                       ▼
+        cache_examples 参数是 None 吗？
+              /              \
+            是                否
+           /                  \
+          ▼                    ▼
+┌──────────────────────┐  cache_examples 是 True/False 吗？
+│ 读 GRADIO_CACHE_EXAMPLES │         /         \
+│ 环境变量                │       是           否
+│ 若值为 "true" 或 "lazy"  │      /             \
+│ 且 fn 和 outputs 都存在  │     ▼               ▼
+│ → self.cache_examples = True │ 赋值         抛 ValueError
+└──────────────────────┘
+                       │
+                       ▼
+        self.cache_examples 为 True 且
+        (fn 是 None 或 outputs 是 None)？
+              /              \
+            是                否
+           /                  \
+          ▼                    ▼
+      抛 ValueError        继续
+                       │
+                       ▼
+        cache_mode 参数是 None 吗？
+              /              \
+            是                否
+           /                  \
+          ▼                    ▼
+┌──────────────────────┐  用传入的 cache_mode
+│ 读 GRADIO_CACHE_MODE   │
+│ 环境变量                │
+│ - "eager" → cache_mode="eager"
+│ - "lazy" → cache_mode="lazy"
+│ - 其他 → cache_mode="eager" + 警告
+└──────────────────────┘
+                       │
+                       ▼
+        self.cache_examples 为 True
+        且 cache_mode == "lazy" 吗？
+              /              \
+            是                否
+           /                  \
+          ▼                    ▼
+self.cache_examples = "lazy"    保持 True
+（从 bool 变成字符串）
+                       │
+                       ▼
+                     完成
 ```
 
-**注意：** `cache_examples` 参数只接受 `True`/`False`，`"lazy"` 是通过 `cache_mode` 参数控制的。
+**判断顺序要点：**
+1. `cache_examples` 的判定优先于 `cache_mode`
+2. 环境变量只有在对应参数为 `None` 时才生效
+3. **参数优先级**：代码显式传参 > 环境变量 > 默认值
+4. 最终 `self.cache_examples` 有三种可能状态：
+   - `False` → 不缓存
+   - `True` → 启用缓存，**eager 模式**
+   - `"lazy"`（字符串）→ 启用缓存，**lazy 模式**
 
-### 3.2 cache_mode 参数判定 ([helpers.py:172-185](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L172-L185))
+---
 
-```python
-# 先检查环境变量 GRADIO_CACHE_MODE
-if self.cache_examples and cache_mode == "lazy":
-    self.cache_examples = "lazy"  # 从 True 变成字符串 "lazy"
-```
-
-最终 `self.cache_examples` 的可能取值：
-- `False` - 不缓存
-- `True` - 启用缓存，**eager 模式**（启动时全部预运行）
-- `"lazy"` - 启用缓存，**lazy 模式**（首次点击时才运行）
-
-### 3.3 缓存目录 ([helpers.py:289-299](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L289-L299))
+### 3.2 缓存目录与重置检查 ([helpers.py:289-299](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L289-L299))
 
 ```python
 self.cache_logger = CSVLogger(simplify_file_data=False, verbose=False, dataset_file_name="log.csv")
 self.cached_folder = utils.get_cache_folder() / str(self.dataset._id)
-# GRADIO_RESET_EXAMPLES_CACHE=True 时删除缓存
+
+# ===== 构造时的一次性重置检查 =====
 if os.environ.get("GRADIO_RESET_EXAMPLES_CACHE") == "True" and self.cached_folder.exists():
     shutil.rmtree(self.cached_folder)
+
 self.cached_file = Path(self.cached_folder) / "log.csv"          # 存输出数据
 self.cached_indices_file = Path(self.cached_folder) / "indices.csv"  # 存已缓存的索引
 ```
 
 默认缓存目录：`.gradio/cached_examples/{dataset_id}/`，可通过环境变量 `GRADIO_EXAMPLES_CACHE` 修改。
+
+**注意：** `GRADIO_RESET_EXAMPLES_CACHE` 只在**构造 Examples 对象时**检查一次，不是每次启动都检查。如果构造完成后再改环境变量不会生效。
+
+---
+
+### 3.3 构造时的 Lazy 模式提示 ([helpers.py:310-319](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L310-L319))
+
+```python
+if self.cache_examples == "lazy":
+    print(f"Will cache examples in '{utils.abspath(self.cached_folder)}' directory at first use.", end="")
+    if Path(self.cached_file).exists():
+        print("If method or examples have changed since last caching, delete this folder to reset cache.")
+    print("\n")
+```
+
+Lazy 模式在构造时就会打印提示，告诉用户缓存目录位置，并提醒如果有旧缓存需要手动删除。
 
 ---
 
@@ -454,3 +533,224 @@ dataset.click
   → load_example (只填输入)
   → (如果 run_on_click=True) .then(fn)  ← 实时跑函数，不存结果
 ```
+
+---
+
+## 13. 旧缓存复用条件与手动重置时机
+
+### 13.1 旧缓存复用的判断逻辑
+
+**位置：** [helpers.py:520-523](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L520-L523)
+
+```python
+if Path(self.cached_file).exists() and example_id is None:
+    print(f"Using cache from '{utils.abspath(self.cached_folder)}' directory. "
+          "If method or examples have changed since last caching, delete this folder to clear cache.\n")
+    return  # 直接返回，不重新缓存
+```
+
+**复用条件（必须同时满足）：**
+1. `log.csv` 文件存在（`Path(self.cached_file).exists()`）
+2. `example_id is None`（表示是**全量缓存**调用，不是单个懒缓存调用）
+
+**这意味着：**
+| 场景 | 是否复用旧缓存 | 说明 |
+|------|---------------|------|
+| Eager 模式启动，且已有 log.csv | ✅ 是 | 直接跳过，不重新运行 |
+| Eager 模式启动，无 log.csv | ❌ 否 | 全部重新运行 |
+| Lazy 模式，首次点击 example 3 | ❌ 否 | 即使有全量 log.csv，也会**追加**一行新的（example_id=3 不为 None） |
+| Lazy 模式，已有 indices.csv 包含该索引 | ✅ 是 | 直接从 log.csv 读 |
+
+**⚠️ 重要提示：** Gradio 不会检查缓存内容是否过期。如果你的函数逻辑、模型权重或示例数据变了，但 log.csv 还在，Eager 模式会继续使用旧缓存，不会自动重新生成。
+
+---
+
+### 13.2 何时需要手动重置缓存
+
+**需要手动重置的场景：**
+
+| 场景 | 重置方法 |
+|------|---------|
+| 函数逻辑修改了 | 删除 `.gradio/cached_examples/{dataset_id}/` 目录 |
+| 模型权重更新了 | 同上 |
+| 示例输入数据变了 | 同上 |
+| 输出组件类型/数量变了 | 同上（表头不匹配会报错） |
+| preprocess/postprocess 参数改了 | 同上 |
+| 想强制重新生成缓存 | 启动前设 `GRADIO_RESET_EXAMPLES_CACHE=True` |
+
+**重置方式对比：**
+
+| 方式 | 作用时机 | 影响范围 |
+|------|---------|---------|
+| `GRADIO_RESET_EXAMPLES_CACHE=True` | Examples 构造时 | 所有 Examples 组件的缓存目录（只要存在就删） |
+| 手动删除单个 `{dataset_id}` 目录 | 任何时候 | 只影响特定 Examples 组件 |
+| 删除整个 `.gradio/cached_examples/` | 任何时候 | 所有 Examples 组件的所有缓存 |
+
+---
+
+### 13.3 缓存失效机制的缺失
+
+当前实现**没有**以下机制：
+- ❌ 没有缓存时间戳检查（不会自动过期）
+- ❌ 没有内容 hash 校验（不会检测函数/数据变化）
+- ❌ 没有版本号机制（不会检测代码版本变化）
+- ❌ 没有增量更新（要么全用旧的，要么全重新生成）
+
+这是因为 Examples 缓存本质是**简单的磁盘持久化**，不是 `@gr.cache` 那样的内容感知缓存系统。
+
+---
+
+## 14. 懒缓存单独路径的设计原因
+
+Lazy 模式不是简单的「启动时不跑，点击时再跑」，它在多个关键点都有特殊处理，有其深层的技术原因。
+
+---
+
+### 14.1 原因一：启动时机不同 — `_start_caching` 的类型判断
+
+**位置：** [helpers.py:497-510](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L497-L510)
+
+```python
+async def _start_caching(self):
+    if self.cache_examples:
+        # ... 校验 ...
+        if self.cache_examples is True:   # ⚠️  注意这里是 `is True`，不是 `== True`
+            await self.cache()            # 只有 bool 类型的 True 才会在启动时执行
+```
+
+关键：**`self.cache_examples is True`** 用的是身份判断（`is`），不是值判断（`==`）。
+- `True is True` → `True` → Eager 模式执行
+- `"lazy" is True` → `False` → Lazy 模式跳过
+
+这就是为什么 Lazy 模式不在启动时预运行，只能在用户点击时通过 `load_from_cache()` 触发。
+
+---
+
+### 14.2 原因二：组件初始化问题 — Issue #12564
+
+**位置：** [helpers.py:556-565](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L556-L565)
+
+```python
+# When caching examples lazily, set in_event_listener to False
+# so that all components are properly instantiated
+# See https://github.com/gradio-app/gradio/issues/12564
+prediction = await self.root_block.process_api(
+    block_fn=self.root_block.default_config.fns[fn_index],
+    inputs=processed_input,
+    request=None,
+    in_event_listener=self.cache_examples != "lazy",  # eager=True, lazy=False
+)
+```
+
+#### 深层原理：`in_event_listener` 与组件元类
+
+**位置：** [component_meta.py:162-195](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/component_meta.py#L162-L195)
+
+```python
+def get_local_contexts():
+    return (
+        LocalContext.in_event_listener.get(False),
+        LocalContext.renderable.get(None) is not None,
+    )
+
+def updateable(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        # ... 记录 constructor_args ...
+        in_event_listener, is_render = get_local_contexts()
+        
+        # ⚠️  关键判断
+        if in_event_listener and initialized_before and not is_render:
+            return None  # 跳过 __init__，不重新初始化组件！
+        
+        return fn(self, **kwargs)
+    return wrapper
+```
+
+组件的 `__init__` 被 `@updateable` 装饰器包裹。当三个条件同时满足时：
+1. `in_event_listener = True`（在事件监听器中）
+2. `initialized_before = True`（组件已经初始化过）
+3. `is_render = False`（不在渲染阶段）
+
+→ **组件 `__init__` 直接返回 `None`，不执行初始化！**
+
+#### Eager vs Lazy 的上下文差异
+
+| 模式 | 执行时机 | `is_render` | `in_event_listener` | 结果 |
+|------|---------|------------|---------------------|------|
+| Eager | 启动时（render 阶段之前/之中） | `True` | `True` | `is_render=True` → 条件不成立 → 正常初始化 |
+| Lazy | 用户点击时（render 已完成） | `False` | ❌ 如果设 `True` | 三个条件全满足 → `__init__` 跳过后，组件属性缺失 → Bug |
+| Lazy | 用户点击时（render 已完成） | `False` | ✅ 设 `False` | `in_event_listener=False` → 条件不成立 → 正常初始化 |
+
+**这就是 Lazy 模式必须单独设置 `in_event_listener=False` 的根本原因。** 如果和 Eager 模式一样传 `True`，在用户点击时（render 已结束）调用函数，函数内部如果创建新组件实例（如 `gr.Textbox()`），这些组件将不会正确初始化。
+
+---
+
+### 14.3 原因三：预加载（preload）不支持 Lazy
+
+**位置：** [helpers.py:392-395](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L392-L395)
+
+```python
+if (self.preload is not False
+    and self.cache_examples != "lazy"   # ⚠️  Lazy 模式跳过 preload
+    and self.root_block
+    and not any("value" in inp.constructor_args for inp in self.inputs_with_examples)):
+```
+
+Lazy 模式不支持 preload，因为 preload 是页面加载时自动填充输出，但 Lazy 模式在点击之前还没有缓存结果，无法预加载。
+
+---
+
+### 14.4 原因四：缓存文件的读写逻辑不同
+
+| 方面 | Eager 模式 | Lazy 模式 |
+|------|-----------|-----------|
+| 写入时机 | 启动时一次性全部写入 | 点击时逐个追加写入 |
+| 写入顺序 | 与 examples 列表顺序一致 | 与用户点击顺序一致 |
+| `indices.csv` 作用 | 冗余（顺序一致），但仍写入 | 必需（映射 example_id 到行号） |
+| 旧缓存判断 | `log.csv.exists() and example_id is None` → 全量复用 | 查 `indices.csv` 中是否有该 example_id |
+| 旧缓存行为 | 存在就全用，不追加 | 即使有全量缓存，点击未命中的也会追加 |
+
+如果 Lazy 模式复用 Eager 的全量缓存逻辑，会导致：
+- 用户点击 example #5，Eager 模式已经缓存过 → 应该直接命中
+- 但如果 Eager 缓存是旧的（函数改了），用户希望 Lazy 模式重新跑 → 需要手动删缓存
+
+当前实现中 Lazy 模式**不会**主动检查和复用 Eager 模式生成的全量缓存，每个 example 被点击时：
+1. 先查 `indices.csv` → 如果有，直接读 `log.csv` 对应行
+2. 如果没有 → 调用 `cache(example_id)` 重新运行并追加
+
+这意味着如果先以 Eager 模式运行过生成了全量缓存，再切换到 Lazy 模式，**旧缓存仍然可以被命中**（因为 `indices.csv` 和 `log.csv` 都存在）。但如果代码变了，旧缓存的结果就是错的，需要手动删除。
+
+---
+
+### 14.5 原因五：`self.cache_examples` 类型变化带来的分支
+
+`self.cache_examples` 从 `bool` 变成字符串 `"lazy"` 是一个巧妙的设计：
+
+```python
+# 构造时
+if self.cache_examples and cache_mode == "lazy":
+    self.cache_examples = "lazy"  # bool → str
+
+# 使用时
+if self.cache_examples:            # True 和 "lazy" 都 truthy
+    # 所有启用缓存的通用逻辑
+    
+if self.cache_examples is True:    # 只有 Eager
+    # 启动时预缓存
+    
+if self.cache_examples == "lazy":  # 只有 Lazy
+    # Lazy 专用逻辑
+```
+
+用一个变量同时表示「是否启用」和「启用哪种模式」，避免了引入 `self.cache_enabled` + `self.cache_mode` 两个变量。代价是类型不一致（bool 或 str），需要用 `is` 和 `==` 小心区分。
+
+---
+
+### 14.6 为什么不统一路径？
+
+理论上可以把 Eager 模式实现为「启动时遍历所有 example_id，逐个调用懒缓存逻辑」，但当前分开实现有以下考量：
+
+1. **性能**：Eager 模式批量处理可以共享临时事件（只创建一次 `fn_index`，处理完所有 example 再删除），逐个调用懒缓存逻辑会反复创建/删除临时事件，性能差。
+2. **历史演进**：Eager 模式先实现，Lazy 是后来加的功能（从 Issue #12564 的修复可以看出），为了不破坏已有逻辑，单独走分支更安全。
+3. **错误处理**：Eager 模式启动时出错会直接抛出，阻止应用启动；Lazy 模式点击时出错只影响单个示例，不影响整体可用性。
