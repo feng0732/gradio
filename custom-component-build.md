@@ -718,54 +718,153 @@ SSR 回退的关键特征：
 - **不发起任何网络请求**：直接返回内置 fallback，性能零开销
 - **对组件透明**：`load_component` 的外层 try/catch 根本不会感知到这次回退，因为 `get_component_with_css` 正常返回了一个 Promise 数组
 
-#### 6.2.2 Example 变体兜底回退（在 load_component 最外层 catch）
+#### 6.2.2 Example 变体兜底回退：同步失败 vs 异步失败
 
-**位置**：[component_loader.js L60-L73](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/component_loader.js#L60-L73)
+**位置**：[component_loader.js L45-L73](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/component_loader.js#L45-L73)
 
-这是**第二层**回退，当 `get_component_with_css` 本身抛出异常（例如 HTTP 404、网络错误、JS 语法错误等）时才会触发：
+Example 变体的回退逻辑嵌套在两层 try/catch 中。理解它的关键是区分**同步失败**和**异步失败**——这两种情况的行为完全不同。
 
 ```javascript
-try {
-    const cc = get_component_with_css(api_url, _id, variant);
-    // ... 正常处理 ...
-} catch (e) {
-    // 只有 example 变体才兜底
-    if (variant === "example") {
-        request_map[`${_id}-${variant}`] = import("@gradio/fallback/example");
+export function load_component({ api_url, name, id, variant }) {
+    // ... 缓存检查（见 6.2.4） ...
 
-        return {
-            name,
-            component: request_map[`${_id}-${variant}`],
-            runtime: runtime_map[`${_id}-${variant}`]  // 潜在问题：此处 runtime 可能未定义！
-        };
+    try {
+        // ========== 第 1 层 try：从静态映射表加载 ==========
+        if (!_component_map?.[_id]?.[variant] && !_component_map?.[name]?.[variant])
+            throw new Error();  // ← 同步抛出（情况 A）
+
+        request_map[`${_id}-${variant}`] = (
+            _component_map?.[_id]?.[variant] ||
+            _component_map?.[name]?.[variant]
+        )();
+        return { name, component: ..., runtime: ... };
+    } catch (e) {
+        // ========== 第 1 层 catch ==========
+        if (!_id) throw new Error(`Component not found: ${name}`);
+        try {
+            // ========== 第 2 层 try：HTTP 动态加载 ==========
+            const cc = get_component_with_css(api_url, _id, variant);
+            const [component_module, svelte_runtime_module] = cc;
+            request_map[`${_id}-${variant}`] = component_module;
+            runtime_map[`${_id}-${variant}`] = svelte_runtime_module;
+            return { name, component: ..., runtime: ... };
+        } catch (e) {
+            // ========== 第 2 层 catch：example fallback ==========
+            if (variant === "example") {
+                request_map[`${_id}-${variant}`] = import("@gradio/fallback/example");
+                return {
+                    name,
+                    component: request_map[`${_id}-${variant}`],
+                    runtime: runtime_map[`${_id}-${variant}`]  // ← 潜在 bug：undefined！
+                };
+            }
+            console.error(`failed to load: ${name}`);
+            throw e;
+        }
     }
-    // 主组件或 base 变体：直接抛出错误
-    console.error(`failed to load: ${name}`);
-    console.error(e);
-    throw e;
 }
 ```
 
-**回退条件**（必须同时满足）：
-1. 前面所有加载方式都失败（`_component_map` 找不到，`get_component_with_css` 抛出异常）
-2. `variant === "example"`
+##### 情况 A：同步失败（第 1 层 try 中 throw）
 
-**主组件（`variant === "component"`）加载失败时无回退**，直接 `throw e`。这意味着：
-- `gr.Examples` 中展示的示例组件加载失败 → 使用 JSON 形式兜底显示（不影响主界面）
-- 用户界面中的实际组件加载失败 → 控制台报错，组件区域空白或异常
+当 `_component_map` 中找不到对应组件（既不是内置组件，也不是开发模式注入的自定义组件）时，执行 `throw new Error()`，这是**同步抛出**：
 
-**潜在缺陷**：example 回退分支中返回的 `runtime: runtime_map[`${_id}-${variant}`]` 没有被赋值过（因为前面的 try 分支走的是异常路径），实际值为 `undefined`，可能导致 `MountCustomComponent` 中 `await node.runtime` 出问题。
+1. 立即进入第 1 层 catch
+2. 第 1 层 catch 尝试调用 `get_component_with_css()`
+3. **关键：`get_component_with_css()` 永远不会同步抛出**
+   - 浏览器环境：直接返回 `[Promise, Promise]`（构造 URL 字符串不抛异常）
+   - SSR 环境：直接返回 `[import("@gradio/fallback"), Promise.resolve(false)]`
+4. 返回值被正常解构并存入 `request_map` / `runtime_map`
+5. **不会进入第 2 层 catch**
+
+**结论：同步失败不会触发 example fallback！**
+
+##### 情况 B：异步失败（HTTP 请求 / import 失败）
+
+当 `get_component_with_css()` 正常返回 Promise，但这些 Promise 在后续执行中 reject 时（例如 HTTP 404、网络断开、JS 语法错误导致 import 失败）：
+
+1. Promise reject 发生在 `load_component()` 函数**返回之后**
+2. try/catch 只能捕获同步异常，对异步 Promise reject **完全无效**
+3. 这些 reject 的 Promise 已经被存入 `request_map` 缓存
+4. 调用方（`MountComponents.svelte`、`Dataset.svelte` 等）在 `await node.component` 时才会遇到错误
+5. **不会进入第 2 层 catch**
+
+**结论：异步失败也不会触发 example fallback！**
+
+##### Example Fallback 实际可达性
+
+经过上述分析，example fallback 分支（第 2 层 catch）**在当前实现中几乎是不可达代码**。只有当 `get_component_with_css()` 本身同步抛出时才会触发，但它的实现中没有任何同步 throw 的路径。
+
+**example 变体加载失败的实际表现**：
+- Promise reject → 调用方 `await` 时出错
+- `MountComponents.svelte` 中 `let component = $derived(await node.component)` 出错
+- 由于 `{#if node && component}` 判断，`component` 为 falsy，组件区域**空白不显示**
+- **不会**自动切换为 `@gradio/fallback/example`
+
+**潜在缺陷**：
+- fallback 分支中 `runtime: runtime_map[`${_id}-${variant}`]` 在该路径下从未被赋值，返回 `undefined`
+- 即使 fallback 被触发，`MountCustomComponent` 中 `await node.runtime` 也会出问题
 
 #### 6.2.3 两种回退的对比
 
 | 维度 | SSR 强制回退 | Example 兜底回退 |
 |-----|------------|----------------|
-| 代码位置 | `get_component_with_css()` 函数内部入口判断 | `load_component()` 最外层 catch |
-| 触发条件 | `is_browser === false`（Node.js 环境） | 所有加载方式失败且 `variant === "example"` |
+| 代码位置 | `get_component_with_css()` 函数内部入口判断 | `load_component()` 第 2 层 catch |
+| 触发条件 | `is_browser === false`（Node.js 环境） | `get_component_with_css()` 同步抛出 **且** `variant === "example"` |
+| 实际可达性 | ✅ 每次 SSR 必然触发 | ❌ 几乎不可达（`get_component_with_css` 从不同步抛出） |
 | 回退组件 | `@gradio/fallback`（主组件变体） | `@gradio/fallback/example`（示例变体） |
-| runtime 返回值 | `Promise.resolve(false)` | `runtime_map[...]`（可能为 `undefined`） |
+| runtime 返回值 | `Promise.resolve(false)` | `runtime_map[...]`（几乎必为 `undefined`） |
 | 是否抛异常 | ❌ 正常返回 | ❌ 静默处理（只打 log） |
-| 触发方式 | 每次 SSR 加载都必然触发 | 仅在异常情况下触发 |
+| 处理时机 | 同步阶段立即返回 | 同步阶段 catch |
+
+#### 6.2.4 缓存机制：失败结果被缓存后不再重试
+
+**缓存检查位置**：[component_loader.js L20-L26](file:///d:/fz/0601/solo-dogfeeding/code/250-gradio/js/build/out/component_loader.js#L20-L26)
+
+```javascript
+if (request_map[`${_id}-${variant}`]) {
+    return {
+        component: request_map[`${_id}-${variant}`],
+        name,
+        runtime: runtime_map[`${_id}-${variant}`]
+    };
+}
+```
+
+缓存的核心问题：**`request_map` 存储的是 Promise 本身，不区分 resolve 还是 reject**。
+
+##### 缓存流程图
+
+```
+第 1 次调用 load_component(id, "example")
+    ├─ request_map 为空 → 跳过缓存检查
+    ├─ 第 1 层 try → 失败（_component_map 找不到）
+    ├─ 第 1 层 catch → get_component_with_css()
+    │   └─ 返回 [reject_Promise, reject_Promise]   （HTTP 404 等）
+    ├─ request_map[id-example] = reject_Promise   ← 失败结果被缓存！
+    └─ 返回 { component: reject_Promise, runtime: reject_Promise }
+                ↓
+调用方 await node.component → 出错（Promise reject）
+                ↓
+第 2 次调用 load_component(id, "example")
+    ├─ request_map[id-example] 已存在 → ✅ 缓存命中
+    ├─ 直接返回同一个 reject_Promise（不做任何重试！）
+    └─ 调用方 await → 再次得到同一个错误
+                ↓
+           （无限循环，永不重试）
+```
+
+##### 缓存导致的具体问题
+
+| 缓存内容 | 后续调用表现 | 用户可见影响 |
+|---------|------------|------------|
+| 成功 resolve 的 Promise | ✅ 正常复用缓存，性能良好 | 组件正常显示 |
+| **reject 的 Promise**（HTTP 失败） | ❌ 反复返回同一个错误，永不重试 | 组件永久空白，刷新页面才恢复 |
+| fallback 的 Promise（理论可达） | ❌ 永久使用 fallback，不再尝试真实组件 | 示例区永远显示 JSON |
+
+**为什么不做重试？** 设计上可能假设组件加载要么成功要么永久失败（例如组件包确实没装、URL 确实不存在），但实际场景中网络抖动、临时 404（后端还没启动好）等 transient 错误都可能导致组件永久空白。
+
+**唯一的恢复方式**：刷新整个页面，`request_map` 是模块级变量，页面刷新后 JS 模块重新加载，缓存才被清空。
 
 ### 6.3 SSR 回退的设计意图与两阶段渲染流程
 
@@ -794,13 +893,66 @@ SSR 回退的根本原因是 Node.js 的技术限制，但设计上形成了**�
 
 ### 6.4 回退触发场景总结
 
-| 场景 | 回退组件 | 是否用户可见 | 说明 |
-|------|---------|------------|------|
+| 场景 | 回退组件 | 是否用户可见 | 实际行为 |
+|------|---------|------------|---------|
 | `gradio cc create` 空白模板 | `gradio.components.Fallback` | 否 | 创建组件时基于其复制代码 |
-| Example 组件加载完全失败 | `@gradio/fallback/example` | 是（示例区） | 兜底分支 catch，HTTP 请求或解析失败 |
-| SSR 服务端渲染（所有自定义组件） | `@gradio/fallback` | 短暂可见 | `get_component_with_css` 入口直接返回 |
-| 主组件（variant=component）加载失败 | **无回退** | 是（报错/空白） | 直接 `throw e`，无兜底 |
+| SSR 服务端渲染（所有自定义组件） | `@gradio/fallback` | 短暂可见 | `get_component_with_css` 入口直接返回，客户端水化后替换为真实组件 |
+| Example 组件同步加载失败 | 理论上 `@gradio/fallback/example` | ❌ 几乎不可达 | `get_component_with_css()` 从不同步抛出，第 2 层 catch 难以触发 |
+| Example 组件异步加载失败 | **无回退** | 是（组件空白） | Promise reject 超出 try/catch 范围，调用方 await 出错导致空白 |
+| 主组件（variant=component）加载失败 | **无回退** | 是（报错/空白） | 无兜底，Promise reject 直接向上冒泡 |
 | 内置组件加载失败 | **无回退** | 是（报错/空白） | 不在 fallback 处理范围内 |
+
+### 6.5 Example 组件失败的完整处理流程（端到端）
+
+以 `gr.Examples` 或 `gr.Dataset` 中的自定义组件示例加载失败为例，完整调用链：
+
+```
+Python: gr.Examples(examples, inputs=[MyCustomComponent])
+    ↓
+后端 config 返回组件类型和 component_class_id
+    ↓
+前端 Dataset.svelte 调用 get_component_meta()
+    ↓
+① load_component(name, "example", class_id)          ← shared_props 包装层
+    ↓
+② get_component(name, class_id, api_url, "example")   ← init_utils.ts 桥梁
+    ↓
+③ load_component({api_url, name, id, variant:"example"})  ← virtual:component-loader
+    │
+    ├─ 缓存检查 request_map → 空（首次调用）
+    │
+    ├─ 第 1 层 try: _component_map 查找
+    │     └─ 失败：自定义组件不在内置映射中 → throw new Error()
+    │
+    ├─ 第 1 层 catch:
+    │     └─ get_component_with_css(api_url, id, "example")
+    │           └─ 返回 [Promise<index.js>, Promise<svelte_runtime_entry.js>]
+    │
+    ├─ request_map[id-example] = Promise<index.js>   ← 存入缓存
+    ├─ runtime_map[id-example] = Promise<runtime>
+    └─ return { component: Promise, runtime: Promise }
+                ↓
+④ Dataset.svelte 保存 Promise，等待渲染
+                ↓
+⑤ 浏览器发起 HTTP 请求
+    ├─ GET /custom_component/{id}/client/example/style.css      → 404 ❌
+    ├─ GET /custom_component/{id}/client/example/index.js       → 404 ❌
+    └─ GET /custom_component/{id}/client/example/svelte_runtime_entry.js → 404 ❌
+                ↓
+⑥ Promise.all reject（style.css 或 index.js 失败）
+    ├─ Promise<index.js> → reject(Error)
+    └─ Promise<runtime> → reject(Error)
+                ↓
+⑦ MountComponents.svelte: $derived(await node.component)
+    └─ await reject_Promise → 出错 → component = undefined
+                ↓
+⑧ {#if node && component} → 条件不满足
+    └─ 不渲染任何内容 → 用户看到**空白区域**
+                ↓
+⑨ 用户刷新页面
+    ├─ request_map 重置（JS 模块重新加载）
+    └─ 重新走 ①~⑧ 流程
+```
 
 ---
 
