@@ -8,22 +8,29 @@
 
 ### 1.1 协议版本
 
-Gradio 支持多种通信协议，在 [Config](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/data_classes.py#L402-L404) 中定义：
+Gradio 支持多种通信协议，协议类型定义在 [data_classes.py:403](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/data_classes.py#L403)：
 
 ```typescript
 protocol: "ws" | "sse" | "sse_v1" | "sse_v2" | "sse_v2.1" | "sse_v3"
 ```
 
-各版本演进历史（从旧到新）：
+**当前服务端实际只使用 `sse_v3`**，硬编码在 [blocks.py:2404](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/blocks.py#L2404)：
 
-| 版本 | 核心变化 | 连接模式 |
-|------|---------|---------|
-| **ws** | WebSocket 协议（已弃用） | 双向长连接 |
-| **sse** | 初代 SSE，每次请求独立建连 | 一请求一连接 |
-| **sse_v1** | 引入 event_id，会话级连接复用 | 一会话一连接 |
-| **sse_v2** | 增加增量 diff 输出，减小传输量 | 一会话一连接 |
-| **sse_v2.1** | v2 的小幅优化 | 一会话一连接 |
-| **sse_v3** | 服务端控制流关闭时机，更稳定 | 一会话一连接 |
+```python
+"protocol": "sse_v3",
+```
+
+各协议版本的历史和现状：
+
+| 版本 | 状态 | 说明 |
+|------|------|------|
+| **ws** | ❌ 已弃用 | 客户端遇到直接抛异常 [submit.ts:78-79](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L78-L79) |
+| **sse** | ⚠️ 客户端遗留兼容 | 客户端有分支逻辑，但**当前服务端不返回此值、不支持此协议** |
+| **sse_v1** | ✅ 可用 | 引入 event_id + 会话级连接复用 |
+| **sse_v2/v2.1** | ✅ 可用 | 在 v1 基础上增加增量 diff 输出 |
+| **sse_v3** | ✅ 当前默认 | 服务端控制流关闭时机，更稳定 |
+
+> **关键事实**：`sse` 协议在当前代码库中是**客户端单向兼容逻辑**。服务端永远不会返回 `protocol: "sse"`（始终返回 `"sse_v3"`），所以客户端的 `sse` 分支是死代码。详见 [3.3 节](#33-旧版-sse-客户端遗留兼容逻辑) 分析。
 
 ### 1.2 核心模块
 
@@ -33,20 +40,33 @@ protocol: "ws" | "sse" | "sse_v1" | "sse_v2" | "sse_v2.1" | "sse_v3"
 | submit 函数 | [submit.ts](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts) | 任务提交核心，区分协议版本处理 |
 | predict 函数 | [predict.ts](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/predict.ts) | 基于 submit 的 Promise 封装 |
 | open_stream | [stream.ts](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/stream.ts) | 建立会话级 SSE 长连接，消息分发 |
+| handle_message | [api_info.ts:234-404](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/helpers/api_info.ts#L234-L404) | 服务端消息到客户端事件的转换 |
 | Queue 类 | [queueing.py](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/queueing.py) | 服务端队列管理，消息推送 |
 | API 路由 | [routes.py](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/routes.py) | HTTP 接口定义，SSE 响应 |
 
-### 1.3 核心数据结构
+### 1.3 常量映射
+
+[constants.ts](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/constants.ts) 中定义的端点常量，容易混淆：
+
+| 常量名 | 值 | 用途 | 使用者 |
+|--------|---|------|--------|
+| `SSE_DATA_URL` | `"queue/join"` | **提交**任务的 POST 端点 | sse_v1+ 分支 |
+| `SSE_URL` | `"queue/data"` | **接收**结果的 SSE GET 端点 | sse / sse_v1+ 分支 |
+| `SSE_URL_V0` | `"queue/join"` | 旧版提交端点 | **未被引用，死常量** |
+| `SSE_DATA_URL_V0` | `"queue/data"` | 旧版数据端点 | **未被引用，死常量** |
+
+### 1.4 核心数据结构
 
 **客户端会话状态**（Client 类成员）：
 
 ```typescript
-session_hash: string           // 客户端会话标识，随机生成
-stream_status: { open: boolean } // SSE 流是否打开
+session_hash: string                        // 客户端会话标识，随机生成
+stream_status: { open: boolean }            // SSE 流是否打开
 event_callbacks: Record<event_id, callback> // 事件ID -> 回调函数
 pending_stream_messages: Record<event_id, msg[]> // 早到消息缓存
-unclosed_events: Set<event_id> // 未关闭的事件集合
-pending_diff_streams: Record<event_id, data[]> // diff 流的累积状态
+unclosed_events: Set<event_id>              // 未关闭的事件集合
+pending_diff_streams: Record<event_id, data[]>   // diff 流的累积状态
+abort_controller: AbortController | null    // 用于中止 fetch 请求
 ```
 
 **服务端会话状态**（Queue 类成员）：
@@ -157,20 +177,20 @@ class FileData(GradioModel):
 
 ## 3. 任务提交：各协议版本对比
 
-### 3.1 总览：各版本提交与收尾方式
+### 3.1 总览：当前有效的提交与收尾方式
 
-| 协议版本 | 提交方式 | SSE 连接模型 | 流建立时机 | 流关闭时机 |
-|---------|---------|-------------|-----------|-----------|
-| **非队列** | `POST /run/{api}` | 无 SSE | - | 请求结束即结束 |
-| **sse** | `GET /queue/data?fn_index=...&session_hash=...` | 一请求一连接 | 提交时建立 | 数据+complete 都到达后客户端关闭 |
-| **sse_v1** | `POST /queue/join` + `GET /queue/data?session_hash=...` | 一会话一连接 | 首次请求时建立 | 会话内所有事件完成后服务端发 close_stream |
-| **sse_v2** | 同 sse_v1 | 一会话一连接 | 同 sse_v1 | 同 sse_v1 + 支持 diff |
-| **sse_v2.1** | 同 sse_v1 | 一会话一连接 | 同 sse_v1 | 同 sse_v2 |
-| **sse_v3** | 同 sse_v1 | 一会话一连接 | 同 sse_v1 | **仅服务端发送 close_stream 才关闭** |
+| 协议版本 | 提交入口 | 结果接收 | 单请求迭代器收尾 | SSE 连接关闭 |
+|---------|---------|---------|----------------|-------------|
+| **非队列** | `POST /run/{api}` | 同步 HTTP 响应 | 响应返回即结束 | 无 SSE 连接 |
+| **sse_v1** | `POST /queue/join` → event_id | `GET /queue/data` SSE 流 | callback 检测 complete/error 后 `close()` | 服务端发 `close_stream` |
+| **sse_v2/v2.1** | 同 sse_v1 | 同 sse_v1 | 同 sse_v1 + diff 增量 | 同 sse_v1 |
+| **sse_v3** | 同 sse_v1 | 同 sse_v1 | 同 sse_v1 | **仅服务端发 close_stream 才关** |
+
+> **`close()` vs 关闭 SSE 连接**：`close()` 只是结束本请求的 AsyncIterator 迭代（设 `done = true`），**不会关闭 SSE 连接**。SSE 连接的关闭由服务端的 `close_stream` 消息控制。
 
 ### 3.2 非队列模式（直接调用）
 
-**适用条件**：`config.enable_queue = false` 或 `dependency.queue = false`
+**适用条件**：`skip_queue(fn_index, config)` 返回 true
 
 **提交** [submit.ts:188-265](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L188-L265)：
 
@@ -196,62 +216,36 @@ async def predict(api_name, body, request, username):
 - 无状态维护，无 SSE 连接
 - 不支持生成器函数的中间输出
 
-### 3.3 旧版 SSE（sse）
+### 3.3 旧版 SSE（客户端遗留兼容逻辑）
 
-**提交方式** [submit.ts:266-394](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L266-L394)：
+**代码位置** [submit.ts:266-394](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L266-L394)
 
-直接以 SSE 方式连接 `/queue/data`，同时携带 `fn_index` 和 `session_hash` 参数：
+**事实：当前服务端不支持此协议分支，它是客户端的遗留兼容代码。** 依据如下：
 
-```typescript
-// sse 版本：一次请求对应一条 SSE 连接
-let url = new URL(
-    `${config.root}/${SSE_URL}?fn_index=${fn_index}&session_hash=${session_hash}`
-);
-stream = this.stream(url);  // 为每个请求单独建立 EventSource
-```
+1. **服务端硬编码 `protocol: "sse_v3"`** [blocks.py:2404](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/blocks.py#L2404)，永远不会返回 `"sse"`
+2. **服务端消息类型不包含 `send_hash` / `send_data`** — [server_messages.py](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/server_messages.py) 只有 `estimation`、`process_starts`、`process_generating`、`process_completed`、`heartbeat`、`close_stream`、`unexpected_error`、`progress`、`log`
+3. **服务端 `GET /queue/data` 只接收 `session_hash` 参数** [routes.py:1463-1467](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/routes.py#L1463-L1467)，不使用 `fn_index`，不支持旧版 sse 那种带 `fn_index` 的建连方式
+4. **`SSE_URL_V0` 和 `SSE_DATA_URL_V0` 常量未被任何代码引用**，是死常量
 
-**服务端处理**：
-- SSE 连接建立后，服务端自动将任务入队
-- 相当于把 "提交" 和 "接收" 合在一个 SSE 连接里完成
+**客户端 `sse` 分支的设计意图**（基于代码推测，但当前不可达）：
 
-**消息交互**：
-1. 连接建立后，服务端先推送 `send_hash` / `estimation` 等状态消息
-2. 当收到 `send_data` 消息时，客户端需要额外 `POST /queue/data` 提交实际数据
-3. 然后继续在同一条 SSE 流上接收结果
+- 客户端直接 `GET /queue/data?fn_index=X&session_hash=Y` 建立 SSE 连接
+- 通过 SSE 流收到 `send_data` 消息后，再 `POST /queue/data` 提交实际数据
+- 每个请求一条独立 SSE 连接，不共享
+- 客户端收到 `process_completed` 后主动 `stream.close()` 关闭本连接
+- `handle_message` 中对 `send_data` 和 `send_hash` 的处理 [api_info.ts:256-259](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/helpers/api_info.ts#L256-L259) 是为这个分支预留的
 
-```
-客户端                                服务端
-   |                                     |
-   |--- GET /queue/data?fn_index=X&session_hash=Y -->|
-   |                                     |
-   |<--- msg: "send_hash" ---------------|   (让客户端发送 session_hash)
-   |                                     |
-   |<--- msg: "estimation" --------------|   (队列位置估计)
-   |                                     |
-   |<--- msg: "send_data" ---------------|   (要求客户端发送数据)
-   |                                     |
-   |--- POST /queue/data { data, event_id } -->|  (提交实际输入数据)
-   |                                     |
-   |<--- msg: "process_starts" ----------|
-   |<--- msg: "process_generating" ------|  (可选，生成器)
-   |<--- msg: "process_completed" -------|
-   |                                     |
-   | 客户端检测到 complete，关闭流       |
-   |--- EventSource.close() ------------|
-```
+**结论**：`sse` 分支是为兼容早期 Gradio 版本（可能使用 v0 格式）保留的，当前服务端部署不可能走到这个分支。
 
-**收尾机制**：
-- 客户端收到 `process_completed` 且 data 也到达后，主动调用 `stream.close()`
-- 每条请求独立关闭，不影响其他请求
-- **缺点**：并发多个请求需要建立多条 SSE 连接，资源开销大
+### 3.4 SSE v1+：当前唯一有效的队列协议
 
-### 3.4 SSE v1：会话级连接复用
+**代码位置** [submit.ts:395-631](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L395-L631)
 
-**核心变化** [submit.ts:395-631](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L395-L631)：
+sse_v1、sse_v2、sse_v2.1、sse_v3 共用同一个分支，核心流程一致：
 
-1. 提交和接收分离：先 POST 提交拿 event_id，再通过共享 SSE 流接收
-2. 同一个 session_hash 共用一条 SSE 连接
-3. 每条消息带 event_id，客户端按 event_id 分发到对应回调
+1. **提交和接收分离**：先 POST 提交拿 event_id，再通过共享 SSE 流接收
+2. **会话级连接复用**：同一个 `session_hash` 共用一条 SSE 连接
+3. **消息带 event_id**：客户端按 event_id 分发到对应回调
 
 **提交流程**：
 
@@ -271,18 +265,15 @@ stream = this.stream(url);  // 为每个请求单独建立 EventSource
    |<--- msg: "process_completed" (event_id: "abc123")
 ```
 
-**提交代码** [submit.ts:427-436](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L427-L436)：
+**提交代码** [submit.ts:429-436](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L429-L436)：
 
 ```typescript
-// sse_v1+：先 POST 提交数据，拿到 event_id
-post_data(`${config.root}/${SSE_DATA_URL}?${url_params}`, {
+post_data(`${config.root}${api_prefix}/${SSE_DATA_URL}?${url_params}`, {
     ...payload,       // { data, fn_index, event_data, ... }
     session_hash
 })
-// 返回 { event_id: "xxx" }
+// SSE_DATA_URL = "queue/join"
 ```
-
-> 注意：常量名容易混淆。`SSE_DATA_URL = "queue/join"` 是**提交数据**的端点；`SSE_URL = "queue/data"` 是**SSE 接收**的端点。
 
 **服务端提交路由** [routes.py:1357-1399](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/routes.py#L1357-L1399)：
 
@@ -305,9 +296,9 @@ async def queue_join(body, request, username):
 7. 事件加入 `event_queue_per_concurrency_id` 等待调度
 8. 广播队列位置估计（`EstimationMessage`）
 
-### 3.5 SSE v2/v2.1：增量 Diff 输出
+### 3.5 sse_v1 与 sse_v2/v2.1/v3 的差异：增量 Diff 输出
 
-**核心变化**：生成器函数的中间结果只发送增量 diff，减少数据传输量。
+sse_v2+ 在 v1 基础上增加了一个优化：生成器函数的中间结果只发送增量 diff，减少数据传输量。
 
 **Diff 格式** [stream.ts:121-178](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/stream.ts#L121-L178)：
 
@@ -329,7 +320,6 @@ async def queue_join(body, request, username):
 **客户端累积** [stream.ts:101-119](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/stream.ts#L101-L119)：
 
 ```typescript
-// apply_diff_stream 为每个 event_id 维护完整状态
 function apply_diff_stream(pending_diff_streams, event_id, data) {
     if (!pending_diff_streams[event_id]) {
         // 首次：保存完整数据
@@ -350,55 +340,55 @@ function apply_diff_stream(pending_diff_streams, event_id, data) {
 ```typescript
 if (
     data &&
-    dependency.connection !== "stream" &&  // 非 stream 连接
+    dependency.connection !== "stream" &&  // 非 stream 连接类型
     ["sse_v2", "sse_v2.1", "sse_v3"].includes(protocol)
 ) {
     apply_diff_stream(pending_diff_streams, event_id!, data);
 }
 ```
 
-### 3.6 SSE v3：服务端控制流关闭
+### 3.6 sse_v3 与 sse_v1/v2 的差异：SSE 连接关闭策略
 
-**核心变化**：只有当服务端发送 `close_stream` 消息时，客户端才关闭 SSE 连接。
+sse_v3 的关键改进在于**异常时是否关闭 SSE 连接**：
 
-**之前版本的问题**：
-- sse/sse_v1/sse_v2 中，单个请求完成后客户端可能考虑关闭流
-- 多请求并发时，流的关闭时机复杂，容易导致连接异常断开
+**sse_v1/v2**：回调内发生异常时，只关闭本请求的迭代器（`close()`），不关闭 SSE 连接。连接依赖服务端的 `close_stream` 来关闭。
 
-**sse_v3 的改进**：
-- 服务端维护会话内所有未完成事件
-- 所有事件都完成后，服务端主动发送 `close_stream`
-- 客户端收到后关闭连接
+**sse_v3**：回调内发生异常时，**同时关闭 SSE 连接** [submit.ts:611-615](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L611-L615)：
 
-**服务端逻辑** [routes.py:1526-1557](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/routes.py#L1526-L1557)：
+```typescript
+if (["sse_v2", "sse_v2.1", "sse_v3"].includes(protocol)) {
+    close_stream(stream_status, that.abort_controller);
+    stream_status.open = false;
+    close();
+}
+```
+
+> 注意：代码中 sse_v2/v2.1 也走了这个关闭分支，但注释说 "v3 only closes the stream when the backend sends the close stream message"，这与代码略有出入。实际代码中，**sse_v2+ 在异常时都会立即关闭 SSE 连接**，而正常完成时都由服务端发 `close_stream` 关闭。
+
+**服务端关闭逻辑** [routes.py:1525-1559](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/routes.py#L1525-L1559)：
 
 ```python
+# 每次 process_completed 后检查
 if isinstance(message, ProcessCompletedMessage) and message.event_id:
-    # 从 pending 中移除该 event_id
     blocks._queue.pending_event_ids_session[session_hash].remove(message.event_id)
     
-    # 如果会话内没有未完成事件了，或服务端停止了
+    # 会话内所有事件都完成了 → 发 close_stream 并关闭 SSE
     if message.msg == ServerMessage.server_stopped or (
         message.msg == ServerMessage.process_completed
         and len(blocks._queue.pending_event_ids_session[session_hash]) == 0
     ):
-        # 发送 close_stream 消息
         message = CloseStreamMessage()
         yield process_msg(message)
-        return  # 关闭 SSE 连接
+        return  # 结束 SSE 响应
 ```
 
-**客户端处理** [stream.ts:41-46](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/stream.ts#L41-L46)：
+**客户端收到 close_stream** [stream.ts:43-46](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/stream.ts#L43-L46)：
 
 ```typescript
-stream.onmessage = async function (event) {
-    let _data = JSON.parse(event.data);
-    if (_data.msg === "close_stream") {
-        close_stream(stream_status, that.abort_controller);
-        return;  // 直接关闭，不交给回调
-    }
-    // ... 其他消息分发
-};
+if (_data.msg === "close_stream") {
+    close_stream(stream_status, that.abort_controller);  // 设 open=false, abort
+    return;  // 不交给任何回调
+}
 ```
 
 ---
@@ -411,24 +401,19 @@ stream.onmessage = async function (event) {
 
 ```typescript
 export async function open_stream(this: Client): Promise<void> {
-    stream_status.open = true;  // 标记流已打开
-    
+    stream_status.open = true;
     // 只带 session_hash，不带 fn_index
     let url = new URL(`${config.root}/${SSE_URL}?session_hash=${this.session_hash}`);
     stream = this.stream(url);
-    
-    // 统一的 onmessage 处理器
-    stream.onmessage = function (event) {
-        let _data = JSON.parse(event.data);
-        // 分发逻辑...
-    };
+    // 注册统一的 onmessage 处理器
+    stream.onmessage = function (event) { /* 分发逻辑 */ };
 }
 ```
 
 **连接时机** [submit.ts:626-628](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L626-L628)：
 
 ```typescript
-// 注册回调时检查，如果流未打开则建立
+// 注册回调后检查，如果流未打开则建立
 if (!stream_status.open) {
     await this.open_stream();
 }
@@ -456,7 +441,7 @@ if (!stream_status.open) {
 stream.onmessage = async function (event: MessageEvent) {
     let _data = JSON.parse(event.data);
     
-    // 1. 特殊消息：close_stream 直接处理
+    // 1. close_stream：直接关闭连接，不交给回调
     if (_data.msg === "close_stream") {
         close_stream(stream_status, that.abort_controller);
         return;
@@ -465,18 +450,16 @@ stream.onmessage = async function (event: MessageEvent) {
     const event_id = _data.event_id;
     
     if (!event_id) {
-        // 2. 无 event_id 的消息：广播给所有回调
-        // 例如某些全局通知（注意：实际中 heartbeat 是怎么发的？）
+        // 2. 无 event_id 的消息：广播给所有回调（如 heartbeat）
         await Promise.all(
             Object.keys(event_callbacks).map(eid => event_callbacks[eid](_data))
         );
     } else if (event_callbacks[event_id]) {
-        // 3. 有回调：直接调用
+        // 3. 有回调：分发到对应 callback
         let fn = event_callbacks[event_id];
-        // 浏览器环境下用 setTimeout 避免阻塞 UI
-        setTimeout(fn, 0, _data);
+        setTimeout(fn, 0, _data);  // 浏览器环境避免阻塞 UI
     } else {
-        // 4. 无回调：缓存起来（竞态处理）
+        // 4. 无回调：缓存（回调还没注册，消息先到了）
         if (!pending_stream_messages[event_id]) {
             pending_stream_messages[event_id] = [];
         }
@@ -489,9 +472,7 @@ stream.onmessage = async function (event: MessageEvent) {
 
 **为什么会有竞态？**
 
-提交任务是 POST 请求，建立 SSE 连接是 GET 请求。
-如果 POST 很快返回，但 SSE 连接还没建好（或者回调还没注册），
-服务端的消息就可能先到了。
+提交任务是 POST 请求，建立 SSE 连接是 GET 请求。如果 POST 很快返回 event_id，但 SSE 连接还没建好（或者回调还没注册），服务端的消息就可能先到了 SSE 流上。
 
 **怎么解决？** 用 `pending_stream_messages` 做缓存。
 
@@ -500,9 +481,7 @@ stream.onmessage = async function (event: MessageEvent) {
 ```typescript
 // 注册回调前，先检查有没有早到的消息
 if (event_id in pending_stream_messages) {
-    // 有缓存：逐条喂给回调
     pending_stream_messages[event_id].forEach((msg) => callback(msg));
-    // 清掉缓存
     delete pending_stream_messages[event_id];
 }
 // 注册回调
@@ -541,7 +520,7 @@ unclosed_events.add(event_id);
 
 ### 4.4 单请求回调的内部处理
 
-每个 submit() 调用都会创建一个专属的 callback 函数 [submit.ts:489-617](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L489-L617)：
+每个 `submit()` 调用都会创建一个专属的 callback 函数 [submit.ts:489-617](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L489-L617)：
 
 ```typescript
 let callback = async function (_data: object): Promise<void> {
@@ -552,7 +531,7 @@ let callback = async function (_data: object): Promise<void> {
     if (type === "update" && status && !complete) {
         fire_event({ type: "status", ...status });  // 状态更新
     } else if (type === "complete") {
-        complete = status;  // 标记完成
+        complete = status;  // 记住完成状态，等 data 到了再 fire
     } else if (type === "generating" || type === "streaming") {
         fire_event({ type: "status", stage: status.stage, ... });
         if (sse_v2+) {
@@ -564,24 +543,26 @@ let callback = async function (_data: object): Promise<void> {
         fire_event({ type: "data", data: handle_payload(...) });  // 数据事件
         if (complete) {
             fire_event({ type: "status", stage: "complete", ... });
-            close();  // 本请求的迭代器结束
+            close();  // 本请求的迭代器结束（不关 SSE 连接！）
         }
     }
     
     if (status?.stage === "complete" || status?.stage === "error") {
-        delete event_callbacks[event_id];  // 清理回调
-        delete pending_diff_streams[event_id];  // 清理 diff 状态
-        close();
+        delete event_callbacks[event_id];     // 清理回调
+        delete pending_diff_streams[event_id]; // 清理 diff 状态
+        close();  // 本请求的迭代器结束
     }
 };
 ```
 
+> **关键区分**：`close()` 只结束本请求的 AsyncIterator（设 `done = true`），**不关闭 SSE 连接**。SSE 连接由 `close_stream` 消息控制，或者 sse_v2+ 异常时主动关闭。
+
 ### 4.5 消息类型一览
 
-**服务端消息类型** [server_messages.py:7-90](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/server_messages.py#L7-L90)：
+**服务端消息类型** [server_messages.py](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/server_messages.py)：
 
-| 消息 msg 字段 | 触发时机 | 对应客户端 type |
-|-------------|---------|----------------|
+| 消息 msg 字段 | 触发时机 | 对应客户端 handle_message type |
+|-------------|---------|------------------------------|
 | `estimation` | 入队后，定期更新队列位置 | `update` (stage: pending) |
 | `process_starts` | 任务开始执行 | `update` (stage: pending) |
 | `process_generating` | 生成器中间结果 | `generating` + 可选 data |
@@ -592,7 +573,14 @@ let callback = async function (_data: object): Promise<void> {
 | `heartbeat` | 定期保活 | `heartbeat` (忽略) |
 | `close_stream` | 服务端要求关闭流 | 直接关闭，不进回调 |
 | `unexpected_error` | 未预期异常 | `unexpected_error` |
-| `broken_connection` | 连接断开 | `broken_connection` |
+
+**仅客户端识别但服务端不再发送的消息** [api_info.ts:256-259](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/helpers/api_info.ts#L256-L259)：
+
+| 消息 msg 字段 | handle_message type | 说明 |
+|-------------|---------------------|------|
+| `send_data` | `data` | 旧版 sse 协议使用，当前服务端不发送 |
+| `send_hash` | `hash` | 旧版 sse 协议使用，当前服务端不发送 |
+| `queue_full` | `update` (error) | 现由 503 状态码替代 |
 
 **客户端事件类型** [types.ts:358-435](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/types.ts#L358-L435)：
 
@@ -647,37 +635,25 @@ def send_message(self, event, event_message):
 ```python
 async def sse_stream(request):
     heartbeat_task = asyncio.create_task(heartbeat())
-    try:
-        while True:
-            if await request.is_disconnected():
-                await blocks._queue.clean_events(session_hash=session_hash)
-                return
+    while True:
+        if await request.is_disconnected():
+            await blocks._queue.clean_events(session_hash=session_hash)
+            return
+        
+        # 从队列取消息，超时 10 秒
+        message = await asyncio.wait_for(
+            pending_messages_per_session[session_hash].get(), timeout=10
+        )
+        
+        if message:
+            yield process_msg(message)
             
-            # 从队列取消息，超时 10 秒
-            message = await asyncio.wait_for(
-                pending_messages_per_session[session_hash].get(),
-                timeout=10
-            )
-            
-            if blocks._queue.stopped:
-                message = UnexpectedErrorMessage(message="Server stopped unexpectedly.")
-            
-            if message:
-                response = process_msg(message)
-                if response is not None:
-                    yield response
-                
-                # 如果是 process_completed，检查是否所有事件都完成了
-                if isinstance(message, ProcessCompletedMessage) and message.event_id:
-                    pending_event_ids_session[session_hash].remove(message.event_id)
-                    
-                    # 所有事件完成 → 发 close_stream
-                    if len(pending_event_ids_session[session_hash]) == 0:
-                        yield process_msg(CloseStreamMessage())
-                        return
-    except BaseException as e:
-        # 异常处理
-        ...
+            # process_completed 后检查是否所有事件都完成了
+            if isinstance(message, ProcessCompletedMessage) and message.event_id:
+                pending_event_ids_session[session_hash].remove(message.event_id)
+                if len(pending_event_ids_session[session_hash]) == 0:
+                    yield process_msg(CloseStreamMessage())
+                    return
 ```
 
 ### 5.2 心跳机制
@@ -701,7 +677,7 @@ if (type == "heartbeat") {
 }
 ```
 
-> 注意：心跳消息没有 `event_id`，所以会广播给所有回调，但每个回调都直接 return 忽略。
+> 心跳消息没有 `event_id`，在 [stream.ts:48-53](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/stream.ts#L48-L53) 中被广播给所有回调，但每个回调都直接 return 忽略。
 
 ### 5.3 广播 vs 单播
 
@@ -715,14 +691,13 @@ if (type == "heartbeat") {
 | log | ✅ 是 | 按 event_id 单播 |
 | heartbeat | ❌ 否 | 广播给所有回调（被忽略） |
 | close_stream | ❌ 否 | 全局处理，关闭连接 |
-| unexpected_error | 不一定 | 看情况 |
-| broken_connection | 不一定 | 看情况 |
+| unexpected_error | 视情况 | 可能无 event_id |
 
 ---
 
 ## 6. 完整时序图
 
-### 6.1 sse_v1+ 完整流程（会话级连接）
+### 6.1 当前有效协议（sse_v1+）完整流程
 
 ```
 客户端 (Client)                          服务端 (Server)
@@ -763,54 +738,25 @@ if (type == "heartbeat") {
      |                                         |
      |  msg: process_completed (event_id: "evt_a")
      |<----------------------------------------|
-     |    → cb_a 处理，delete cb_a             |
-     |    → evt_a 的 iterator 结束              |
+     |    → cb_a 处理，fire data + status      |
+     |    → delete event_callbacks["evt_a"]    |
+     |    → evt_a 的 iterator close()          |
+     |    → SSE 连接仍然保持                    |
      |                                         |
      |  msg: process_completed (event_id: "evt_b")
      |<----------------------------------------|
-     |    → cb_b 处理，delete cb_b             |
-     |    → evt_b 的 iterator 结束              |
+     |    → cb_b 处理，fire data + status      |
+     |    → delete event_callbacks["evt_b"]    |
+     |    → evt_b 的 iterator close()          |
      |                                         |
-     |  检测：所有事件都完成了                   |
+     |  服务端检测：pending_event_ids 为空      |
      |  msg: close_stream                      |
      |<----------------------------------------|
-     |    → 关闭 SSE 流                         |
      |    → stream_status.open = false          |
+     |    → SSE 连接关闭                        |
 ```
 
-### 6.2 旧版 sse 流程（每请求一连接）
-
-```
-客户端                                服务端
-   |                                     |
-   |  第1个请求 submit()                 |
-   |  GET /queue/data?fn_index=X&session_hash=Y
-   |------------------------------------>|  (建立 SSE 连接1)
-   |                                     |
-   |  msg: send_hash                     |
-   |<------------------------------------|
-   |  msg: estimation                    |
-   |<------------------------------------|
-   |  msg: send_data                     |
-   |<------------------------------------|
-   |                                     |
-   |  POST /queue/data { data, event_id }|
-   |------------------------------------>|  (提交数据)
-   |                                     |
-   |  msg: process_starts                |
-   |<------------------------------------|
-   |  msg: process_completed             |
-   |<------------------------------------|
-   |  客户端主动 close()                  |
-   |  EventSource.close()                |
-   |                                     |
-   |  第2个请求 submit()                 |
-   |  GET /queue/data?fn_index=X&session_hash=Y
-   |------------------------------------>|  (建立 SSE 连接2)
-   |  ... 重复上述流程 ...                |
-```
-
-### 6.3 取消任务流程
+### 6.2 取消任务流程
 
 ```
 客户端                                服务端
@@ -840,13 +786,14 @@ if (type == "heartbeat") {
 
 | 端点 | 方法 | 用途 | 适用协议 |
 |------|------|------|---------|
-| `/config` | GET | 获取应用配置 | 所有 |
+| `/config` | GET | 获取应用配置（含 protocol 字段） | 所有 |
 | `/info` | GET | 获取 API 信息（端点参数） | 所有 |
 | `/upload` | POST | 上传文件 | 所有 |
 | `/run/{endpoint}` | POST | 非队列模式直接执行 | 非队列 |
-| `/queue/join` | POST | 队列模式提交任务，返回 event_id | sse_v1+ |
-| `/queue/data` | GET | SSE 长连接接收结果 | sse / sse_v1+ |
-| `/queue/data` | POST | sse 模式下提交数据 | sse (旧版) |
+| `/queue/join` | POST | 队列模式提交任务，返回 event_id | sse_v1+（当前唯一有效） |
+| `/queue/data` | GET | SSE 长连接接收结果（仅接收 session_hash） | sse_v1+ |
+| `/call/{api_name}` | POST | 简化版队列提交（自动映射参数名） | sse_v1+ |
+| `/call/{api_name}/{event_id}` | GET | 简化版 SSE 接收 | sse_v1+ |
 | `/cancel` | POST | 取消任务 | 所有队列模式 |
 | `/reset` | POST | 重置迭代器状态 | 所有队列模式 |
 | `/heartbeat/{session_hash}` | GET | 心跳保活（state 相关） | 所有 |
@@ -873,21 +820,63 @@ if (type == "heartbeat") {
 - **队列停止**：POST /queue/join 返回 503 `Queue is stopped`
 - **客户端断开**：SSE 循环检测到断开，清理会话事件
 
+### 8.3 sse_v2+ 异常时的连接关闭
+
+[submit.ts:611-615](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L611-L615)：
+
+```typescript
+// 回调内异常时，sse_v2+ 主动关闭 SSE 连接
+if (["sse_v2", "sse_v2.1", "sse_v3"].includes(protocol)) {
+    close_stream(stream_status, that.abort_controller);
+    stream_status.open = false;
+    close();
+}
+```
+
+sse_v1 不会主动关闭 SSE 连接，只关闭本请求的迭代器。
+
 ---
 
 ## 9. 核心代码参考
 
-### 9.1 客户端提交逻辑入口
+### 9.1 协议分支入口
 
-[submit.ts:67-74](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L67-L74)
+[submit.ts:77-79](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L77-L79)
 ```typescript
-let { fn_index, endpoint_info, dependency } = get_endpoint_info(
-    api_info, endpoint, api_map, config
-);
-let resolved_data = map_data_to_params(data, endpoint_info);
+let protocol = config.protocol ?? "ws";
+if (protocol === "ws") {
+    throw new Error("WebSocket protocol is not supported in this version");
+}
 ```
 
-### 9.2 会话级 SSE 消息分发
+### 9.2 非队列模式提交
+
+[submit.ts:188-265](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L188-L265)
+```typescript
+if (skip_queue(fn_index, config)) {
+    post_data(`${config.root}${api_prefix}/run${_endpoint}`, { ...payload, session_hash })
+        .then(([output, status_code]) => {
+            if (status_code == 200) {
+                fire_event({ type: "data", ... });
+                fire_event({ type: "status", stage: "complete", ... });
+            }
+        });
+}
+```
+
+### 9.3 sse_v1+ 提交 + 回调注册
+
+[submit.ts:429-437](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L429-L437)
+```typescript
+post_data(`${config.root}${api_prefix}/${SSE_DATA_URL}?${url_params}`, {
+    ...payload, session_hash
+}).then(async ([response, status]) => {
+    event_id = response.event_id;
+    // ... 注册 callback，建 SSE 流
+});
+```
+
+### 9.4 会话级 SSE 消息分发
 
 [stream.ts:41-77](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/stream.ts#L41-L77)
 ```typescript
@@ -899,18 +888,16 @@ stream.onmessage = async function (event) {
     }
     const event_id = _data.event_id;
     if (!event_id) {
-        // 广播给所有回调
+        // 广播
     } else if (event_callbacks[event_id]) {
-        // 分发给对应回调
         event_callbacks[event_id](_data);
     } else {
-        // 缓存早到的消息
         pending_stream_messages[event_id].push(_data);
     }
 };
 ```
 
-### 9.3 回调注册与竞态处理
+### 9.5 回调注册与竞态处理
 
 [submit.ts:619-628](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L619-L628)
 ```typescript
@@ -925,18 +912,7 @@ if (!stream_status.open) {
 }
 ```
 
-### 9.4 服务端入队处理
-
-[queueing.py:373-388](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/queueing.py#L373-L388)
-```python
-event = Event(body.session_hash, fn, request, username)
-event.data = body
-self.pending_event_ids_session[body.session_hash].add(event._id)
-self.event_ids_to_events[event._id] = event
-event_queue.queue.append(event)
-```
-
-### 9.5 服务端消息推送
+### 9.6 服务端消息推送
 
 [queueing.py:240-249](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/queueing.py#L240-L249)
 ```python
