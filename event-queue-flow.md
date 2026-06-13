@@ -479,100 +479,242 @@ rank_eta = process_time_for_fn   # 自身执行耗时（历史均值）
 
 ---
 
-## 7. 断线清理流程
+## 7. 边界路径的精确状态变化
 
-断线清理有三种触发路径：**客户端主动取消**、**SSE 连接断开**、**服务端队列停止**。三者共享核心清理逻辑 `clean_events()`，但前置操作各不相同。
+三条边界路径（取消请求、连接断开、服务端停止）的核心差异在于**事件集合**、**消息队列**、**关闭条件**三者的变化时机和方式。先明确定义三个核心状态结构：
 
-### 7.1 客户端主动取消：POST /cancel
+### 7.0 三个核心状态结构定义
+
+| 状态类型 | 数据结构 | 含义 |
+|---------|---------|------|
+| **事件集合** | `pending_event_ids_session[session_hash]` | `set[str]`，该 session 所有未完成的 event_id。SSE 关闭的唯一判定依据 |
+| | `event_ids_to_events` | `dict[str, Event]`，全局 event_id → Event 映射 |
+| | `EventQueue.queue` | `list[Event]`，按并发组的**等待队列**（已取出执行的事件不在此） |
+| **消息队列** | `pending_messages_per_session[session_hash]` | `AsyncQueue[EventMessage]`，该 session 的待发送消息缓冲。`send_message()` 的唯一目的地 |
+| **关闭条件** | [routes.py:1543-1553](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/gradio/routes.py#L1543-L1553) | `msg == server_stopped` **OR** `(msg == process_completed AND len(pending_event_ids_session) == 0)` |
+
+---
+
+### 7.1 路径一：POST /cancel（客户端主动取消）
 
 位置：[routes.py:1401-1429](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/gradio/routes.py#L1401-L1429)
 
 ```
-客户端调用 iterator.cancel()
+客户端 iterator.cancel()
        │
        ▼
 POST /cancel { event_id, session_hash, fn_index }
        │
-       ├─ 1. cancel_tasks({session_hash_fn_index})
-       │     └─ 遍历所有 asyncio.Task，按 task name 匹配
-       │        task name 格式: "{session_hash}_{fn_index}<gradio-sep>{event_id}"
-       │        匹配到的 task 调用 .cancel() → 触发 asyncio.CancelledError
-       │        位置: utils.py:1102-1115
+       ├─ Step 1: cancel_tasks({f"{session_hash}_{fn_index}"})
+       │     └─ 遍历 asyncio.Task，按 task name 匹配
+       │        格式: "{session_hash}_{fn_index}<gradio-sep>{event_id}"
+       │        匹配到的 .cancel() → asyncio.CancelledError
+       │        【不修改】三个核心状态结构
        │
-       ├─ 2. remove_from_queue(event_id)
-       │     └─ 从 EventQueue.queue 移除（若还在等待中）
-       │        从 event_ids_to_events 移除
-       │        位置: queueing.py:470-479
+       ├─ Step 2: remove_from_queue(event_id)
+       │     位置: queueing.py:470-479
+       │     ├─ 【事件集合】EventQueue.queue.remove(event)  # 仅从等待队列移除
+       │     ├─ 【事件集合】event_ids_to_events.pop(event_id, None)
+       │     └─ 【注意】pending_event_ids_session 【完全不动!】
        │
-       ├─ 3. 若 session 仍打开 且 事件正在运行:
-       │     向 pending_messages_per_session 注入 ProcessCompletedMessage(output={}, success=True)
-       │     → SSE 通道向客户端发送 "完成" 消息 → 客户端安全断开
+       ├─ Step 3: if session_open AND event_running:
+       │     ├─ session_open = session_hash in pending_messages_per_session
+       │     ├─ event_running = event_id in pending_event_ids_session[session_hash]
+       │     └─ 【消息队列】pending_messages_per_session[session_hash].put_nowait(
+       │           ProcessCompletedMessage(output={}, success=True, event_id=event_id)
+       │        )
        │
-       └─ 4. 若 event_id 在 app.iterators 中:
-             safe_aclose_iterator() → del app.iterators[event_id]
-             app.iterators_to_reset.add(event_id)
+       └─ Step 4: iterator 清理（不影响核心结构）
 ```
 
-**关键设计**：cancel 时注入一个**伪造的 success=True 完成消息**，确保 SSE 客户端不会因为缺少完成信号而无限等待。这在 [routes.py:1414-1420](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/gradio/routes.py#L1414-L1420) 实现。
+#### 关键：后续异步变化（SSE 流中）
 
-### 7.2 SSE 连接断开（客户端失联/关闭标签页）
+**`pending_event_ids_session` 的修改不在 `/cancel` 路由中，而是在 SSE 流消费消息时！**
 
-位置：[routes.py:1490-1497](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/gradio/routes.py#L1490-L1497)
+位置：[routes.py:1525-1559](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/gradio/routes.py#L1525-L1559)
 
 ```
-sse_stream() 循环内，每次迭代前检测:
+SSE 流消费到注入的 ProcessCompletedMessage:
+       │
+       ├─ if isinstance(message, ProcessCompletedMessage) and message.event_id:
+       │   │
+       │   ├─ 【事件集合】
+       │   │     if event_id in pending_event_ids_session[session_hash]:
+       │   │         pending_event_ids_session[session_hash].remove(event_id)
+       │   │     ← 【这里才真正修改 pending_event_ids_session!】
+       │   │
+       │   └─ 【关闭条件判定】
+       │         if (message.msg == ServerMessage.process_completed
+       │             and len(pending_event_ids_session[session_hash]) == 0):
+       │             │
+       │             ├─ 构造 CloseStreamMessage → yield
+       │             ├─ heartbeat_task.cancel()
+       │             └─ return  ← SSE 流优雅关闭
+```
+
+#### /cancel 完整状态链
+
+```
+POST /cancel
+   │
+   ├─ cancel_tasks() → 取消 Task
+   ├─ remove_from_queue() → EventQueue.queue + event_ids_to_events
+   │                                    (pending_event_ids_session 不动!)
+   ├─ 注入 ProcessCompletedMessage → pending_messages_per_session
+   │
+   ▼ (异步，SSE 流消费)
+pending_event_ids_session.remove(event_id)
+   │
+   └─ 若集合变空 → CloseStreamMessage → SSE return
+```
+
+---
+
+### 7.2 路径二：SSE 连接断开（客户端失联/关闭标签页）
+
+位置：[routes.py:1494-1497](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/gradio/routes.py#L1494-L1497)
+
+```
+sse_stream() while 循环开头检测:
        │
        if await request.is_disconnected():
        │
        ├─ clean_events(session_hash=session_hash)
-       │     → 遍历 active_jobs，将匹配 session 的 event.alive = False
-       │     → 从所有 EventQueue.queue 中移除该 session 的事件
-       │     → 从 event_ids_to_events 移除
-       │     → 清理 pending_event_ids_session[session_hash]
-       │     位置: queueing.py:631-658
        │
-       └─ heartbeat_task.cancel()
-           return  ← SSE 流结束
+       ├─ heartbeat_task.cancel()
+       └─ return  ← SSE 流直接终止，不发任何消息
 ```
 
-**状态变化的完整效果**：
+#### clean_events() 的精确操作
 
-| 被清理的状态 | clean_events 内部操作 | 后续影响 |
-|-------------|----------------------|---------|
-| `event.alive = False` | 遍历 active_jobs 中正在执行的事件 | process_events 后续循环中 send_message 跳过（`if not event.alive: return`） |
-| EventQueue.queue 中移除 | 等待中的事件直接被抽走 | 不再被 get_events() 调度 |
-| `event_ids_to_events` 移除 | event_id 失去引用 | 后续 /stream/{event_id} 等路由将 KeyError |
-| `pending_event_ids_session` 收缩 | 移除已清理的 event_id | 若集合为空则 pop 整个 session |
+位置：[queueing.py:631-658](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/gradio/queueing.py#L631-L658)
 
-**注意**：断线清理**不会**主动取消正在执行的 asyncio Task（与 /cancel 不同），仅设置 `alive=False` 让 process_events 自行跳过后续消息发送。正在运行的协程会自然完成，但在 finally 块中释放并发槽位。
-
-### 7.3 服务端队列停止：Queue.stopped = True
-
-位置：[queueing.py:237-238](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/gradio/queueing.py#L237-L238)
-
-触发场景：应用关闭 / 重新加载
-
-```
-Queue.close()
-  └─ self.stopped = True
-       │
-       ├─ start_processing() 主循环退出:
-       │     finally: self.stopped = True; _cancel_asyncio_tasks()
-       │     → 取消所有 process_events 后台任务
-       │     位置: queueing.py:561-563
-       │
-       └─ sse_stream() 检测到 stopped:
-             注入 UnexpectedErrorMessage(message="Server stopped unexpectedly.")
-             位置: routes.py:1516-1520
-```
-
-`_cancel_asyncio_tasks()` 位置：[queueing.py:481-484](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/gradio/queueing.py#L481-L484)
 ```python
-def _cancel_asyncio_tasks(self):
-    for task in self._asyncio_tasks:
-        task.cancel()
-    self._asyncio_tasks = []
+async def clean_events(self, *, session_hash: str | None = None):
+    # Part A: 标记正在执行的事件
+    for job_set in self.active_jobs:
+        if job_set:
+            for job in job_set:
+                if job.session_hash == session_hash:
+                    job.alive = False  # 【仅标记! 不修改任何集合】
+    
+    # Part B: 收集并移除"等待中的"事件
+    async with self.delete_lock:
+        events_to_remove = []
+        for event_queue in event_queue_per_concurrency_id.values():
+            for event in event_queue.queue:  # 【只遍历等待队列!】
+                if event.session_hash == session_hash:
+                    events_to_remove.append(event)
+        
+        for event in events_to_remove:
+            event_queue.queue.remove(event)       # 【事件集合】
+            event_ids_to_events.pop(event._id, None)  # 【事件集合】
+        
+        # Part C: 只移除"等待中"的事件从 pending_event_ids_session
+        if session_hash in self.pending_event_ids_session:
+            removed_ids = {e._id for e in events_to_remove}  # 只含等待中的!
+            self.pending_event_ids_session[session_hash] -= removed_ids
+            if not self.pending_event_ids_session[session_hash]:
+                self.pending_event_ids_session.pop(session_hash, None)
 ```
+
+#### 精确状态变化（按事件状态分类）
+
+| 事件状态 | EventQueue.queue | event_ids_to_events | pending_event_ids_session | event.alive |
+|---------|------------------|---------------------|--------------------------|-------------|
+| **正在执行** (在 active_jobs 中) | 不修改（已不在队列） | 不修改 | **不修改（保留）** | 设为 False |
+| **等待中** (在 EventQueue.queue) | 移除 | 移除 | 移除 | —（未执行）|
+
+| 其他状态 | 变化 |
+|---------|------|
+| **消息队列** (pending_messages_per_session) | **完全不碰!** AsyncQueue 和里面的消息都原封不动 |
+| **关闭条件** | 不触发 — SSE 直接 `return`，不发送 CloseStreamMessage |
+| **asyncio Task** | 不取消 — 正在执行的协程会自然完成，finally 块释放槽位 |
+
+#### 后续影响
+- `event.alive = False`：`process_events` 后续 `send_message()` 会直接 return（`if not event.alive: return`）
+- `pending_event_ids_session` 仍包含正在执行的 event_id，但 SSE 已断开，没人消费了
+- `pending_messages_per_session` 仍存在，但生产者（process_events）被 `alive=False` 阻挡，消费者（SSE 流）已退出，形成**僵尸队列**
+
+---
+
+### 7.3 路径三：服务端停止（Queue.stopped = True）
+
+有两个并行变化链：
+
+#### 变化链 A：start_processing 主循环退出
+
+位置：[queueing.py:561-563](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/gradio/queueing.py#L561-L563)
+
+```python
+finally:
+    self.stopped = True
+    self._cancel_asyncio_tasks()  # 取消所有 process_events 协程
+```
+
+- `_cancel_asyncio_tasks()` 遍历 `self._asyncio_tasks`，每个 `.cancel()`
+- 被取消的 `process_events` 触发 `CancelledError`，进入 finally 块：
+  - `current_concurrency--`
+  - `active_jobs[slot] = None`
+  - `reset_iterators()`
+
+#### 变化链 B：SSE 流检测到 stopped 标志
+
+位置：[routes.py:1516-1520](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/gradio/routes.py#L1516-L1520)
+
+```
+while True:
+    ...
+    if blocks._queue.stopped:
+        message = UnexpectedErrorMessage(
+            message="Server stopped unexpectedly.",
+            success=False,
+        )
+    ...
+    yield process_msg(message)
+    ...
+    # 检查关闭条件
+    if message.msg == ServerMessage.server_stopped or (...):
+```
+
+#### 关键发现：关闭条件的设计不匹配
+
+`ServerMessage.server_stopped` 的值是 **字符串 `"Server stopped unexpectedly."`**（见 [utils.py:142](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/client/python/gradio_client/utils.py#L142)），而 `UnexpectedErrorMessage` 的 `msg` 字段是 `ServerMessage.unexpected_error = "unexpected_error"`。
+
+所以条件 `message.msg == ServerMessage.server_stopped` **永远不会为 True**！
+
+#### 精确状态变化
+
+| 状态结构 | 变化 |
+|---------|------|
+| **EventQueue.queue** | 不直接修改（process_events finally 自然释放） |
+| **event_ids_to_events** | 不直接修改 |
+| **pending_event_ids_session** | 不修改（继续保留所有 event_id） |
+| **pending_messages_per_session** | 注入 `UnexpectedErrorMessage` |
+| **关闭条件** | 不触发 — msg 是 `"unexpected_error"`，不匹配 `server_stopped`，也不是 `process_completed` |
+| **asyncio Task** | `_cancel_asyncio_tasks()` 批量取消所有后台任务 |
+
+#### 实际效果
+- SSE 流会不断循环，每次都注入 `UnexpectedErrorMessage` 发给客户端
+- 客户端收到 `unexpected_error` 消息后，由前端逻辑自行处理关闭（`handle_message()` → `fire_event(stage="error")` → `close()`）
+- 服务端最终会因为外层连接断开或进程退出而终止
+
+---
+
+### 7.4 三条路径状态对比总表
+
+| 状态结构 | /cancel 路径 | SSE 断开路径 | 服务端停止路径 |
+|---------|-------------|-------------|---------------|
+| **EventQueue.queue** | `remove_from_queue()` 移除 | `clean_events()` 移除**等待中的** | 不直接修改（finally 释放） |
+| **event_ids_to_events** | `remove_from_queue()` pop | `clean_events()` pop 等待中的 | 不直接修改 |
+| **pending_event_ids_session** | **不动**（SSE 消费 ProcessCompletedMessage 时才 remove） | 仅移除**等待中的**，**执行中的保留** | 不修改（全部保留） |
+| **pending_messages_per_session** | 注入 `ProcessCompletedMessage` | **完全不碰** | 注入 `UnexpectedErrorMessage` |
+| **event.alive** | 不修改（cancel_tasks 触发 CancelledError） | 正在执行的标记为 False | 不修改 |
+| **asyncio Task** | `cancel_tasks()` 精准取消（按 task name） | 不取消（自然完成） | `_cancel_asyncio_tasks()` 批量取消所有 |
+| **SSE 关闭方式** | `CloseStreamMessage`（当 pending 变空时） | 直接 `return`（无 CloseStreamMessage） | 注入 `UnexpectedErrorMessage`（关闭条件永不触发，前端自行关闭） |
+| **关闭条件触发** | `process_completed + pending == 0` | 不触发（直接 return） | `server_stopped` 条件永不触发 |
+| **消息队列是否残留** | 无（优雅关闭） | 有（僵尸 AsyncQueue） | 有（不断注入错误消息） |
+| **pending_event_ids_session 是否残留** | 无（清空后 pop） | 有（执行中的 event_id 残留） | 有（全部残留） |
 
 ---
 
@@ -680,23 +822,38 @@ SSE 连接 onerror:
 ```
 sse_stream() 收到 ProcessCompletedMessage(event_id=xxx):
        │
-       ├─ 从 pending_event_ids_session[session_hash] 移除该 event_id
-       │   (重复 cancel 安全：若已被移除则跳过)
+       ├─ if isinstance(message, ProcessCompletedMessage) and message.event_id:
+       │   │
+       │   ├─ 从 pending_event_ids_session[session_hash] 移除该 event_id
+       │   │   (重复 cancel 安全：若已被移除则跳过)
+       │   │
+       │   └─ 判断是否应该关闭 SSE:
+       │       条件: (message.msg == process_completed
+       │              AND len(pending_event_ids_session[session_hash]) == 0)
+       │       │
+       │       ├─ YES → 构造 CloseStreamMessage
+       │       │        yield process_msg(CloseStreamMessage)
+       │       │        heartbeat_task.cancel()
+       │       │        return  ← SSE 流结束
+       │       │
+       │       └─ NO  → 继续循环，等待其他事件完成
        │
-       └─ 判断是否应该关闭 SSE:
-           条件: message.msg == server_stopped
-                 OR (message.msg == process_completed
-                     AND len(pending_event_ids_session[session_hash]) == 0)
-           │
-           ├─ YES → 构造 CloseStreamMessage
-           │        yield process_msg(CloseStreamMessage)
-           │        heartbeat_task.cancel()
-           │        return  ← SSE 流结束
-           │
-           └─ NO  → 继续循环，等待其他事件完成
+       └─ 其他消息类型 → 只 yield，不移除 event_id，不判断关闭
 ```
 
-**核心判定逻辑**：只有当 `pending_event_ids_session[session_hash]` 变为空集时，才认为该 session 的所有事件已结束，发送 `CloseStreamMessage` 关闭 SSE。
+**核心判定逻辑（精确说明）**：
+
+关闭条件代码上写的是 `OR`，但实际上只有一个分支会触发：
+- **分支 1**：`message.msg == ServerMessage.server_stopped` → **永不触发**（设计不匹配：`ServerMessage.server_stopped` = `"Server stopped unexpectedly."` 是字符串内容，而消息的 `msg` 字段是枚举值 `"unexpected_error"`）
+- **分支 2**：`message.msg == process_completed AND len(pending_event_ids_session) == 0` → **正常路径唯一触发条件**
+
+所以**实际生效的关闭条件只有一个**：当且仅当收到 `ProcessCompletedMessage` 且 `pending_event_ids_session[session_hash]` 变为空集时，才发送 `CloseStreamMessage` 关闭 SSE。
+
+**关闭触发时机**：
+- 正常完成：process_events 发送 ProcessCompletedMessage → SSE 消费 → 移除 event_id → 集合变空 → CloseStreamMessage
+- 主动取消：/cancel 注入 ProcessCompletedMessage → SSE 消费 → 移除 event_id → 集合变空 → CloseStreamMessage
+- 连接断开：不触发 CloseStreamMessage，直接 return
+- 服务端停止：不触发 CloseStreamMessage，前端收到 unexpected_error 自行关闭
 
 前端收到 `close_stream` 后：
 ```typescript
@@ -855,16 +1012,16 @@ sse_stream() 取出消息
 
 ## 10. 边界场景速查表
 
-| 场景 | 触发路径 | 核心清理动作 | 消息回传 |
-|------|---------|-------------|---------|
-| 用户点击取消 | POST /cancel | cancel_tasks + remove_from_queue + iterator reset | ProcessCompletedMessage(success=True, output={}) |
-| 关闭浏览器标签 | SSE is_disconnected | clean_events(session_hash) | 无（连接已断） |
-| 用户函数 raise | process_events except | error_payload → ProcessCompletedMessage(success=False) | 有 error 内容（受 show_error 控制） |
-| 生成式函数迭代异常 | while 循环内 except | error_payload → ProcessCompletedMessage(success=False) | 使用 old_err 兜底 |
-| 服务端停止 | Queue.stopped | _cancel_asyncio_tasks | UnexpectedErrorMessage("Server stopped unexpectedly.") |
-| SSE 连接异常 | except BaseException | clean_events + del pending_messages | UnexpectedErrorMessage(str(e)) |
-| SSE CancelledError | except CancelledError | del pending_messages + clean_events | UnexpectedErrorMessage 后 re-raise |
-| Session 不存在 | HTTPException(404) | 无（本就无状态） | UnexpectedErrorMessage(session_not_found=True) |
-| 前端 SSE 断连 | stream.onerror | 前端构造 broken_connection | 广播给所有 event_callbacks |
-| 队列满 | push() 返回 queue_full | 不入队 | HTTP 503 + 前端 fire_error |
-| 验证失败 | push() 返回 validator_error | 不入队 | HTTP 422 + 前端 fire_error |
+| 场景 | 触发路径 | pending_event_ids_session | pending_messages_per_session | SSE 关闭方式 | 消息回传 |
+|------|---------|--------------------------|-----------------------------|-------------|---------|
+| 用户点击取消 | POST /cancel | **SSE 消费时才 remove** | 注入 ProcessCompletedMessage(success=True) | CloseStreamMessage（集合变空时） | 伪造的 success=True 完成消息 |
+| 关闭浏览器标签 | SSE is_disconnected | 仅移除等待中的，**执行中的保留** | **完全不碰**（僵尸队列） | 直接 return（无 CloseStreamMessage） | 无（连接已断） |
+| 用户函数 raise | process_events except | SSE 消费 ProcessCompletedMessage 时 remove | 注入 ProcessCompletedMessage(success=False) | CloseStreamMessage（若集合变空） | error 内容（受 show_error 控制） |
+| 生成式函数迭代异常 | while 循环内 except | SSE 消费时 remove | 注入 ProcessCompletedMessage(success=False) | CloseStreamMessage（若集合变空） | 使用 old_err 兜底 |
+| 服务端停止 | Queue.stopped | **不修改（全部保留）** | 不断注入 UnexpectedErrorMessage | 不触发（前端自行关闭） | "Server stopped unexpectedly." |
+| SSE 连接异常 | except BaseException | CancelledError 触发 clean_events | 非 CancelledError 保留，CancelledError 直接 del | 异常 return | UnexpectedErrorMessage(str(e)) |
+| SSE CancelledError | except CancelledError | clean_events 移除 | **直接 del** 整个 AsyncQueue | 异常 return + re-raise | UnexpectedErrorMessage 后 re-raise |
+| Session 不存在 | HTTPException(404) | 无（本就无状态） | 无 | 异常 return | UnexpectedErrorMessage(session_not_found=True) |
+| 前端 SSE 断连 | stream.onerror | 不修改（服务端不知情） | 不修改（服务端不知情） | 前端 close_stream() | 前端构造 broken_connection，广播给所有 callbacks |
+| 队列满 | push() 返回 queue_full | 不入队，不修改 | 不入队，不修改 | 无（不入队） | HTTP 503 + 前端 fire_error |
+| 验证失败 | push() 返回 validator_error | 不入队，不修改 | 不入队，不修改 | 无（不入队） | HTTP 422 + 前端 fire_error |
