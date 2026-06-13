@@ -11,7 +11,8 @@
 
 **输出侧**：
 ```
-用户函数返回值 → Image.postprocess() → image_utils.postprocess_image() → ImageData/Base64ImageData → 前端显示
+用户函数返回值 → Image.postprocess() → postprocess_image() → ImageData(path=...)
+    → move_files_to_cache() → 路径转 URL → 前端显示
 ```
 
 [Image.preprocess()](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/components/image.py#L194-L209) 将输入逻辑委托给 [image_utils.preprocess_image()](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L264-L325)。
@@ -423,7 +424,7 @@ saved = save_image(value, cache_dir=cache_dir, format=format)
 | `PIL.Image.Image` | `save_pil_to_cache()` → 直接保存 |
 | `Path` / `str` | 原样返回路径（假设已是有效文件） |
 
-⚠️ **注意**：如果 `value` 是字符串类型的**远程 URL**（如 `https://...`），`save_image` 会直接返回该 URL 字符串，不会下载到本地。此时 `Path(saved).exists()` 为 `False`。
+⚠️ **注意**：如果 `value` 是字符串类型的**远程 URL**（如 `https://...`），`save_image` 会直接返回该 URL 字符串，不会下载到本地。此时 `Path(saved).exists()` 为 `False`。但远程 URL 会在后续 `move_files_to_cache` 阶段被下载到缓存（详见 6.4 节）。
 
 #### 5. 构造 ImageData 返回（[L358-L359](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L358-L359)）
 
@@ -440,18 +441,60 @@ return ImageData(path=saved, orig_name=orig_name)
 
 `Image.postprocess()` 的返回类型声明为 `ImageData | Base64ImageData | None`（[image.py#L213](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/components/image.py#L213)），但实际 `postprocess_image()` 只返回 `ImageData | None`。
 
-返回的 `ImageData` 会通过以下路径到达前端：
-1. 在 Blocks 事件处理中，`postprocess` 的结果会被 `model_dump()` 序列化为字典
-2. 路由层将 `path` 转换为可通过 `/file=...` 端点访问的 URL
-3. 前端 Image 组件根据 `url` 或 `path` 渲染图像
+返回的 `ImageData` 并不直接发给前端，而是经过 [move_files_to_cache()](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/processing_utils.py#L431-L502) 处理后才序列化发送（详见 6.4 节）。
 
-> **关于 `Base64ImageData`**：目前 `postprocess_image()` 函数本身并不直接返回 `Base64ImageData`。该类型主要用于 API 文档声明（`api_info_as_output` 中 `streaming == "base64"` 时）以及 MCP 等协议层。实际的 base64 转换由 `encode_image_to_base64()` / `encode_image_file_to_base64()` 等工具函数在其他调用点完成。
+> **关于 `Base64ImageData`**：该类型声明在 `postprocess` 返回类型中，但 `postprocess_image()` 实际上从不返回它。`api_info_as_output` 中的 `self.streaming == "base64"` 检查也是死代码——构造函数参数 `streaming: bool = False`，布尔值永远不等于字符串 `"base64"`。`Base64ImageData` 真正的消费者是 MCP 协议层（详见第七节）。
+
+### 6.4 move_files_to_cache：路径转 URL 的关键步骤
+
+`postprocess_image()` 返回的 `ImageData` 会被 `model_dump()` 序列化为字典，然后在 [blocks.py#L2077-L2083](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/blocks.py#L2077-L2083) 中传入 `move_files_to_cache(data, block, postprocess=True)`。
+
+该函数的核心逻辑是遍历数据中的所有 FileData 对象，对每个执行 `_move_to_cache()`（[processing_utils.py#L459-L495](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/processing_utils.py#L459-L495)）：
+
+```python
+def _move_to_cache(d: dict):
+    payload = FileData(**d)
+    # ① URL 直通：如果 url 已是 HTTP URL，直接设 path=url，跳过下载
+    if payload.url and postprocess and client_utils.is_http_url_like(payload.url):
+        payload.path = payload.url
+    # ② 静态文件：不处理
+    elif utils.is_static_file(payload):
+        pass
+    # ③ 常规路径：将 path 指向的文件移入缓存
+    elif not block.proxy_url:
+        if not client_utils.is_http_url_like(payload.path):
+            _check_allowed(payload.path, check_in_upload_folder)
+        if not payload.is_stream:
+            temp_file_path = block.move_resource_to_block_cache(payload.path)
+            payload.path = temp_file_path
+
+    # ④ 根据 path 生成前端可访问的 url
+    url_prefix = f"{API_PREFIX}/stream/" if payload.is_stream else f"{API_PREFIX}/file="
+    if block.proxy_url:
+        url = f"{API_PREFIX}/proxy={proxy_url}{url_prefix}{payload.path}"
+    elif client_utils.is_http_url_like(payload.path) or payload.path.startswith(url_prefix):
+        url = payload.path                    # 远程 URL 或已有前缀 → 原样
+    else:
+        url = f"{url_prefix}{payload.path}"   # 本地路径 → /file=<path>
+    payload.url = url
+    return payload.model_dump()
+```
+
+#### 三种典型场景
+
+| 场景 | postprocess_image 返回 | _move_to_cache 行为 | 最终前端收到的 url |
+|------|----------------------|--------------------|--------------------|
+| **本地文件** | `ImageData(path="/tmp/abc/image.webp")` | `move_resource_to_block_cache` 复制到缓存 → 本地路径 | `/file=<缓存路径>` |
+| **远程 URL** | `ImageData(path="https://example.com/img.png")` | `move_resource_to_block_cache` **下载到缓存** → 本地路径 | `/file=<缓存路径>` |
+| **SVG 内联** | `ImageData(url="data:image/svg+xml,...")` | L465: `payload.url` 是 HTTP URL？**否**（是 data URL）→ 走 ③，但 `path=None` → `move_resource_to_block_cache(None)` 返回 `None` → 抛 `ValueError` |
+
+⚠️ **SVG 内联的特殊处理**：SVG 通过 `data:image/svg+xml` URL 返回时，`_move_to_cache` 会尝试对 `path=None` 执行 `move_resource_to_block_cache`，导致异常。但由于 `ImageData` 的 `meta` 字段标记了 `_type: "gradio.FileData"`，`is_file_obj_with_meta` 会识别它为 FileData 对象并执行 `_move_to_cache`。实际运行时，SVG 的 `url` 是 data URL 不是 HTTP URL，因此 L465 条件不成立，走到 ③ 分支。此时 `path=None`，`move_resource_to_block_cache(None)` 返回 `None`，随后 L475-476 会抛出 `ValueError("Did not determine a file path for the resource.")`。
+
+> 这意味着 SVG 内联输出可能在实际运行中出错，除非前端或其他中间层做了特殊处理绕过了 `move_files_to_cache`。
 
 ---
 
-## 七、Streaming 场景
-
-`Image` 组件的 `streaming` 参数在输入侧和输出侧有不同的含义。
+## 七、Streaming 场景与 Base64 输出
 
 ### 7.1 输入侧 streaming：Webcam 流
 
@@ -462,51 +505,74 @@ return ImageData(path=saved, orig_name=orig_name)
 - 前端以固定间隔（`stream_every`，默认 0.5 秒）将 webcam 帧作为图片发送给后端
 - 每帧图像通过正常的 `preprocess_image()` 流程处理
 
-### 7.2 输出侧 streaming：Base64 模式
+### 7.2 输出侧：不继承 StreamingOutput
+
+`Image` 继承自 `StreamingInput`，**不继承** `StreamingOutput`（与 Video/Audio 不同）。这意味着：
+
+- `handle_streaming_outputs()`（[blocks.py#L2087-L2138](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/blocks.py#L2087-L2138)）中 `isinstance(block, components.StreamingOutput)` 检查为 `False`，Image 永远走普通的 postprocess + move_files_to_cache 路径
+- Image 没有 `stream_output()` 方法，不支持 HLS 分片流
+
+### 7.3 Base64ImageData 与 `streaming == "base64"` 的真相
 
 `Image` 组件的 `streaming` 参数文档说明：*"If the component is an output component, will automatically convert images to base64."*
 
-从代码层面可以看到以下设计：
+但对照代码，这个描述**并不准确**：
 
-**1. API 文档层面**（[image.py#L227-L232](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/components/image.py#L227-L232)）：
+**1. 构造函数类型为 `bool`**（[image.py#L85](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/components/image.py#L85)）：
+
+```python
+streaming: bool = False
+```
+
+**2. `api_info_as_output` 检查 `self.streaming == "base64"`**（[image.py#L228](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/components/image.py#L228)）：
 
 ```python
 def api_info_as_output(self) -> dict[str, Any]:
     if self.streaming == "base64":
         schema = Base64ImageData.model_json_schema()
-        schema.pop("description", None)
-        return schema
+        ...
     return self.api_info()
 ```
 
-- 当 `self.streaming == "base64"` 时，API 输出 schema 为 `Base64ImageData`
-- `Base64ImageData` 只有 `url` 字段，值为 base64 data URL
+由于 `self.streaming` 是 `bool` 类型，`bool == "base64"` 永远为 `False`。**这段代码是死代码**，`Base64ImageData` 从未在 API 文档中实际使用。
 
-**2. 数据模型层面**（[data_classes.py#L445-L447](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/data_classes.py#L445-L447)）：
+**3. `postprocess_image()` 从不返回 `Base64ImageData`**：它只返回 `ImageData | None`，输出的图片始终走文件路径 → `/file=...` URL 的链路。
+
+**4. 真正的 base64 输出发生在 MCP 协议层**：[mcp.py#L1521-L1572](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/mcp.py#L1521-L1572) 中的 `postprocess_output_data()` 方法：
 
 ```python
-class Base64ImageData(GradioModel):
-    url: str = Field(description="base64 encoded image")
+def postprocess_output_data(self, data, root_url):
+    data = processing_utils.add_root_url(data, root_url, None)
+    for output in data:
+        if svg_bytes := self.get_svg(output):
+            base64_data = base64.b64encode(svg_bytes).decode("utf-8")
+            return_value = [types.ImageContent(type="image", data=base64_data, ...)]
+        elif client_utils.is_file_obj_with_meta(output):
+            if image := self.get_image(output["path"]):
+                image_format = image.format or "png"
+                base64_data = self.get_base64_data(image, image_format)
+                return_value = [types.ImageContent(type="image", data=base64_data, ...)]
 ```
 
-**3. 工具函数层面**：`image_utils.py` 中提供了 base64 编码函数：
+MCP 层从 `ImageData.path` 读取本地文件，打开为 PIL Image，再编码为 base64，包装为 MCP 的 `ImageContent` 返回给 MCP 客户端。这是 base64 输出**唯一真正生效的路径**。
 
-- [encode_image_to_base64()](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L227-L232)：PIL Image → JPEG base64
-- [encode_image_file_to_base64()](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L235-L240)：图像文件 → base64（保留原始格式）
-- [encode_image_array_to_base64()](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L216-L224)：numpy 数组 → JPEG base64
+### 7.4 工具函数（备用）
 
-### 7.3 streaming 的完整图景
+`image_utils.py` 提供了三个 base64 编码函数，但目前**无调用者**（仅定义未使用）：
 
-| 场景 | streaming 值 | 行为 |
-|------|-------------|------|
+- [encode_image_array_to_base64()](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L216-L224)：`np.ndarray` → JPEG base64 data URL
+- [encode_image_to_base64()](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L227-L232)：`PIL.Image` → JPEG base64 data URL
+- [encode_image_file_to_base64()](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/image_utils.py#L235-L240)：图像文件 → 保留原始格式的 base64 data URL
+
+### 7.5 完整图景
+
+| 场景 | streaming 值 | 实际行为 |
+|------|-------------|---------|
 | 输入侧 webcam 流 | `True`（bool） | 启用 webcam 实时流输入，前端定时发送帧 |
-| 输出侧 base64 | `"base64"`（str） | API 输出为 Base64ImageData，前端直接渲染 base64 |
-| 非 streaming | `False`（默认） | 正常文件路径传输，通过 `/file=` 端点访问 |
-
-**注意**：
-- `Image` 组件**不继承** `StreamingOutput`（与 Video/Audio 不同）
-- 输出侧的 base64 streaming 主要用于 API 层面的简化，以及需要减少 HTTP 请求的场景
-- 与 Video/Audio 的 chunk streaming 不同，Image 的 streaming 是单帧 base64 传输
+| 输出侧（Gradio UI / API） | `True`（bool） | **不产生 base64 输出**，仍然走文件路径 → `/file=...` |
+| 输出侧（MCP 协议） | 不相关 | MCP 层自行将文件读取并转为 base64 `ImageContent` |
+| `self.streaming == "base64"` | 不可达 | 死代码，`bool` 永远不等于 `"base64"` |
+| 非 streaming | `False`（默认） | 正常文件路径传输 |
 
 ---
 
@@ -527,12 +593,31 @@ class Base64ImageData(GradioModel):
     │    └─ 转为 RGBA 模式叠加后转回
     │
     ├─ save_image(value, cache_dir, format)
-    │    ├─ np.ndarray → 转 PIL → save_pil_to_cache
-    │    ├─ PIL.Image → save_pil_to_cache
-    │    └─ str/Path → 原样返回
+    │    ├─ np.ndarray → 转 PIL → save_pil_to_cache → 本地路径
+    │    ├─ PIL.Image → save_pil_to_cache → 本地路径
+    │    ├─ Path → 原样返回
+    │    └─ str (本地路径) → 原样返回
+    │    └─ str (远程 URL) → 原样返回（后续下载）
     │
-    └─ return ImageData(path=saved, orig_name=...)
-       (url 为 None，由路由层/前端生成可访问 URL)
+    ├─ return ImageData(path=saved, orig_name=...)
+    │
+    ▼
+move_files_to_cache(data, block, postprocess=True)
+    │
+    ├─ payload.url 是 HTTP URL (SVG 不会走这里)
+    │    └─ path=url, 跳过下载
+    │
+    ├─ payload.path 是远程 URL
+    │    └─ move_resource_to_block_cache() → 下载到缓存 → 本地路径
+    │       → url = "/file=<缓存路径>"
+    │
+    ├─ payload.path 是本地路径
+    │    └─ move_resource_to_block_cache() → 复制到缓存 → 本地路径
+    │       → url = "/file=<缓存路径>"
+    │
+    └─ payload.path 是 None (SVG 内联)
+         └─ move_resource_to_block_cache(None) → 返回 None
+            → ValueError("Did not determine a file path...")
 ```
 
 ---
@@ -555,35 +640,50 @@ class Base64ImageData(GradioModel):
          └─ 通用路径 → EXIF旋转 → mode转换 → format_image
 ```
 
-### 输出侧（postprocess）
+### 输出侧（postprocess → move_files_to_cache → 前端）
 
 ```
 用户返回值
     ├─ None → None
-    ├─ SVG 路径 → ImageData(url=data:image/svg+xml,...)
-    ├─ numpy/PIL/路径 → 水印 → save_image → ImageData(path=...)
-    └─ streaming="base64" → Base64ImageData(url=data:image/...;base64,...)
+    ├─ SVG 路径 → ImageData(url=data:image/svg+xml,...) → move_files_to_cache 出错
+    ├─ numpy/PIL → 水印 → save_image → ImageData(path=本地路径) → /file=<路径>
+    ├─ 本地路径 → ImageData(path=本地路径) → 复制到缓存 → /file=<缓存路径>
+    └─ 远程 URL → ImageData(path=https://...) → 下载到缓存 → /file=<缓存路径>
+
+MCP 协议层额外路径：
+    ImageData(path=本地路径) → MCP.postprocess_output_data()
+        → 打开文件 → PIL.Image → base64 → ImageContent
 ```
 
 ---
 
 ## 十、设计问题与权衡（续）
 
-### 问题 4：输出侧字符串路径不区分本地文件和 URL
+### 问题 4：远程 URL 会被下载到缓存
 
-`save_image()` 对 `str` 类型直接返回，不检查是本地路径还是远程 URL。这意味着：
-- 如果用户函数返回 URL，`postprocess_image` 会将其作为 `path` 返回
-- `orig_name` 会因 `Path(saved).exists() == False` 而为 `None`
-- 前端可能无法正确显示远程 URL 的图片
+~~之前错误结论：远程 URL 无法正确显示~~
+
+实际行为：当用户函数返回远程 URL（如 `https://example.com/img.png`）时：
+1. `postprocess_image()` 将其原样放入 `ImageData(path="https://...")`
+2. `move_files_to_cache()` 检测到 `path` 是 HTTP URL，调用 `move_resource_to_block_cache()`
+3. [async_move_resource_to_block_cache()](file:///d:/fz/0601/solo-dogfeeding/code/251-gradio/gradio/blocks.py#L335-L373) 通过 `async_ssrf_protected_download()` **下载到本地缓存**
+4. 最终前端收到的 `url` 为 `/file=<本地缓存路径>`
+
+**影响**：
+- ✅ 远程 URL 图片可以正确显示
+- ⚠️ 会产生额外的下载延迟和带宽开销
+- ⚠️ 如果远程 URL 不可达，会导致下载失败
+- ⚠️ `orig_name` 为 `None`（因为 `Path("https://...").exists()` 为 `False`），前端可能无法正确推断文件名
 
 ### 问题 5：输入输出的对称性
 
 | 能力 | 输入侧 preprocess | 输出侧 postprocess |
 |------|-----------------|------------------|
-| base64 处理 | ✅ 完整支持 | ⚠️ 仅 SVG 用 data URL，普通图不直接返回 base64 |
+| base64 处理 | ✅ 完整支持 | ❌ 从不返回 base64（MCP 层单独处理） |
 | EXIF 旋转 | ✅ 有（非快速路径） | ❌ 无（输出时保留原始方向） |
 | image_mode 转换 | ✅ 有（非快速路径、非 GIF） | ❌ 无（按原始格式保存） |
-| SVG 支持 | ⚠️ 仅 filepath | ✅ 内联为 data URL |
+| SVG 支持 | ⚠️ 仅 filepath | ⚠️ 内联为 data URL，但 move_files_to_cache 可能出错 |
+| 远程 URL | — | ✅ 下载到缓存后提供服务 |
 | 水印 | — | ✅ 有 |
 
 ### 问题 6：快速路径的两面性
@@ -592,3 +692,11 @@ class Base64ImageData(GradioModel):
 - ✅ 优点：零拷贝、零重编码，性能最优
 - ❌ 缺点：跳过 EXIF 旋转，可能导致方向错误
 - ❌ 缺点：与 base64 分支、非快速路径的行为不一致
+
+### 问题 7：`streaming == "base64"` 是死代码
+
+`Image.streaming` 类型为 `bool`，`api_info_as_output` 中 `self.streaming == "base64"` 永远为 `False`。`Base64ImageData` 模型和三个 `encode_image_*_to_base64()` 工具函数实际上从未在 Image 组件的输出路径中使用。文档描述 *"will automatically convert images to base64"* 与实际行为不符。
+
+### 问题 8：SVG 输出的 move_files_to_cache 问题
+
+`postprocess_image()` 对 SVG 返回 `ImageData(url="data:image/svg+xml,...", path=None)`。在 `move_files_to_cache` 中，`path=None` 会导致 `move_resource_to_block_cache(None)` 返回 `None`，随后抛出 `ValueError`。这意味着 SVG 的 data URL 内联方式可能与后续的文件缓存流程不兼容。
