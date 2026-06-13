@@ -4,6 +4,12 @@
 
 Gradio 提供了多层次的 JavaScript 注入能力，从全局页面脚本到单个事件的前端处理。这些 JS 注入与应用生命周期、组件事件之间的关系可以通过代码追踪清晰地展现。
 
+本文档重点澄清**四个易混淆概念**的执行顺序和适用场景：
+- `launch(head=...)` — L1 级头部注入
+- `launch(js=...)` — L2 级全局脚本
+- `dispatch("loaded")` — 页面级加载完成信号
+- `app_tree.ready` + `dispatch_load_events()` — 组件 load 事件
+
 ---
 
 ## 2. JS 注入的四个层级
@@ -11,7 +17,7 @@ Gradio 提供了多层次的 JavaScript 注入能力，从全局页面脚本到�
 | 层级 | 注入方式 | 作用域 | 代码位置 |
 |------|---------|--------|---------|
 | L1 | `launch(head=...)` / `head_paths` | HTML `<head>` 内的任意标签 | [blocks.py#L2653](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/gradio/blocks.py#L2653-L2654) |
-| L2 | `launch(js=...)` / `head_paths` 中的内联脚本 | 页面加载期，全局作用域 | [blocks.py#L2652](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/gradio/blocks.py#L2652) |
+| L2 | `launch(js=...)` | 页面加载期，全局作用域 | [blocks.py#L2652](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/gradio/blocks.py#L2652) |
 | L3 | 事件监听器的 `js="..."` 参数 | 事件触发时，前端预处理 | [block_function.py#L40](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/gradio/block_function.py#L40) |
 | L4 | 事件监听器的 `js=True` (Python→JS 自动转译) | 整个事件纯前端执行 | [blocks.py#L2438-L2460](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/gradio/blocks.py#L2438-L2460) |
 
@@ -73,62 +79,105 @@ return {
 
 ---
 
-## 4. 前端执行时机与生命周期
+## 4. 前端执行时机与生命周期（修正版）
 
-### 4.1 完整生命周期时序图
+### 4.1 精确执行时序
+
+以下是基于 `Index.svelte` onMount 真实代码的精确时序：
+
+[Index.svelte#L306-L427](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/spa/src/Index.svelte#L306-L427)
 
 ```
 Browser 加载页面
   │
   ├─ 1. SPA main.ts 启动，挂载 <gradio-app> WebComponent
   │
-  ├─ 2. Index.svelte onMount() 开始
+  ├─ 2. Index.svelte onMount() 开始 (L306)
   │   │
-  │   ├─ 2a. Client.connect(api_url) → 拉取 config
+  │   ├─ 2a. Client.connect(api_url) → HTTP /config 拉取配置
+  │   │   (await 阻塞)
   │   │
-  │   ├─ 2b. mount_custom_css(config.css)        ← CSS 注入
+  │   ├─ 2b. await mount_custom_css(config.css)
   │   │     [Index.svelte#L359]
   │   │
-  │   ├─ 2c. add_custom_html_head(config.head)   ← L1: Head 注入
+  │   ├─ 2c. await add_custom_html_head(config.head)   ← L1: Head 注入
   │   │     [Index.svelte#L360]
   │   │     内部实现：DOMParser 解析 → 逐个克隆节点到 document.head
-  │   │     [Index.svelte#L172-L200]
+  │   │     [Index.svelte#L172-L226]
+  │   │     注意：SCRIPT 标签 async=false，按文档顺序阻塞执行
   │   │
-  │   ├─ 2d. 创建 <script> 标签执行 config.js   ← L2: 全局 JS 注入
-  │   │     [Index.svelte#L372-L380]
-  │   │     ```javascript
-  │   │     const script = document.createElement("script");
-  │   │     script.textContent = config.js;
-  │   │     document.head.appendChild(script);
-  │   │     ```
+  │   ├─ 2d. dispatch("loaded")                        ← 页面级 loaded 信号
+  │   │     [Index.svelte#L364]
+  │   │     ⚠️  重要：此时组件 DOM **尚未**渲染！
+  │   │     ⚠️  重要：全局 config.js 也 **尚未** 执行！
   │   │
-  │   └─ 2e. dispatch("loaded") 事件
+  │   ├─ 2e. 响应式触发 load_demo()
+  │   │     [Index.svelte#L436]
+  │   │     $: if (config && (eager || $intersecting[_id])) load_demo();
+  │   │     └─> 动态 import("@gradio/core/blocks")
+  │   │         └─> 等待 CSS 就绪 + i18n 就绪
+  │   │             └─> Blocks.svelte 组件开始挂载
+  │   │
+  │   └─ 2f. 同步执行 config.js                       ← L2: 全局 JS 注入
+  │         [Index.svelte#L372-L380]
+  │         ```javascript
+  │         if (config.js) {
+  │             const script = document.createElement("script");
+  │             script.textContent = config.js;
+  │             document.head.appendChild(script);  // 同步阻塞执行
+  │         }
+  │         ```
+  │         ⚠️  重要：此时 Blocks.svelte 可能仍在导入中，组件 DOM **尚未**渲染
   │
-  ├─ 3. load_demo() → 渲染 Blocks.svelte 组件
-  │   │
-  │   ├─ 3a. 创建 DependencyManager
-  │   │     内部 new Dependency(dep_config) → 编译前端函数
-  │   │     [dependency.ts#L52-L86]
-  │   │
-  │   ├─ 3b. 创建 AppTree → 构建组件树
-  │   │
-  │   └─ 3c. Svelte onMount() 内
-  │         │
-  │         └─ app_tree.ready.then(() => {
-  │             ready = true;
-  │             dep_manager.dispatch_load_events();  ← load 事件触发
-  │         })
-  │         [Blocks.svelte#L442-L445]
-  │
-  └─ 4. 用户交互触发组件事件
-        │
-        └─ gradio_event_dispatcher() → dep_manager.dispatch()
-             [Blocks.svelte#L106-L158]
+  └─ 3. Blocks.svelte 组件挂载 (异步)
+      │
+      ├─ 3a. 构造 AppTree (组件树)
+      │   [init.svelte.ts#L96-L144]
+      │   ├─ 初始化 this.ready = new Promise(...)
+      │   ├─ 构建 components_to_register Set（所有 visible=true 的组件）
+      │   └─ 递归 traverse 布局树
+      │
+      ├─ 3b. 构造 DependencyManager
+      │   [dependency.ts#L194+]
+      │   └─ new Dependency(dep_config) → 编译前端函数
+      │      [dependency.ts#L52-L86]
+      │
+      ├─ 3c. Svelte 渲染 <MountComponents node={app_tree.root} />
+      │   [Blocks.svelte#L479]
+      │   │
+      │   └─ 每个组件的 Gradio 基类 constructor 中调用：
+      │      this.register_component(id, this.set_data, this.get_data)
+      │      [utils.svelte.ts#L430-L435]
+      │      │
+      │      └─ app_tree.register_component(id, ...)
+      │         ├─ this.components_to_register.delete(id)
+      │         └─ if (size === 0) this.ready_resolve()
+      │            [init.svelte.ts#L232-L235]
+      │
+      └─ 3d. Blocks.svelte onMount() 内
+            [Blocks.svelte#L422-L456]
+            │
+            └─ app_tree.ready.then(() => {
+                ready = true;
+                dep_manager.dispatch_load_events();   ← 组件 load 事件触发
+            })
+            [Blocks.svelte#L442-L445]
 ```
 
-### 4.2 L1: `head` 注入执行细节
+### 4.2 关键时间点对比表
 
-[Index.svelte#L172-L200](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/spa/src/Index.svelte#L172-L200)
+| 事件 | 代码位置 | 组件 DOM 是否渲染 | 能否操作组件 | 适用场景 |
+|------|---------|-----------------|-------------|---------|
+| **head 注入** | [Index.svelte#L360](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/spa/src/Index.svelte#L360) | ❌ 未渲染 | ❌ 不能 | 注入第三方库、CSS 样式、全局配置脚本 |
+| **`dispatch("loaded")`** | [Index.svelte#L364](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/spa/src/Index.svelte#L364) | ❌ 未渲染 | ❌ 不能 | 父级容器监听页面加载完成状态（与组件无关） |
+| **全局 `js` 执行** | [Index.svelte#L372-L380](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/spa/src/Index.svelte#L372-L380) | ❌ 未渲染 | ❌ 不能 | 定义全局函数、挂载 window 变量、注册全局事件监听器 |
+| **`app_tree.ready`** | [init.svelte.ts#L234](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/core/src/init.svelte.ts#L234) | ✅ 已挂载 | ✅ 能（DOM 已存在） | 组件注册全部完成的内部信号 |
+| **`dispatch_load_events()`** | [Blocks.svelte#L444](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/core/src/Blocks.svelte#L444) | ✅ 已挂载 | ✅ 能 | 组件 load 事件触发，可读取/修改组件值 |
+| **`render_complete` → CustomEvent("render")** | [Index.svelte#L495-L503](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/spa/src/Index.svelte#L495-L503) | ✅ 已挂载 | ✅ 能 | 嵌入场景通知父页面渲染完成 |
+
+### 4.3 L1: `head` 注入执行细节
+
+[Index.svelte#L172-L226](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/spa/src/Index.svelte#L172-L226)
 
 ```javascript
 async function add_custom_html_head(head_string: string | null): Promise<void> {
@@ -142,16 +191,44 @@ async function add_custom_html_head(head_string: string | null): Promise<void> {
             if (newElement.tagName === "SCRIPT") {
                 (newElement as HTMLScriptElement).async = false; // 保序执行
             }
-            // 复制 attributes 和 children
+            // 复制 attributes、textContent、children
             document.head.appendChild(newElement);
         }
     }
 }
 ```
 
-**关键点**：SCRIPT 标签设置 `async=false`，确保按文档顺序执行。`head` 注入发生在全局 `js` 注入之前。
+**关键点**：
+- `await` 会等待所有外部资源（如 `<script src>`、`<link rel="stylesheet">`）加载完成
+- 内联 `<script>` 会在 `appendChild` 时**同步阻塞**执行
+- `async=false` 保证多个 SCRIPT 按文档顺序执行
+- 执行时机早于 `dispatch("loaded")`，早于全局 `js`
 
-### 4.3 L2: 全局 `js` 注入执行细节
+### 4.4 `dispatch("loaded")`：页面级信号（⚠️ 不是 DOM ready！）
+
+[Index.svelte#L364](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/spa/src/Index.svelte#L364)
+
+```javascript
+await mount_custom_css(config.css);
+await add_custom_html_head(config.head);
+css_ready = true;
+dispatch("loaded");   // ← 此处触发
+
+// 下面的代码在 dispatch("loaded") 之后才执行
+pages = config.pages;
+current_page = config.current_page;
+root = config.root;
+// ...
+if (config.js) { /* 注入全局 JS */ }
+```
+
+**重要澄清**：
+- `dispatch("loaded")` 是 Svelte 组件事件，只通知父级 `<gradio-app>` 容器
+- 触发时：✅ CSS 就绪 / ✅ Head 资源加载完成 / ❌ 组件 DOM **未** 渲染 / ❌ 全局 js **未** 执行
+- **与 `load` 事件无关**，是页面级容器状态信号
+- 触发后才执行全局 `js` 注入，然后才开始动态 import Blocks 模块
+
+### 4.5 L2: 全局 `js` 注入执行细节
 
 [Index.svelte#L372-L380](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/spa/src/Index.svelte#L372-L380)
 
@@ -160,7 +237,7 @@ if (config.js) {
     try {
         const script = document.createElement("script");
         script.textContent = config.js;
-        document.head.appendChild(script);
+        document.head.appendChild(script);  // 同步阻塞执行
     } catch (e) {
         console.error("Error executing custom JS:", e);
     }
@@ -168,18 +245,41 @@ if (config.js) {
 ```
 
 **关键点**：
-- 此时组件 DOM 尚未渲染（Blocks.svelte 还没 mount），但 `document`、`window` 可用
-- 如果需要操作组件 DOM，应使用 DOMContentLoaded 监听或 `load` 事件
-- 执行顺序：`head` → `js` → `load_demo()`
+- **执行顺序**：`head` → `dispatch("loaded")` → **全局 `js`**
+- 此时：✅ `window`/`document` 可用 / ❌ Blocks.svelte 组件可能仍在导入 / ❌ 组件 DOM **未** 渲染
+- 如果需要操作组件 DOM，**必须**用 `load` 事件，不能用全局 `js` 直接查询 DOM
+- 作用于全局作用域，可以定义 `window.myFn = function() {...}` 供后续事件级 JS 调用
 
-### 4.4 load 事件 (Blocks.load)
+### 4.6 `app_tree.ready`：组件就绪的内部 Promise
+
+[init.svelte.ts#L232-L235](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/core/src/init.svelte.ts#L232-L235)
+
+```javascript
+if (this.components_to_register.size === 0 && !this.resolved) {
+    this.resolved = true;
+    this.ready_resolve();   // ← 所有组件注册完成
+}
+```
+
+**触发条件**：
+- AppTree 构造时先将所有 `visible=true` 的组件 ID 加入 `components_to_register` Set
+  [init.svelte.ts#L123-L125](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/core/src/init.svelte.ts#L123-L125)
+- 不可见组件（`visible=false`、折叠的 accordion 子项、非活动 tab 子项）会被 `_untrack()` 从 Set 中排除
+  [init.svelte.ts#L818-L871](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/core/src/init.svelte.ts#L818-L871)
+- 每个可见组件在其 Gradio 基类 constructor 中调用 `register_component()` 时从 Set 中删除 ID
+  [utils.svelte.ts#L430-L435](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/utils/src/utils.svelte.ts#L430-L435)
+- 当 Set size 降为 0 时 resolve `app_tree.ready`
+
+**注意**：非活动 tab / 折叠 accordion 中的组件不会触发 ready，直到它们被展开时才会注册。
+
+### 4.7 `load` 事件：组件级初始化事件
 
 触发时机：[Blocks.svelte#L442-L445](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/core/src/Blocks.svelte#L442-L445)
 
 ```javascript
 app_tree.ready.then(() => {
     ready = true;
-    dep_manager.dispatch_load_events();  // 所有组件 DOM 已挂载完毕
+    dep_manager.dispatch_load_events();  // 所有可见组件 DOM 已挂载
 });
 ```
 
@@ -202,7 +302,16 @@ dispatch_load_events() {
 }
 ```
 
-**自动 load 事件附加**：[blocks.py#L989-L1011](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/gradio/blocks.py#L989-L1011) 中 `attach_load_events()` 会自动为有初始值需要后端计算的组件附加 `load` 事件。
+**两种 load 事件来源**：
+
+1. **显式声明**：`demo.load(fn=..., inputs=..., outputs=...)` 或 `component.load(fn)`
+2. **自动附加**：[blocks.py#L989-L1011](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/gradio/blocks.py#L989-L1011) `attach_load_events()` 为有初始值需要后端计算的组件（如 `gr.Video(value=...)`）自动附加 `load` 事件
+
+**`load` 事件的 JS 能力**：
+- 触发时组件 DOM 已完全挂载，可以通过 `document.getElementById()` 查询组件元素
+- 可以读取和修改组件值（`gr.State`、`gr.Textbox` 等）
+- 支持 L3（`js="..."` 预处理）和 L4（`js=True` 转译）两种前端执行方式
+- 如果有 Python 后端，会正常发起 `/call` 请求
 
 ---
 
@@ -300,7 +409,7 @@ async run(client, data_payload, event_data, target_id) {
 }
 ```
 
-**三种协同模式对比**：
+**四种协同模式对比**：
 
 | 模式 | Python fn | `js=...` | `js=True` | 执行路径 |
 |------|-----------|----------|-----------|---------|
@@ -395,10 +504,13 @@ with gr.Blocks() as demo:
         js="(x) => x.trim()"       # 前端预处理
     )
 
-demo.launch(js="console.log('global init')")
+demo.launch(
+    head="<script>window.LIB_VERSION='1.0'</script>",
+    js="console.log('global init', window.LIB_VERSION);"
+)
 ```
 
-**执行追踪**：
+**执行追踪（精确时序）**：
 
 1. **配置阶段**：`BlockFunction.get_config()` 输出
    ```json
@@ -411,9 +523,17 @@ demo.launch(js="console.log('global init')")
    }
    ```
 
-2. **前端初始化**：
-   - `Index.svelte` onMount → 注入 `console.log('global init')`
-   - Blocks.svelte onMount → DependencyManager 编译 `process_frontend_fn("(x)=>x.trim()", true, 1, 1)`
+2. **前端初始化时序**：
+   - T0: `Index.svelte` onMount → `Client.connect()` 拉取 config
+   - T1: `await mount_custom_css(config.css)` → CSS 就绪
+   - T2: `await add_custom_html_head(config.head)` → 执行 `<script>window.LIB_VERSION='1.0'</script>`
+   - T3: `dispatch("loaded")` → 通知父容器（组件 DOM 未渲染）
+   - T4: `load_demo()` 触发 → 开始动态 import Blocks 模块（异步）
+   - T5: 注入全局 `js` → 执行 `console.log('global init', '1.0')` → 输出 `global init 1.0`
+   - T6: Blocks 模块加载完成 → 构造 AppTree（components_to_register = {0,1,2,3}）
+   - T7: Blocks.svelte 首次渲染 → 每个组件 constructor 调用 `register_component`，逐个从 Set 中删除
+   - T8: 最后一个组件注册完成 → `app_tree.ready_resolve()`
+   - T9: `dep_manager.dispatch_load_events()` → 触发所有 load 事件
 
 3. **用户点击按钮**：
    - 组件 Button emit `click` → `gradio_event_dispatcher(3, "click", null)`
@@ -430,17 +550,76 @@ demo.launch(js="console.log('global init')")
 
 ---
 
-## 7. 关键文件索引
+## 7. 常见问题与最佳实践
+
+### Q1: 全局 `js` 中为什么 `document.getElementById("component-id")` 返回 null？
+
+**原因**：全局 `js` 执行时（T5），Blocks.svelte 组件仍在异步导入/渲染中，DOM 尚未创建。
+
+**解决方案**：
+```python
+# ❌ 错误
+demo.launch(js="document.getElementById('my-text').value = 'hello'")
+
+# ✅ 正确 - 使用 load 事件
+with gr.Blocks() as demo:
+    t = gr.Textbox(elem_id="my-text")
+    demo.load(
+        fn=None,
+        outputs=t,
+        js="() => 'hello'"  # 此时组件 DOM 已就绪
+    )
+```
+
+### Q2: `dispatch("loaded")` 和 `dispatch_load_events()` 有什么区别？
+
+| 特性 | `dispatch("loaded")` | `dispatch_load_events()` |
+|------|---------------------|-------------------------|
+| 触发者 | Index.svelte | Blocks.svelte onMount |
+| 触发时机 | head 注入完成后 | 所有组件注册完成后 |
+| 组件 DOM | ❌ 未渲染 | ✅ 已挂载 |
+| 作用对象 | 父级 `<gradio-app>` 容器 | 所有带 `load` 事件的组件 |
+| 能否触发 Python 代码 | ❌ 不能 | ✅ 能 |
+| 能否访问组件值 | ❌ 不能 | ✅ 能 |
+
+### Q3: `head` 中的内联 `<script>` 和 `launch(js=...)` 有什么区别？
+
+| 特性 | `head="<script>...</script>"` | `launch(js="...")` |
+|------|------------------------------|-------------------|
+| 执行时机 | `dispatch("loaded")` 之前 | `dispatch("loaded")` 之后 |
+| 顺序保证 | 与其他 head 资源按序执行 | 保证在 head 之后执行 |
+| 适用场景 | 第三方库引入、全局 CSS、早于所有代码的配置 | 初始化全局函数、挂载 window 变量 |
+
+### Q4: 非活动 tab 中的组件会触发 load 事件吗？
+
+**不会**。非活动 tab / 折叠 accordion 中的组件在布局树遍历阶段会被 `_untrack()` 从 `components_to_register` Set 中移除，因此不会计入 `app_tree.ready` 的 resolve 条件。当 tab 切换到活动状态时，组件才会被渲染并调用 `register_component()`，此时也会触发其 `load` 事件。
+
+### Q5: 自定义 JS 中如何调用另一个事件的 Python 函数？
+
+在全局 `js` 或事件级 `js` 中，可以通过组件实例的 API：
+```javascript
+// 在 load 事件或用户交互事件中
+const button = document.querySelector("[data-testid='button']");
+button.click();  // 触发按钮点击事件，会执行其绑定的 Python 函数
+```
+
+或者通过 `dep_manager` 直接调度（需在 Svelte 上下文内）。
+
+---
+
+## 8. 关键文件索引
 
 | 功能模块 | 文件 | 关键代码位置 |
 |---------|------|------------|
-| 全局 JS/Head 注入 | [blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/gradio/blocks.py) | `launch()` L2602+ / `get_config_file()` L2381+ |
+| 全局 JS/Head 注入配置 | [blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/gradio/blocks.py) | `launch()` L2602+ / `get_config_file()` L2381+ |
 | 事件函数配置 | [block_function.py](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/gradio/block_function.py) | `get_config()` L138+ |
 | 配置 HTTP API | [routes.py](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/gradio/routes.py) | `/config` 路由 L954+ |
-| SPA 入口注入 | [Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/spa/src/Index.svelte) | onMount L306+ / 注入 JS L372+ |
+| SPA 入口注入时序 | [Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/spa/src/Index.svelte) | onMount L306+ / 注入 JS L372+ / dispatch("loaded") L364 |
 | Head 注入实现 | [Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/spa/src/Index.svelte) | `add_custom_html_head()` L172+ |
 | 依赖管理与运行 | [dependency.ts](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/core/src/dependency.ts) | `Dependency` L25+ / `DependencyManager` L194+ |
 | 前端函数编译 | [dependency.ts](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/core/src/dependency.ts) | `process_frontend_fn()` L935+ |
 | load 事件触发 | [Blocks.svelte](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/core/src/Blocks.svelte) | onMount L442+ |
+| AppTree 组件就绪 | [init.svelte.ts](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/core/src/init.svelte.ts) | `register_component()` L209+ / ready_resolve L234 |
+| 组件基类注册 | [utils.svelte.ts](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/utils/src/utils.svelte.ts) | Gradio 基类 constructor L430+ |
 | 事件派发器 | [Blocks.svelte](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/js/core/src/Blocks.svelte) | `gradio_event_dispatcher()` L106+ |
 | Python→JS 转译 | [blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/257-gradio/gradio/blocks.py) | `transpile_to_js()` L2438+ |
