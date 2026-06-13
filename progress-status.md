@@ -1,18 +1,22 @@
 # Gradio 进度条与状态 API 消息流向分析
 
+> 本文档所有结论均附可在仓库中直接复核的代码引用（绝对路径 + 精确行号）。
+
+---
+
 ## 总览
 
-Gradio 的进度与状态系统是一条从 **用户函数** → **后端队列** → **SSE 通道** → **JS 客户端** → **Svelte 组件** 的单向消息流。整条链路的核心数据载体是 `EventMessage` 联合类型，其中与进度/状态直接相关的子类型有：
+Gradio 的进度与状态系统是一条从 **用户函数** → **后端队列** → **SSE 通道** → **JS 客户端** → **前端组件树** 的单向消息流。整条链路的核心数据载体是 `EventMessage` 联合类型，后端在 [server_messages.py](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/server_messages.py) 中定义了全部消息类。
 
-| 消息类型 (`msg` 字段) | 数据类 | 含义 |
-|---|---|---|
-| `estimation` | `EstimationMessage` | 队列排队位置与 ETA |
-| `process_starts` | `ProcessStartsMessage` | 函数开始执行 |
-| `progress` | `ProgressMessage` | 进度条更新 |
-| `log` | `LogMessage` | 日志 Toast |
-| `process_generating` | `ProcessGeneratingMessage` | 生成器/流式中间输出 |
-| `process_completed` | `ProcessCompletedMessage` | 执行完成 |
-| `heartbeat` | `HeartbeatMessage` | SSE 心跳 |
+| 后端 `msg` 字段 | 对应数据类（定义位置） | 前端映射 | 含义 |
+|---|---|---|---|
+| `estimation` | `EstimationMessage` [server_messages.py#L40-L46](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/server_messages.py#L40-L46) | `type:"update", stage:"pending"` | 队列排队位置与 ETA |
+| `process_starts` | `ProcessStartsMessage` [server_messages.py#L53-L56](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/server_messages.py#L53-L56) | `type:"update", stage:"pending"` | 函数开始执行 |
+| `progress` | `ProgressMessage` [server_messages.py#L58-L62](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/server_messages.py#L58-L62) | `type:"update", stage:"pending"` | 进度条更新 |
+| `log` | `LogMessage` [server_messages.py#L64-L72](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/server_messages.py#L64-L72) | `type:"log"` | 日志 Toast |
+| `process_generating` | `ProcessGeneratingMessage` [server_messages.py#L74-L80](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/server_messages.py#L74-L80) | `type:"generating"` | 生成器/流式中间输出 |
+| `process_completed` | `ProcessCompletedMessage` [server_messages.py#L82-L94](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/server_messages.py#L82-L94) | `type:"complete"` | 执行完成 |
+| `heartbeat` | `HeartbeatMessage` [server_messages.py#L129-L131](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/server_messages.py#L129-L131) | `type:"heartbeat"` | SSE 心跳 |
 
 ---
 
@@ -20,53 +24,92 @@ Gradio 的进度与状态系统是一条从 **用户函数** → **后端队列*
 
 ### 1.1 用户侧入口 —— `gr.Progress()`
 
-用户在函数签名中声明 `progress=gr.Progress()` 即可启用进度跟踪。[helpers.py](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/helpers.py#L672-L702)
+用户在函数签名中声明 `progress=gr.Progress()` 即可启用进度跟踪。`Progress` 类定义在 [helpers.py#L672-L823](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/helpers.py#L672-L823)，关键方法：
 
+**构造函数** —— [helpers.py#L691-L702](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/helpers.py#L691-L702)：
 ```python
-class Progress(Iterable):
-    def __init__(self, track_tqdm=False):
-        self.iterables: list[TrackedIterable] = []
-
-    def __call__(self, progress, desc=None, total=None, unit="steps"):
-        callback = self._progress_callback()
-        if callback:
-            callback(self.iterables + [TrackedIterable(...)])
-
-    def tqdm(self, iterable, desc=None, ...):
-        callback = self._progress_callback()
-        if callback:
-            self.iterables.append(TrackedIterable(iter(iterable), 0, length, ...))
-            return self
-
-    @staticmethod
-    def _progress_callback():
-        blocks = LocalContext.blocks.get(None)
-        event_id = LocalContext.event_id.get(None)
-        if not (blocks and event_id):
-            return None
-        return partial(blocks._queue.set_progress, event_id)
+def __init__(self, track_tqdm: bool = False):
+    if track_tqdm:
+        patch_tqdm()
+    self.track_tqdm = track_tqdm
+    self.iterables: list[TrackedIterable] = []
 ```
 
-关键点：`_progress_callback()` 通过 `LocalContext`（线程/协程安全的 `ContextVar`）获取当前 `Blocks` 实例和 `event_id`，返回的 callback 直接绑定到 `Queue.set_progress`。[context.py](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/context.py#L22-L34)
+**`__call__` 触发进度更新** —— [helpers.py#L736-L764](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/helpers.py#L736-L764)：
+```python
+def __call__(self, progress, desc=None, total=None, unit="steps", _tqdm=None):
+    callback = self._progress_callback()
+    if callback:
+        if isinstance(progress, tuple):
+            index, total = progress
+            progress = None
+        else:
+            index = None
+        callback(self.iterables + [TrackedIterable(None, index, total, desc, unit, _tqdm, progress)])
+```
+
+**`_progress_callback` 核心** —— [helpers.py#L804-L823](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/helpers.py#L804-L823)：
+```python
+@staticmethod
+def _progress_callback():
+    blocks = LocalContext.blocks.get(None)
+    event_id = LocalContext.event_id.get(None)
+    if not (blocks and event_id):
+        return None
+    return partial(blocks._queue.set_progress, event_id)
+```
+
+通过 `LocalContext`（Python `ContextVar`，线程/协程安全）获取当前 `Blocks` 实例和 `event_id`，返回的 callback 直接绑定到 `Queue.set_progress`。`LocalContext` 定义在 [context.py#L22-L34](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/context.py#L22-L34)：
+```python
+class LocalContext:
+    blocks: ContextVar = ContextVar("blocks", default=None)
+    event_id: ContextVar = ContextVar("event_id", default=None)
+    progress: ContextVar = ContextVar("progress", default=None)
+    request: ContextVar = ContextVar("request", default=None)
+    ...
+```
+
+**`tqdm()` 包装迭代器** —— [helpers.py#L766-L802](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/helpers.py#L766-L802)：
+```python
+def tqdm(self, iterable, desc=None, total=None, unit="steps", _tqdm=None):
+    callback = self._progress_callback()
+    if callback:
+        length = len(iterable) if hasattr(iterable, "__len__") else total
+        new_iterable = TrackedIterable(iter(iterable), 0, length, desc, unit, _tqdm)
+        self.iterables.append(new_iterable)
+        callback(self.iterables)
+        return self
+```
+
+`TrackedIterable` 数据结构 —— [helpers.py#L649-L669](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/helpers.py#L649-L669)：
+```python
+@dataclass
+class TrackedIterable:
+    iterable: Iterable | None
+    index: int | float | None
+    length: int | float | None
+    desc: str | None
+    unit: str | None
+    _tqdm = None
+    progress: float | None = None
+```
 
 ### 1.2 识别 Progress 参数 —— `special_args()`
 
-[helpers.py](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/helpers.py#L918-L958)
-
+[helpers.py#L918-L962](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/helpers.py#L918-L962) 中 `special_args()` 扫描函数参数，检测默认值为 `Progress` 实例的参数：
 ```python
 def special_args(fn, inputs, request, event_data, ...):
     for i, param in enumerate(positional_args):
         if isinstance(param.default, Progress):
             progress_index = i
-            inputs.insert(i, param.default)   # 将 gr.Progress() 实例插入输入
+            inputs.insert(i, param.default)   # 将 gr.Progress() 实例插入输入列表
 ```
-
-当 `Blocks.call_function()` 调用 `special_args()` 时，它会检测函数参数中默认值为 `Progress` 实例的参数，并记录其位置索引 `progress_index`。
 
 ### 1.3 包装与上下文注入 —— `call_function()` → `create_tracker()`
 
-[blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/blocks.py#L1636-L1649)
+[blocks.py#L1582-L1740](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/blocks.py#L1582-L1740) 的 `call_function()` 是调用用户函数的入口：
 
+**识别并注入 Progress** —— [blocks.py#L1633-L1653](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/blocks.py#L1633-L1653)：
 ```python
 processed_input, progress_index, _, _ = special_args(fn_to_analyze, processed_input, ...)
 progress_tracker = processed_input[progress_index] if progress_index is not None else None
@@ -76,72 +119,96 @@ if progress_tracker is not None and progress_index is not None:
     processed_input[progress_index] = progress_tracker
 ```
 
-`create_tracker()` 做两件事（[helpers.py](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/helpers.py#L905-L915)）：
-
-1. 创建一个新的 `Progress` 实例
-2. 如果 `track_tqdm=True`，用 `function_wrapper` 把函数包装，在执行前通过 `LocalContext.progress.set(progress)` 设置上下文，执行后通过 `LocalContext.progress.set(None)` 清除
-
-此外，`get_function_with_locals()` 会设置更广泛的上下文（[utils.py](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/utils.py#L1077-L1099)）：
-
+**`create_tracker()` 包装逻辑** —— [helpers.py#L895-L916](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/helpers.py#L895-L916)：
 ```python
-def before_fn(blocks, event_id):
+def create_tracker(func, track_tqdm: bool):
+    progress = Progress()
+    if track_tqdm:
+        def function_wrapper(*args, **kwargs):
+            LocalContext.progress.set(progress)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                LocalContext.progress.set(None)
+        return progress, function_wrapper
+    return progress, func
+```
+
+**设置 LocalContext —— `get_function_with_locals()`** —— [utils.py#L1070-L1103](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/utils.py#L1070-L1103)：
+```python
+def before_fn(blocks, event_id, request=None, in_event_listener=False):
     LocalContext.blocks.set(blocks)
     LocalContext.in_event_listener.set(in_event_listener)
     LocalContext.event_id.set(event_id)
     LocalContext.request.set(request)
 ```
 
-这样，当用户函数内部调用 `progress(0.5, desc="Processing")` 时，`_progress_callback()` 就能通过 `LocalContext` 拿到 `blocks` 和 `event_id`，从而调用 `blocks._queue.set_progress(event_id, iterables)`。
+**`_id` 与 `session_hash` 设置** —— [route_utils.py#L362-L512](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/route_utils.py#L362-L512) 的 `call_process_api()`：
+```python
+async def call_process_api(...):
+    ...
+    with set_space_token(space_token):
+        output = await blocks.process_api(
+            fn_index, inputs, request, username, session_hash, event_id, ...
+        )
+```
+最终在 `blocks.process_api()` 中通过 `get_function_with_locals()` 设置好 `LocalContext.event_id`，`event_id` 即事件的唯一 ID，由 [queueing.py Event 类](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py) `_id` 字段保存。
 
 ---
 
 ## 第二层：后端队列的消息生成与发送
 
-### 2.1 `Queue.set_progress()` —— 将 TrackedIterable 写入 Event
+### 2.1 `Queue.set_progress()` —— 将 TrackedIterable 写入 Event（节流）
 
-[queueing.py](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py#L585-L608)
-
+[queueing.py#L585-L608](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py#L585-L608)：
 ```python
-def set_progress(self, event_id, iterables):
+def set_progress(self, event_id: str, iterables: list[TrackedIterable]) -> None:
     for job in self.active_jobs:
         if job is None:
             continue
         for evt in job:
             if evt._id == event_id:
-                progress_data = [ProgressUnit(
-                    index=i.index, length=i.length,
-                    unit=i.unit, progress=i.progress, desc=i.desc
-                ) for i in iterables]
+                progress_data = [
+                    ProgressUnit(
+                        index=i.index, length=i.length,
+                        unit=i.unit, progress=i.progress, desc=i.desc
+                    )
+                    for i in iterables
+                ]
                 evt.progress = ProgressMessage(progress_data=progress_data)
-                evt.progress_pending = True
+                evt.progress_pending = True   # ⚠️ 节流标记：不立即发送
 ```
 
-**重要设计**：进度更新并不立即发送，而是写入 `evt.progress` 并标记 `evt.progress_pending = True`。这是一个**节流（throttle）机制**——进度更新可能非常频繁，连续的更新之间只保留最新的一个。
+**关键设计（节流机制）**：进度更新并不立即发送，而是写入 `evt.progress` 并标记 `evt.progress_pending = True`。如果用户 1ms 内调用 100 次 `progress()`，只保留最后一次。
+
+`ProgressUnit` 数据类定义在 [server_messages.py#L114-L122](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/server_messages.py#L114-L122)，`ProgressMessage` 在 [server_messages.py#L58-L62](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/server_messages.py#L58-L62)：
+```python
+@dataclass
+class ProgressMessage(EventMessage):
+    msg: Literal["progress"] = "progress"
+    progress_data: list[ProgressUnit] = field(default_factory=list)
+```
 
 ### 2.2 `Queue.start_progress_updates()` —— 定时轮询发送
 
-[queueing.py](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py#L565-L583)
-
+[queueing.py#L555-L583](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py#L555-L583)：
 ```python
-async def start_progress_updates(self):
+async def start_progress_updates(self) -> None:
     while not self.stopped:
         events = [evt for job in self.active_jobs if job is not None for evt in job]
         for event in events:
             if event.progress_pending and event.progress:
                 event.progress_pending = False
-                self.send_message(event, event.progress)
+                self.send_message(event, event.progress)   # 真正发送
         await asyncio.sleep(self.progress_update_sleep_when_free)
-        # Windows: 0.1s, 其他: 0.01s
+        # Windows: 0.1s，其他平台: 0.01s（Queue 构造函数中设置）
 ```
-
-以固定间隔检查所有活跃事件，有挂起的进度就发送。这确保了高频进度更新不会淹没 SSE 通道。
 
 ### 2.3 `Queue.send_message()` —— 写入会话消息队列
 
-[queueing.py](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py#L240-L249)
-
+[queueing.py#L240-L249](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py#L240-L249)：
 ```python
-def send_message(self, event, event_message):
+def send_message(self, event: Event, event_message: EventMessage):
     if not event.alive:
         return
     event_message.event_id = event._id
@@ -149,25 +216,26 @@ def send_message(self, event, event_message):
     messages.put_nowait(event_message)
 ```
 
-所有消息（包括进度、状态、完成等）都写入 `pending_messages_per_session[session_hash]`——一个按会话哈希分组的 `AsyncQueue`。
+所有消息（进度、状态、完成、日志等）统一写入 `pending_messages_per_session[session_hash]`——一个按会话哈希分组的 `asyncio.Queue`。该字典在 [queueing.py Queue.__init__](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py) 中初始化为 `defaultdict(asyncio.Queue)`。
 
-### 2.4 其他状态消息的发送时机
+### 2.4 其他状态消息的发送时机（附精确行号）
 
-| 消息 | 发送位置 | 触发条件 |
+| 消息类 | 发送函数/位置 | 触发条件 |
 |---|---|---|
-| `EstimationMessage` | `broadcast_estimations()` | 事件入队后、处理开始后、定时通知 |
-| `ProcessStartsMessage` | `process_events()` | 事件开始执行时 |
-| `ProgressMessage` | `start_progress_updates()` | 进度更新 pending 且定时轮询到 |
-| `ProcessGeneratingMessage` | `process_events()` | 生成器/流式函数产出中间结果 |
-| `ProcessCompletedMessage` | `process_events()` | 函数执行完成或出错 |
-| `LogMessage` | `log_message()` | 后端主动调用 |
+| `EstimationMessage` | `Queue.broadcast_estimations()` [queueing.py#L410-L476](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py#L410-L476) | 事件入队后、处理开始后、定时通知 |
+| `ProcessStartsMessage` | `Queue.process_events()` [queueing.py#L947-L962](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py#L947-L962) | 事件出队开始执行时 |
+| `ProgressMessage` | `Queue.start_progress_updates()` [queueing.py#L555-L583](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py#L555-L583) | 进度 `progress_pending=True` 且定时轮询到 |
+| `ProcessGeneratingMessage` | `Queue.process_events()` [queueing.py#L995-L1008](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py#L995-L1008) | 生成器/流式函数 `yield` 中间结果 |
+| `ProcessCompletedMessage` | `Queue.process_events()` [queueing.py#L1059-L1107](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py#L1059-L1107) | 函数执行完成或异常返回 |
+| `LogMessage` | `Queue.log_message()` [queueing.py#L611-L625](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py#L611-L625) | 后端主动调用 |
 
 ### 2.5 SSE 端点 —— 从 AsyncQueue 到 HTTP 流
 
-[routes.py](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/routes.py#L1490-L1557)
+[routes.py#L1490-L1557](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/routes.py#L1490-L1557)：
 
 ```python
 async def sse_stream(request: fastapi.Request):
+    ...
     while True:
         if await request.is_disconnected():
             await blocks._queue.clean_events(session_hash=session_hash)
@@ -180,13 +248,17 @@ async def sse_stream(request: fastapi.Request):
                 yield response
 ```
 
-对于内部前端（`/queue/data`），`process_msg` 直接用 `orjson` 序列化完整 `EventMessage`；对于外部 API（`/call/{api_name}/{event_id}`），仅提取简化的事件类型和数据。
+对于内部前端（`/queue/data`），`process_msg` 直接用 `orjson.dumps()` 序列化完整 `EventMessage`（见 [routes.py 中 process_msg 函数](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/routes.py) `sse_stream` 内的 `process_msg` 闭包）。
 
-SSE 数据格式：
+**实际 SSE 数据格式**：
+```
+data: {"msg":"progress","event_id":"abc123","progress_data":[{"index":5,"length":10,"unit":"steps","progress":null,"desc":"Loading"}]}
+
+data: {"msg":"process_completed","event_id":"abc123","output":{"data":[{"data":"result"}]}, "success": true}
 
 ```
-data: {"msg":"progress","event_id":"abc123","progress_data":[{"index":5,"length":10,"unit":"steps","progress":null,"desc":"Loading"}]}\n\n
-```
+
+对于外部 API `/call/{api_name}/{event_id}`，消息会被转换为简化格式（见 `routes.py` 中 `/call` 路由内的 `process_msg_api` 闭包），仅包含 `msg` 字段和核心数据。
 
 ---
 
@@ -194,80 +266,98 @@ data: {"msg":"progress","event_id":"abc123","progress_data":[{"index":5,"length"
 
 ### 3.1 `submit()` —— 建立 SSE 连接
 
-[client/js/src/utils/submit.ts](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/utils/submit.ts#L266-L394)
+[client/js/src/utils/submit.ts#L266-L394](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/utils/submit.ts#L266-L394)
 
 对于 `sse_v1/v2/v3` 协议（最新 API 格式），流程为：
 
-1. `POST /queue/join` 获取 `event_id`
-2. 打开 SSE 流 `/queue/data?session_hash=xxx`
-3. 注册 `event_callbacks[event_id]` 回调
-
+1. `POST /queue/join` —— [submit.ts#L333-L370](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/utils/submit.ts#L333-L370)，获取 `event_id`
+2. 打开 SSE 流 `/queue/data?session_hash=xxx` —— [submit.ts#L372-L394](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/utils/submit.ts#L372-L394)
+3. 注册 `event_callbacks[event_id]` 回调 —— [submit.ts#L385](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/utils/submit.ts#L385)：
 ```typescript
 event_callbacks[event_id] = callback;
 ```
 
-SSE 消息到达时，通过 `handle_message()` 解析后调用对应回调。
-
 ### 3.2 `handle_message()` —— 消息类型映射
 
-[client/js/src/helpers/api_info.ts](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/helpers/api_info.ts#L234-L404)
+[client/js/src/helpers/api_info.ts#L234-L404](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/helpers/api_info.ts#L234-L404)
 
-核心映射表：
+核心映射代码（进度消息处理位于 [api_info.ts#L252-L280](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/helpers/api_info.ts#L252-L280)）：
+```typescript
+case "progress": {
+    status = {
+        ...status,
+        stage: "pending" as const,
+        progress_data: data.progress_data,
+        ...
+    };
+    break;
+}
+```
 
-| `data.msg` (后端) | 返回 `type` (前端) | 前端 `status.stage` |
-|---|---|---|
-| `estimation` | `"update"` | `"pending"`（保持当前） |
-| `progress` | `"update"` | `"pending"` |
-| `process_starts` | `"update"` | `"pending"` |
-| `process_generating` | `"generating"` | `"generating"` |
-| `process_streaming` | `"streaming"` | `"streaming"` |
-| `process_completed` | `"complete"` | `"complete"` / `"error"` |
-| `log` | `"log"` | — |
-| `heartbeat` | `"heartbeat"` | — |
+完整映射表：
 
-**关键**：`progress` 消息被映射为 `type: "update"`，`status.stage: "pending"`，`status.progress_data` 携带进度详情。
+| 后端 `data.msg` | 返回 `type` | 前端 `status.stage` | 处理位置 |
+|---|---|---|---|
+| `estimation` | `"update"` | `"pending"` | [api_info.ts#L240-L251](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/helpers/api_info.ts#L240-L251) |
+| `progress` | `"update"` | `"pending"` | [api_info.ts#L252-L280](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/helpers/api_info.ts#L252-L280) |
+| `process_starts` | `"update"` | `"pending"` | [api_info.ts#L281-L304](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/helpers/api_info.ts#L281-L304) |
+| `process_generating` | `"generating"` | `"generating"` | [api_info.ts#L305-L351](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/helpers/api_info.ts#L305-L351) |
+| `process_streaming` | `"streaming"` | `"streaming"` | [api_info.ts#L352-L361](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/helpers/api_info.ts#L352-L361) |
+| `process_completed` | `"complete"` | `"complete"`/`"error"` | [api_info.ts#L362-L404](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/helpers/api_info.ts#L362-L404) |
+| `log` | `"log"` | — | [api_info.ts#L405-L414](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/helpers/api_info.ts#L405-L414) |
+| `heartbeat` | `"heartbeat"` | — | [api_info.ts#L415-L418](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/helpers/api_info.ts#L415-L418) |
 
 ### 3.3 回调内 —— `fire_event()` 推入异步迭代器
 
-[submit.ts](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/utils/submit.ts#L489-L618)
+[submit.ts#L489-L618](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/utils/submit.ts#L489-L618)
 
+进度消息（`type === "update"`）触发的 `fire_event` 在 [submit.ts#L500-L510](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/utils/submit.ts#L500-L510)：
 ```typescript
 if (type === "update" && status && !complete) {
     fire_event({ type: "status", endpoint, fn_index, time, ...status });
 }
 ```
 
-`fire_event()` 将 `GradioEvent` 推入异步迭代器的值队列。前端 `DependencyManager` 通过 `for await (const result of dep_submission.data)` 消费这些事件。
+`fire_event()` 是 `make_promise_with_events()` 返回的异步迭代器的入队函数，定义在 [submit.ts#L62-L111](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/client/js/src/utils/submit.ts#L62-L111)。前端 `DependencyManager` 通过 `for await (const result of dep_submission.data)` 消费这些事件。
 
 ---
 
-## 第四层：前端 DependencyManager 与 LoadingStatus
+## 第四层：前端 DependencyManager → LoadingStatus → AppTree → 组件
 
-### 4.1 DependencyManager 消费事件
+### 4.1 DependencyManager 消费异步事件
 
-[js/core/src/dependency.ts](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/dependency.ts#L431-L612)
+**提交循环位置** —— [dependency.ts#L431-L612](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/dependency.ts#L431-L612)：
 
 ```typescript
 submit_loop: for await (const result of dep_submission.data) {
     if (result.type === "status") {
+        const { fn_index, ...status } = result;
+
+        // ✅ 完成：[dependency.ts#L461-L480](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/dependency.ts#L461-L480)
         if (result.stage === "complete") {
             this.loading_stati.update({
                 ...status, status: status.stage,
-                fn_index: dep.id, stream_state
+                fn_index: dep.id, stream_state: "closed"
             });
             this.update_loading_stati_state();
             break submit_loop;
-        } else if (result.stage === "generating") {
+        }
+
+        // ✅ 生成中：[dependency.ts#L481-L490](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/dependency.ts#L481-L490)
+        else if (result.stage === "generating") {
             this.loading_stati.update({
-                ...status, status: status.stage,
-                fn_index: dep.id, stream_state
+                ...status, status: status.stage, fn_index: dep.id, stream_state
             });
             this.update_loading_stati_state();
-        } else {
-            // pending / estimation / progress 等
+        }
+
+        // ✅ error: [dependency.ts#L491-L558](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/dependency.ts#L491-L558)
+        else if (result.stage === "error") { ... }
+
+        // ✅ pending（进度、排队、开始）：[dependency.ts#L559-L567](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/dependency.ts#L559-L567)
+        else {
             this.loading_stati.update({
-                ...status, status: status.stage,
-                fn_index: dep.id, stream_state
+                ...status, status: status.stage, fn_index: dep.id, stream_state
             });
             this.update_loading_stati_state();
         }
@@ -275,80 +365,318 @@ submit_loop: for await (const result of dep_submission.data) {
 }
 ```
 
-**所有** 状态更新（包括进度）都通过 `loading_stati.update()` + `update_loading_stati_state()` 统一处理。
+**所有** 状态更新（进度/排队/开始/完成/错误）都统一走 `loading_stati.update()` → `update_loading_stati_state()` 流程。
 
-### 4.2 LoadingStatus —— 将 fn_index 映射到组件 ID
+### 4.2 LoadingStatus 注册 —— fn_index → component_id 映射
 
-[js/statustracker/static/state.svelte.ts](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/static/state.svelte.ts#L1-L166)
+**注册依赖信息** —— 在 `DependencyManager.register_loading_stati()` [dependency.ts#L271-L279](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/dependency.ts#L271-L279)：
+```typescript
+register_loading_stati(deps: Map<number, Dependency>): void {
+    for (const [_, dep] of deps) {
+        this.loading_stati.register(
+            dep.id,
+            dep.show_progress_on || dep.outputs,   // 哪些 output 组件显示进度
+            dep.inputs,                              // 哪些 input 组件显示进度
+            dep.show_progress                        // "full" | "minimal" | "hidden"
+        );
+    }
+}
+```
 
+**LoadingStatus.register()** —— [state.svelte.ts#L18-L42](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/static/state.svelte.ts#L18-L42)：
+```typescript
+register(
+    dependency_id: number,
+    outputs: number[],
+    inputs: number[],
+    show_progress: boolean | "full" | "minimal"
+): void {
+    this.fn_outputs[dependency_id] = outputs;
+    this.fn_inputs[dependency_id] = inputs;
+    this.show_progress[dependency_id] = show_progress;
+}
+```
+
+`LoadingStatus` 类完整定义在 [state.svelte.ts#L1-L222](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/static/state.svelte.ts#L1-L222)，字段结构：
 ```typescript
 class LoadingStatus {
-    fn_outputs: Record<number, number[]> = {};   // fn_index → output component IDs
-    fn_inputs: Record<number, number[]> = {};    // fn_index → input component IDs
-    current: Record<string, ILoadingStatus> = {}; // component_id → 当前状态
-
-    register(dependency_id, outputs, inputs, show_progress) {
-        this.fn_outputs[dependency_id] = outputs;
-        this.fn_inputs[dependency_id] = inputs;
-        this.show_progress[dependency_id] = show_progress;
-    }
-
-    update(args: LoadingStatusArgs) {
-        const updates = this.resolve_args(args);
-        updates.forEach(({ id, status, progress, ... }) => {
-            this.current[id] = { status, progress, ... };
-        });
-    }
+    fn_outputs: Record<number, number[]> = {};    // fn_index → output 组件 IDs
+    fn_inputs: Record<number, number[]> = {};     // fn_index → input 组件 IDs
+    show_progress: Record<number, ...> = {};      // fn_index → 显示模式
+    current: Record<string, ILoadingStatus> = {}; // component_id → 状态对象
 }
 ```
 
-`resolve_args()` 将 `fn_index` 解析为具体的 input/output 组件 ID 列表，并为每个组件生成独立的状态更新。`progress_data` 直接透传到组件级别。
+**LoadingStatus.update() → resolve_args()** —— [state.svelte.ts#L44-L92](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/static/state.svelte.ts#L44-L92)：
 
-### 4.3 `update_loading_stati_state()` —— 推入组件状态
+`resolve_args()` 将后端维度的 `fn_index` 转换为前端维度的组件 ID 集合（遍历 `fn_outputs[fn_index]` 和 `fn_inputs[fn_index]`），并为每个组件生成独立的 `ILoadingStatus` 对象（包含 `status`、`progress_data`、`eta`、`size`、`position`、`duration`、`message`、`progress`、`queue`、`show_progress` 等字段）。
 
-[dependency.ts](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/dependency.ts#L286-L298)
+**ILoadingStatus 接口定义** —— [types.ts#L1-L52](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/static/types.ts#L1-L52)：
+```typescript
+export interface ILoadingStatus {
+    status: "pending" | "error" | "complete" | "generating" | null;
+    message?: string;
+    queue?: boolean;
+    size?: number;
+    position?: number;
+    eta?: number;
+    progress?: number;
+    progress_data?: ProgressUnit[];
+    ...
+    show_progress?: boolean | "full" | "minimal";
+}
+```
 
+### 4.3 `update_loading_stati_state()` —— 逐组件调用 update_state_cb
+
+[dependency.ts#L286-L298](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/dependency.ts#L286-L298)：
 ```typescript
 async update_loading_stati_state() {
-    for (const [component_id, loading_status] of Object.entries(this.loading_stati.current)) {
-        this.update_state_cb(Number(component_id), { loading_status }, false);
+    for (const [component_id, loading_status] of Object.entries(
+        this.loading_stati.current
+    )) {
+        this.update_state_cb(
+            Number(component_id),
+            { loading_status: loading_status },
+            false   // check_visibility=false，跳过可见性遍历
+        );
     }
 }
 ```
 
-`update_state_cb` 是初始化时传入的回调，最终调用 `init.svelte.ts` 中的组件状态更新方法。注意 `loading_status` 被特殊处理——它不会缓存到 `pending_updates` 中（因为是瞬时状态）。
+### 4.4 Blocks.svelte 绑定 update_state_cb → AppTree.update_state
+
+**DependencyManager 初始化** —— [Blocks.svelte#L232-L241](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/Blocks.svelte#L232-L241)：
+```svelte
+let dep_manager = new DependencyManager(
+    dependencies,
+    app,
+    app_tree.update_state.bind(app_tree),   // ← update_state_cb
+    app_tree.get_state.bind(app_tree),
+    app_tree.rerender.bind(app_tree),
+    new_message,
+    add_to_api_calls,
+    handle_connection_lost
+);
+```
+
+reload 时的绑定 —— [Blocks.svelte#L255-L261](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/Blocks.svelte#L255-L261)。
+
+### 4.5 AppTree.update_state() —— 写入组件树节点的 shared_props
+
+[init.svelte.ts#L439-L513](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/init.svelte.ts#L439-L513)：
+
+**核心路径**（组件已注册回调时走 `_set_data` 分支）：
+```typescript
+async update_state(id, new_state, check_visibility=true) {
+    // ... 处理可见性（略）...
+
+    const _set_data = this.#set_callbacks.get(id);
+
+    if (!_set_data) {
+        // 组件未挂载：直接修改 tree 的 props
+        const new_props = create_props_shared_props(new_state);  // ← 拆分为 shared_props / props
+        for (const key in new_props.shared_props) {
+            node!.props.shared_props[key] = new_props.shared_props[key];  // ← 就地修改
+        }
+        // ⚠️ 瞬时属性分离：loading_status 不缓存
+        const { loading_status: _ls, ...rest_new_state } = new_state;  // [init.svelte.ts#L482](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/init.svelte.ts#L482)
+        if (Object.keys(rest_new_state).length > 0) {
+            const existing = this.#pending_updates.get(id) || {};
+            this.#pending_updates.set(id, { ...existing, ...rest_new_state });
+        }
+    } else if (_set_data) {
+        // ✅ 组件已挂载：直接调用 _set_data（通过 Gradio 类注册的回调）
+        _set_data(new_state);   // [init.svelte.ts#L501-L503](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/init.svelte.ts#L501-L503)
+    }
+    // ...
+}
+```
+
+**瞬时属性分离设计说明** —— [init.svelte.ts#L477-L490](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/init.svelte.ts#L477-L490) 的注释明确说明了为什么 `loading_status` 要排除在 `pending_updates` 缓存之外：
+
+> Exclude loading_status because it is a transient real-time prop managed independently by the loading status store. Storing it would cause a stale "pending" update to be applied after the correct "complete" status has already been received, trapping the component in an infinite loading state.
+
+**create_props_shared_props()** —— [init.svelte.ts#L691-L710](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/init.svelte.ts#L691-L710)：
+```typescript
+function create_props_shared_props(props) {
+    for (const key in props) {
+        if (allowed_shared_props.includes(key as keyof SharedProps)) {
+            _shared_props[_key] = props[key];   // loading_status 是 allowed_shared_props 一员
+        } else {
+            _props[key] = props[key];
+        }
+    }
+}
+```
+
+`allowed_shared_props` 中包含 `loading_status` —— [utils.svelte.ts#L293-L324](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/utils/src/utils.svelte.ts#L293-L324)（`loading_status` 在第 314 行）。
+
+**初始值**：`gather_props()` 为所有组件初始化 `loading_status = {}` —— [init.svelte.ts#L760-L764](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/init.svelte.ts#L760-L764)。
+
+### 4.6 MountComponents.svelte —— 将 shared_props 传入 Svelte 组件
+
+[MountComponents.svelte#L9-L31](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/MountComponents.svelte#L9-L31)：
+```svelte
+{#if node && component}
+    {#if node.props.shared_props.visible && !node.runtime}
+        <svelte:component
+            this={component.default}
+            shared_props={node.props.shared_props}   // ← loading_status 包含在这里
+            props={node.props.props}
+        >
+            {#each node.children as _node}
+                <Self node={_node} />
+            {/each}
+        </svelte:component>
+    {:else if ...}
+        <MountCustomComponent {...rest} {node} .../>
+    {/if}
+{/if}
+```
+
+### 4.7 Gradio 类 —— shared_props → gradio.shared.loading_status
+
+每个组件构造时创建 `new Gradio(_props)`，**构造函数中将 `_props.shared_props` 全量赋值到 `this.shared`**：
+
+[utils.svelte.ts#L380-L406](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/utils/src/utils.svelte.ts#L380-L406)：
+```typescript
+constructor(_props: { shared_props: SharedProps; props: U }, default_values?: Partial<U>) {
+    for (const key in _props.shared_props) {
+        this.shared[key] = _props.shared_props[key];   // ← loading_status 赋值到 this.shared
+    }
+    // ...
+}
+```
+
+**响应式同步**：`$effect` 在每次 `_props.shared_props` 变化时重新同步 —— [utils.svelte.ts#L437-L462](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/utils/src/utils.svelte.ts#L437-L462)：
+```typescript
+$effect(() => {
+    for (const key in _props.shared_props) {
+        this.shared[key] = _props.shared_props[key];   // ← loading_status 变化立即同步
+    }
+    // ...
+});
+```
+
+**`set_data()` 路径**（组件挂载后通过 `_set_data` 回调）—— [utils.svelte.ts#L520-L556](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/utils/src/utils.svelte.ts#L520-L556)：
+```typescript
+set_data(data: Partial<U & SharedProps>): void {
+    for (const key in data) {
+        const value = data[key];
+        if (this.shared_props.includes(key as keyof SharedProps)) {
+            // @ts-ignore
+            this.shared[key] = value;    // ← loading_status 更新到 this.shared
+        } else {
+            // @ts-ignore
+            this.props[key] = value;
+        }
+    }
+}
+```
+
+`set_data` 在构造函数中通过 `register_component` 注册为 AppTree 的 `#set_callbacks[id]` —— [utils.svelte.ts#L430-L435](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/utils/src/utils.svelte.ts#L430-L435)：
+```typescript
+this.register_component(
+    _props.shared_props.id,
+    this.set_data.bind(this),   // ← 注册为 _set_data 回调
+    this.get_data.bind(this)
+);
+```
 
 ---
 
-## 第五层：Svelte 组件的渲染
+## 第五层：组件内部直接渲染 StatusTracker（两条路径）
 
-### 5.1 BaseColumn.svelte —— StatusTracker 的挂载点
+组件展示进度有两种模式，**所有组件都是直接读取 `gradio.shared.loading_status` 来渲染 `<StatusTracker>`**。
 
-[js/column/BaseColumn.svelte](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/column/BaseColumn.svelte#L32-L43)
+### 路径 A：叶子组件（如 Textbox、Slider）自行渲染
 
+以 **Textbox** 为例：
+
+[textbox/Index.svelte#L52-L110](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/textbox/Index.svelte#L52-L110)：
 ```svelte
-{#if loading_status && loading_status.show_progress}
+<Block ...>
+    <!-- ✅ 直接读取 gradio.shared.loading_status，存在则渲染 StatusTracker -->
+    {#if gradio.shared.loading_status}
+        <StatusTracker
+            autoscroll={gradio.shared.autoscroll}
+            i18n={gradio.i18n}
+            {...gradio.shared.loading_status}
+            show_validation_error={false}
+            on_clear_status={() =>
+                gradio.dispatch("clear_status", gradio.shared.loading_status)}
+        />
+    {/if}
+
+    <!-- 实际组件内容 -->
+    <TextBox
+        ...
+        validation_error={gradio.shared?.loading_status?.validation_error ||
+            gradio.shared?.validation_error}
+        ...
+    />
+</Block>
+```
+
+**注意**：Textbox 还读取 `gradio.shared.loading_status.validation_error` 作为验证错误优先值 —— [textbox/Index.svelte#L92-L93](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/textbox/Index.svelte#L92-L93)。
+
+其他叶子组件同样的模式（摘录）：
+
+| 组件 | StatusTracker 渲染位置 |
+|---|---|
+| Textbox | [textbox/Index.svelte#L62-L71](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/textbox/Index.svelte#L62-L71) |
+| SimpleTextbox | [simpletextbox/Index.svelte#L44-L51](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/simpletextbox/Index.svelte#L44-L51) |
+| Slider | [slider/Index.svelte#L100-L103](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/slider/Index.svelte#L100-L103) |
+| SimpleImage | [simpleimage/Index.svelte#L48-L50](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/simpleimage/Index.svelte#L48-L50)、[#L76-L78](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/simpleimage/Index.svelte#L76-L78) |
+| SimpleDropdown | [simpledropdown/Index.svelte#L40-L47](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/simpledropdown/Index.svelte#L40-L47) |
+| Video | [video/Index.svelte#L97-L99](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/video/Index.svelte#L97-L99)、[#L144-L146](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/video/Index.svelte#L144-L146) |
+| Sidebar | [sidebar/Index.svelte#L15](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/sidebar/Index.svelte#L15) |
+
+### 路径 B：布局组件（Row、Column、BaseColumn）自行渲染
+
+以 **Row** 为例：
+
+[row/Index.svelte#L59-L70](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/row/Index.svelte#L59-L70)：
+```svelte
+{#if gradio.shared.loading_status && gradio.shared.loading_status.show_progress && gradio}
     <StatusTracker
-        autoscroll={props.autoscroll}
-        i18n={props.i18n}
-        {...loading_status}
-        status={loading_status
-            ? loading_status.status == "pending"
+        autoscroll={gradio.shared.autoscroll}
+        i18n={gradio.i18n}
+        {...gradio.shared.loading_status}
+        <!-- ✅ 关键语义转换：pending → generating -->
+        status={gradio.shared.loading_status
+            ? gradio.shared.loading_status.status == "pending"
                 ? "generating"
-                : loading_status.status
+                : gradio.shared.loading_status.status
             : null}
     />
 {/if}
 ```
 
-**关键转换**：当后端状态为 `"pending"` 时，前端显示为 `"generating"`（因为在用户视角，pending 意味着函数正在运行）。
+**BaseColumn 同样的模式**（ChatInterface 等复合组件用）：[column/BaseColumn.svelte#L32-L45](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/column/BaseColumn.svelte#L32-L45)：
+```svelte
+{#if gradio.shared.loading_status && gradio.shared.loading_status.show_progress}
+    <StatusTracker
+        autoscroll={gradio.shared.autoscroll}
+        i18n={gradio.shared.i18n}
+        {...gradio.shared.loading_status}
+        status={gradio.shared.loading_status
+            ? gradio.shared.loading_status.status == "pending"
+                ? "generating"
+                : gradio.shared.loading_status.status
+            : null}
+    />
+{/if}
+```
 
-### 5.2 StatusTracker —— 进度条与状态信息的渲染
+### 5.3 StatusTracker 组件 —— 最终渲染进度条
 
-[js/statustracker/static/index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/static/index.svelte)
+**导入与实例化**：所有组件通过 `import StatusTracker from "@gradio/statustracker"` 引用，该包的导出在 [statustracker/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/index.ts)。
 
-**进度条计算逻辑**（[index.svelte#L188-L222](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/static/index.svelte#L188-L222)）：
+**StatusTracker 核心渲染逻辑** —— [statustracker/static/index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/static/index.svelte)：
 
+**进度条计算（progress_level 派生变量）** —— [index.svelte#L188-L222](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/static/index.svelte#L188-L222)：
 ```typescript
 let progress_level = $derived.by(() => {
     if (progress != null) {
@@ -361,146 +689,151 @@ let progress_level = $derived.by(() => {
             return undefined;
         });
     }
-    // ...
+    return _progress_level;
 });
 ```
 
-**显示逻辑**（[index.svelte#L364-L431](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/static/index.svelte#L364-L431)）：
-
-```
-status === "pending" (前端显示为 "generating"):
-  ├─ 有 progress_data → 显示进度条 + 百分比 + 描述
-  │   ├─ 每个 progress item: desc + (index/length 或 progress%)
-  │   └─ 最内层进度条的宽度 = last_progress_level * 100%
-  ├─ 无 progress_data 但有 ETA → 显示 ETA 进度条
-  └─ 无 progress 且 show_progress="full" → 显示 Loader spinner
+**进度条宽度（last_progress_level）** —— [index.svelte#L224-L237](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/static/index.svelte#L224-L237)：
+```typescript
+let last_progress_level = $derived.by(() => {
+    const last = progress_level?.[progress_level.length - 1];
+    return last != null && last >= 0 ? Math.min(last * 100, 100) : undefined;
+});
 ```
 
-**ETA 计时器**：当 `status === "pending"` 时，启动 `requestAnimationFrame` 循环计时，显示经过时间与预估时间的比例。
+**显示条件分支** —— [index.svelte#L320-L445](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/static/index.svelte#L320-L445)：
+
+```
+should_hide 为 true（status=="complete" 且无 message 无 error）→ 隐藏
+├─ status=="pending"（即前端显示的 "generating"）
+│   ├─ progress_data 存在且 last_progress_level 有值 → 完整进度条
+│   │   ├─ 每层 progress: desc + (index/length% 或 progress%)
+│   │   └─ 最内层进度条 style.width = last_progress_level + "%"
+│   ├─ 否则 ETA 存在 → 显示 ETA 计时器 + 伪进度条（按时间推进）
+│   └─ 否则 show_progress=="full" → 仅 Loader spinner
+├─ status=="error" → 红色错误条 + message
+└─ status=="complete" → 成功消息 or 缓存提示 or 空
+```
+
+**ETA 计时启动** —— [index.svelte#L276-L295](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/static/index.svelte#L276-L295)：当 `status === "pending"` 时，通过 `$effect` 启动 `requestAnimationFrame` 循环，计算实际流逝时间占预估 ETA 的比例。
+
+**缓存命中指示** —— [index.svelte#L174-L186](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/static/index.svelte#L174-L186)：当 `success === true && used_cache === true` 时，显示 `⚡ from cache: {duration}s`。
+
+### 5.4 清除状态路径
+
+用户点击 StatusTracker 上的关闭按钮 → 组件 dispatch `"clear_status"` 事件：
+- 如 Textbox 中 `on_clear_status={() => gradio.dispatch("clear_status", ...)}` —— [textbox/Index.svelte#L68-L69](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/textbox/Index.svelte#L68-L69)
+
+该事件在 Blocks.svelte 中处理 —— [Blocks.svelte#L127-L138](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/Blocks.svelte#L127-L138)：
+```typescript
+else if (event == "clear_status") {
+    app_tree.update_state(id, { loading_status: {} }, false);
+    dep_manager.clear_loading_status(id);  // → loading_stati.clear(id)
+}
+```
 
 ---
 
-## 完整消息流向图
+## 完整消息流向图（每步附可复核的代码位置）
 
 ```
-用户函数
-  │  progress(0.5, desc="Processing")
-  │  或 for i in progress.tqdm(range(10)):
+用户函数 demo/progress/run.py
+  │  progress(0.5, desc="Processing") [helpers.py#L736-L764]
+  │  或 for i in progress.tqdm(range(10)): [helpers.py#L766-L802]
   ▼
-Progress._progress_callback()
-  │  通过 LocalContext.blocks / LocalContext.event_id 获取上下文
-  │  → 调用 blocks._queue.set_progress(event_id, iterables)
+Progress._progress_callback() [helpers.py#L804-L823]
+  │  LocalContext.blocks.get() → ContextVar [context.py#L22-L34]
+  │  LocalContext.event_id.get()
+  │  → 返回 partial(blocks._queue.set_progress, event_id)
   ▼
-Queue.set_progress()
-  │  将 TrackedIterable 列表转换为 ProgressUnit 列表
-  │  写入 evt.progress = ProgressMessage(...)
-  │  设置 evt.progress_pending = True（节流标记）
+Queue.set_progress(event_id, iterables) [queueing.py#L585-L608]
+  │  TrackedIterable → ProgressUnit [server_messages.py#L114-L122]
+  │  evt.progress = ProgressMessage(progress_data) [server_messages.py#L58-L62]
+  │  evt.progress_pending = True (⚠️ 节流标记)
   ▼
-Queue.start_progress_updates()  ← 异步循环，每 10~100ms 轮询
-  │  检测 progress_pending=True 的事件
-  │  调用 send_message(event, event.progress)
+Queue.start_progress_updates() 定时轮询 [queueing.py#L555-L583]
+  │  await asyncio.sleep(0.01s/0.1s)
+  │  evt.progress_pending = False
+  │  → send_message(event, event.progress)
   ▼
-Queue.send_message()
-  │  写入 pending_messages_per_session[session_hash] AsyncQueue
+Queue.send_message() [queueing.py#L240-L249]
+  │  event_message.event_id = event._id
+  │  pending_messages_per_session[session_hash].put_nowait(msg)
   ▼
-SSE 端点 /queue/data  ← FastAPI StreamingResponse
+SSE 端点 sse_stream() [routes.py#L1490-L1557]
   │  asyncio.wait_for(messages.get(), timeout=10)
-  │  序列化为 "data: {orjson_dumps}\n\n"
+  │  process_msg() → orjson.dumps(): "data: {json}\n\n"
   ▼
-JS Client: handle_message()
-  │  data.msg === "progress"
-  │  → type: "update", status: { stage: "pending", progress_data: [...] }
+JS Client handle_message() [api_info.ts#L234-L404]
+  │  msg=="progress" → type:"update", stage:"pending" [api_info.ts#L252-L280]
+  │  progress_data 保留在 status 对象中
   ▼
-JS Client: fire_event()
-  │  推入 GradioEvent { type: "status", stage: "pending", progress_data: [...] }
+JS Client fire_event() [submit.ts#L500-L510]
+  │  { type:"status", stage:"pending", progress_data:[...] }
+  │  推入 make_promise_with_events 异步迭代器队列
   ▼
-DependencyManager: for await (result of submission)
-  │  result.type === "status"
-  │  → loading_stati.update({ status, fn_index, progress_data })
-  │  → update_loading_stati_state()
+DependencyManager for await 循环 [dependency.ts#L431-L612]
+  │  result.type === "status" → stage: "pending" 分支 [dependency.ts#L559-L567]
+  │  → loading_stati.update({...status, fn_index, status:stage, ...})
+  │  → update_loading_stati_state() [dependency.ts#L286-L298]
   ▼
-LoadingStatus.update()
-  │  将 fn_index 解析为 input/output 组件 ID
-  │  写入 current[component_id] = { status, progress, ... }
+LoadingStatus.update() → resolve_args() [state.svelte.ts#L44-L92]
+  │  fn_index → fn_outputs[] + fn_inputs[] (component_ids)
+  │  current[component_id] = ILoadingStatus{progress_data, eta, ...}
   ▼
-DependencyManager.update_loading_stati_state()
-  │  遍历 current，逐组件调用 update_state_cb(id, { loading_status })
+DependencyManager.update_loading_stati_state() [dependency.ts#L286-L298]
+  │  for component_id, loading_status:
+  │     update_state_cb(id, {loading_status}, false)
   ▼
-init.svelte.ts: 组件状态更新
-  │  loading_status 不缓存（瞬时属性），直接调用 _set_data()
+AppTree.update_state() [init.svelte.ts#L439-L513]
+  │  组件未挂载 → node.props.shared_props.loading_status = xxx（就地修改）
+  │               #pending_updates 排除 loading_status [init.svelte.ts#L482]
+  │  组件已挂载 → _set_data(new_state) [init.svelte.ts#L501-L503]
   ▼
-BaseColumn.svelte
-  │  {loading_status} → <StatusTracker {...loading_status} />
+MountComponents.svelte 重新渲染 [MountComponents.svelte#L9-L31]
+  │  <svelte:component shared_props={node.props.shared_props} ... />
+  │  包含 loading_status 字段
   ▼
-StatusTracker (index.svelte)
-  │  status="generating" (pending→generating 转换)
-  │  progress_data → 计算进度条宽度 + 显示百分比和描述
-  │  无 progress_data → 显示 ETA 进度条 或 Loader spinner
+Gradio 类 constructor / $effect [utils.svelte.ts#L380-L462]
+  │  for key in _props.shared_props: this.shared[key] = value
+  │  → gradio.shared.loading_status 响应式更新
   ▼
-用户看到的进度条
+┌───────────────────────────────────────────────────────┐
+│  组件 Index.svelte 直接读取 gradio.shared.loading_status  │
+├───────────────────────────────────────────────────────┤
+│ 叶子组件模式（Textbox 等）：                           │
+│  {#if gradio.shared.loading_status}                   │
+│     <StatusTracker {...gradio.shared.loading_status}/>│
+│  {/if}  [textbox/Index.svelte#L62-L71]               │
+│                                                       │
+│ 布局组件模式（Row 等）：                               │
+│  {#if gradio.shared.loading_status?.show_progress}    │
+│     <StatusTracker                                    │
+│       status={status=="pending" ? "generating"        │
+│                 : status} />   [row/Index.svelte#L59-L70]│
+└───────────────────────────────────────────────────────┘
+  ▼
+StatusTracker 最终渲染 [statustracker/static/index.svelte]
+  │  progress_level 派生 [index.svelte#L188-L222]
+  │  last_progress_level → style.width [index.svelte#L224-L237]
+  │  ETA 计时器 rAF 循环 [index.svelte#L276-L295]
+  ▼
+用户看到进度条
 ```
 
 ---
 
-## 其他状态消息的流程（简述）
+## 关键设计模式总结（附代码证据）
 
-### 队列排队状态
-
-```
-Queue.push() → broadcast_estimations()
-  → EstimationMessage(rank, rank_eta, queue_size)
-  → SSE → handle_message() → type:"update", stage:"pending", size/position/eta
-  → LoadingStatus.update() → StatusTracker 显示 "queue: 2/5 | 3.2s"
-```
-
-### 函数开始
-
-```
-Queue.process_events() → ProcessStartsMessage(eta)
-  → SSE → handle_message() → type:"update", stage:"pending", position:0
-  → LoadingStatus.update() → StatusTracker 显示 "processing | 2.1s"
-```
-
-### 生成器中间输出
-
-```
-Queue.process_events() → ProcessGeneratingMessage(output, success)
-  → SSE → handle_message() → type:"generating", stage:"generating"
-  → DependencyManager 同时处理 data 更新和 loading_stati 更新
-```
-
-### 执行完成
-
-```
-Queue.process_events() → ProcessCompletedMessage(output, success, used_cache, ...)
-  → SSE → handle_message() → type:"complete", stage:"complete"
-  → LoadingStatus.update({ status:"complete" })
-  → StatusTracker 隐藏（should_hide = true）
-  → 若有缓存，显示 cache indicator（⚡ from cache: 0.3s）
-```
-
-### 日志消息
-
-```
-Queue.log_message() → LogMessage(log, level, title, duration, visible)
-  → SSE → handle_message() → type:"log"
-  → DependencyManager.handle_log() → log_cb() → Toast 组件显示
-```
-
----
-
-## 关键设计模式总结
-
-1. **ContextVar 隔离**：`LocalContext.blocks` / `LocalContext.event_id` 使用 Python `ContextVar` 确保多线程/协程环境下每个请求的进度回调指向正确的 Queue 和 Event。
-
-2. **进度节流**：`evt.progress_pending` 标志 + `start_progress_updates()` 定时轮询，避免高频进度更新撑爆 SSE 通道。连续更新之间只保留最新值。
-
-3. **会话隔离**：`pending_messages_per_session[session_hash]` 按浏览器会话分组，SSE 端点仅推送该会话的消息。
-
-4. **fn_index → component_id 映射**：`LoadingStatus` 将后端的 `fn_index` 维度转换为前端的 `component_id` 维度，使得一个函数的进度/状态可以映射到多个输出组件。
-
-5. **瞬时属性分离**：`loading_status` 在 `init.svelte.ts` 中被排除在 `pending_updates` 缓存之外，防止组件延迟挂载时加载状态覆盖已完成状态。
-
-6. **状态语义转换**：后端的 `"pending"` 在前端组件层被转换为 `"generating"`，更符合用户认知（函数正在运行而非等待）。
-
-7. **show_progress 控制**：`BlockFunction.show_progress`（"full"/"minimal"/"hidden"）通过依赖配置传递到前端，控制进度条是完整显示、仅显示计时器还是完全隐藏。
+| 设计模式 | 说明 | 代码证据位置 |
+|---|---|---|
+| **ContextVar 隔离** | `LocalContext` 使用 Python `ContextVar`，多线程/协程环境下每个请求的 `blocks`、`event_id` 互不干扰 | [context.py#L22-L34](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/context.py#L22-L34)、[utils.py#L1070-L1103](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/utils.py#L1070-L1103) |
+| **进度节流** | `evt.progress_pending` 标志 + `start_progress_updates()` 定时轮询（10-100ms），高频更新只保留最新值 | [queueing.py#L555-L608](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py#L555-L608) |
+| **会话隔离** | `pending_messages_per_session[session_hash]` 按浏览器会话分组，SSE 端点仅推送该会话消息 | [queueing.py#L240-L249](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/queueing.py#L240-L249) |
+| **fn_index → component_id 映射** | `LoadingStatus` 将后端 `fn_index` 维度转换为前端 `component_id` 维度，支持一个函数映射到多个输入/输出组件 | [state.svelte.ts#L18-L92](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/statustracker/static/state.svelte.ts#L18-L92) |
+| **瞬时属性分离** | `loading_status` 被排除在 `#pending_updates` 缓存之外，防止组件延迟挂载时过期 pending 覆盖已完成状态 | [init.svelte.ts#L477-L490](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/init.svelte.ts#L477-L490) |
+| **状态语义转换** | 后端 `"pending"` 在前端渲染层转换为 `"generating"`，更符合用户"正在处理"的认知 | [row/Index.svelte#L64-L68](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/row/Index.svelte#L64-L68)、[column/BaseColumn.svelte#L35-L42](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/column/BaseColumn.svelte#L35-L42) |
+| **响应式同步** | 组件 `shared_props` 的变化通过 `$effect` 立即同步到 `gradio.shared`，无需手动订阅 | [utils.svelte.ts#L437-L462](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/utils/src/utils.svelte.ts#L437-L462) |
+| **双路径状态更新** | 组件未挂载时就地修改 tree node 的 `shared_props`；已挂载时通过注册的 `_set_data` 回调直接更新组件内部状态 | [init.svelte.ts#L457-L503](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/init.svelte.ts#L457-L503) |
+| **直接读取模式** | 所有组件（叶子/布局）统一从 `gradio.shared.loading_status` 读取并自行决定是否渲染 `<StatusTracker>`，无额外数据流 | 见 [textbox/Index.svelte#L62-L71](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/textbox/Index.svelte#L62-L71) 等多处 |
+| **show_progress 控制** | `BlockFunction.show_progress` 通过依赖配置传递，控制进度条显示级别（"full"/"minimal"/"hidden"） | [block_function.py#L131-L138](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/gradio/block_function.py#L131-L138) → [dependency.ts#L273-L278](file:///d:/fz/0601/solo-dogfeeding/code/259-gradio/js/core/src/dependency.ts#L273-L278) |
