@@ -119,20 +119,24 @@ if progress_tracker is not None and progress_index is not None:
     processed_input[progress_index] = progress_tracker
 ```
 
-**`create_tracker()` 包装逻辑** —— [helpers.py#L895-L916](gradio/helpers.py#L895-L916)：
+**`create_tracker()` 包装逻辑** —— [helpers.py#L905-L915](gradio/helpers.py#L905-L915)：
 ```python
-def create_tracker(func, track_tqdm: bool):
-    progress = Progress()
-    if track_tqdm:
-        def function_wrapper(*args, **kwargs):
-            LocalContext.progress.set(progress)
-            try:
-                return func(*args, **kwargs)
-            finally:
-                LocalContext.progress.set(None)
-        return progress, function_wrapper
-    return progress, func
+def create_tracker(fn, track_tqdm):
+    progress = Progress(track_tqdm=track_tqdm)
+    if not track_tqdm:
+        # ✅ track_tqdm=False（默认情况）：直接返回，函数不被包装
+        return progress, fn
+    # ✅ track_tqdm=True：交给 utils.function_wrapper 处理
+    return progress, utils.function_wrapper(
+        f=fn,
+        before_fn=LocalContext.progress.set,
+        before_args=(progress,),
+        after_fn=LocalContext.progress.set,
+        after_args=(None,),
+    )
 ```
+
+`utils.function_wrapper()`（定义在 [utils.py#L993-L1070](gradio/utils.py#L993-L1070)）会根据 `fn` 的类型（普通函数 / 协程 / 生成器 / 异步生成器）选择对应的 wrapper，在执行前调用 `LocalContext.progress.set(progress)`，执行后/每个 yield 前后调用 `LocalContext.progress.set(None)`。这使得被 patch 后的 `tqdm` 能通过 `LocalContext.progress.get(None)` 拿到当前的 Progress 实例（见 [helpers.py#L846](gradio/helpers.py#L846)）。
 
 **设置 LocalContext —— `get_function_with_locals()`** —— [utils.py#L1070-L1103](gradio/utils.py#L1070-L1103)：
 ```python
@@ -216,7 +220,7 @@ def send_message(self, event: Event, event_message: EventMessage):
     messages.put_nowait(event_message)
 ```
 
-所有消息（进度、状态、完成、日志等）统一写入 `pending_messages_per_session[session_hash]`——一个按会话哈希分组的 `asyncio.Queue`。该字典在 [queueing.py Queue.__init__](gradio/queueing.py) 中初始化为 `defaultdict(asyncio.Queue)`。
+所有消息（进度、状态、完成、日志等）统一写入 `pending_messages_per_session[session_hash]`。该容器实际类型为 `LRUCache[str, AsyncQueue[EventMessage]]`（容量上限 2000，LRU 淘汰旧会话），在 [queueing.py#L126-L128](gradio/queueing.py#L126-L128) 中初始化。新会话首次发送时在 [queueing.py#L383-L384](gradio/queueing.py#L383-L384) 按需创建 `AsyncQueue` 实例。
 
 ### 2.4 其他状态消息的发送时机（附精确行号）
 
@@ -633,7 +637,7 @@ this.register_component(
 | Video | [video/Index.svelte#L97-L99](js/video/Index.svelte#L97-L99)、[#L144-L146](js/video/Index.svelte#L144-L146) |
 | Sidebar | [sidebar/Index.svelte#L15](js/sidebar/Index.svelte#L15) |
 
-### 路径 B：布局组件（Row、Column、BaseColumn）自行渲染
+### 路径 B：容器组件（Row、Column、BaseColumn、Group）和 Chatbot 复合组件自行渲染
 
 以 **Row** 为例：
 
@@ -654,21 +658,55 @@ this.register_component(
 {/if}
 ```
 
-**BaseColumn 同样的模式**（ChatInterface 等复合组件用）：[column/BaseColumn.svelte#L32-L45](js/column/BaseColumn.svelte#L32-L45)：
+**BaseColumn / Column / Group 同样的模式**（用于 Group/Column/Row 等嵌套内部含有子组件的容器）：[column/BaseColumn.svelte#L32-L45](js/column/BaseColumn.svelte#L32-L45)。注意：BaseColumn 是 Column、Tab、Group、Row 等容器组件的内部基类，不是 ChatInterface 的进度来源。
+
+### 路径 C：Chatbot / ChatInterface 复合组件的状态来源
+
+ChatInterface 不是一个组件，它继承自 `Blocks`（[chat_interface.py#L53](gradio/chat_interface.py#L53)），内部通过 `self.chatbot`（Chatbot 组件）和 `self.textbox`（Textbox 组件）构成界面。
+
+进度状态直接作用在 `self.chatbot` 上。ChatInterface 的 submit_wrapped 依赖配置定义在 [chat_interface.py#L566-L577](gradio/chat_interface.py#L566-L577)：
+
+```python
+submit_fn_kwargs = {
+    "fn": submit_wrapped,
+    "inputs": [self.saved_input, self.chatbot_state] + self.additional_inputs,
+    # ✅ outputs 的第二个组件就是 self.chatbot
+    "outputs": [self.null_component, self.chatbot] + self.additional_outputs,
+    "show_progress": cast(
+        Literal["full", "minimal", "hidden"], self.show_progress
+    ),
+}
+```
+
+因此 LoadingStatus 会把 `fn_index` 映射到 `self.chatbot` 的组件 ID，`self.chatbot` 自己从 `gradio.shared.loading_status` 读取状态，**与叶子组件路径完全一致**。
+
+**Chatbot 组件 Index.svelte** —— [chatbot/Index.svelte#L49-L58](js/chatbot/Index.svelte#L49-L58)：
 ```svelte
-{#if gradio.shared.loading_status && gradio.shared.loading_status.show_progress}
+{#if gradio.shared.loading_status}
     <StatusTracker
         autoscroll={gradio.shared.autoscroll}
-        i18n={gradio.shared.i18n}
+        i18n={gradio.i18n}
         {...gradio.shared.loading_status}
-        status={gradio.shared.loading_status
-            ? gradio.shared.loading_status.status == "pending"
-                ? "generating"
-                : gradio.shared.loading_status.status
-            : null}
+        {show_progress}
+        on_clear_status={() =>
+            gradio.dispatch("clear_status", gradio.shared.loading_status)}
     />
 {/if}
 ```
+
+Chatbot 有两个特殊的派生逻辑：
+1. `show_progress` 派生变量 —— [chatbot/Index.svelte#L23-L30](js/chatbot/Index.svelte#L23-L30)：error 状态强制 full，其他情况下如果组件配置为 hidden 则 hidden，否则 minimal（覆盖 ChatInterface 传入的 full）
+2. 把状态透传给内部子组件 `ChatBot.svelte` —— [chatbot/Index.svelte#L87-L98](js/chatbot/Index.svelte#L87-L98)：
+```svelte
+<ChatBot
+    pending_message={gradio.shared.loading_status?.status === "pending"}
+    generating={gradio.shared.loading_status?.status === "generating"}
+    show_progress={gradio.shared.loading_status?.show_progress || "full"}
+    ...
+/>
+```
+
+内部 `shared/ChatBot.svelte` 根据这两个 prop 决定是否在气泡底部渲染 typing 指示器或 pending message 占位符（见 [chatbot/shared/ChatBot.svelte#L321-L357](js/chatbot/shared/ChatBot.svelte#L321-L357)）。
 
 ### 5.3 StatusTracker 组件 —— 最终渲染进度条
 
@@ -798,20 +836,30 @@ Gradio 类 constructor / $effect [utils.svelte.ts#L380-L462]
   │  for key in _props.shared_props: this.shared[key] = value
   │  → gradio.shared.loading_status 响应式更新
   ▼
-┌───────────────────────────────────────────────────────┐
-│  组件 Index.svelte 直接读取 gradio.shared.loading_status  │
-├───────────────────────────────────────────────────────┤
-│ 叶子组件模式（Textbox 等）：                           │
-│  {#if gradio.shared.loading_status}                   │
-│     <StatusTracker {...gradio.shared.loading_status}/>│
-│  {/if}  [textbox/Index.svelte#L62-L71]               │
-│                                                       │
-│ 布局组件模式（Row 等）：                               │
-│  {#if gradio.shared.loading_status?.show_progress}    │
-│     <StatusTracker                                    │
-│       status={status=="pending" ? "generating"        │
-│                 : status} />   [row/Index.svelte#L59-L70]│
-└───────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│  组件 Index.svelte 直接读取 gradio.shared.loading_status             │
+├───────────────────────────────────────────────────────────────────┤
+│ 路径 A 叶子组件（Textbox/Slider/SimpleTextbox 等）：                │
+│  {#if gradio.shared.loading_status}                                │
+│     <StatusTracker {...gradio.shared.loading_status}/>             │
+│  {/if}  [textbox/Index.svelte#L62-L71]                             │
+│                                                                     │
+│ 路径 B 容器组件（Row/Column/BaseColumn/Group）：                     │
+│  {#if gradio.shared.loading_status?.show_progress}                 │
+│     <StatusTracker                                                 │
+│       status={status=="pending" ? "generating" : status} />        │
+│                           [row/Index.svelte#L59-L70]               │
+│                                                                     │
+│ 路径 C Chatbot / ChatInterface：                                    │
+│  ChatInterface（Blocks 子类）把 submit_wrapped 的 outputs 指向       │
+│  self.chatbot [chat_interface.py#L566-L577]；                       │
+│  chatbot/Index.svelte 自己读取 gradio.shared.loading_status：       │
+│  {#if gradio.shared.loading_status}                                │
+│    <StatusTracker {...} show_progress={派生值}/>                   │
+│  {/if}  [chatbot/Index.svelte#L49-L58]                              │
+│  并把 pending_message / generating 传给内部 ChatBot.svelte          │
+│  [chatbot/Index.svelte#L87-L98]                                     │
+└───────────────────────────────────────────────────────────────────┘
   ▼
 StatusTracker 最终渲染 [statustracker/static/index.svelte]
   │  progress_level 派生 [index.svelte#L188-L222]
@@ -829,11 +877,13 @@ StatusTracker 最终渲染 [statustracker/static/index.svelte]
 |---|---|---|
 | **ContextVar 隔离** | `LocalContext` 使用 Python `ContextVar`，多线程/协程环境下每个请求的 `blocks`、`event_id` 互不干扰 | [context.py#L22-L34](gradio/context.py#L22-L34)、[utils.py#L1070-L1103](gradio/utils.py#L1070-L1103) |
 | **进度节流** | `evt.progress_pending` 标志 + `start_progress_updates()` 定时轮询（10-100ms），高频更新只保留最新值 | [queueing.py#L555-L608](gradio/queueing.py#L555-L608) |
-| **会话隔离** | `pending_messages_per_session[session_hash]` 按浏览器会话分组，SSE 端点仅推送该会话消息 | [queueing.py#L240-L249](gradio/queueing.py#L240-L249) |
+| **会话隔离** | `pending_messages_per_session` 使用 `LRUCache[str, AsyncQueue[EventMessage]]`（容量 2000）按浏览器会话分组，SSE 端点仅推送该会话消息，旧会话自动被 LRU 淘汰 | [queueing.py#L126-L128](gradio/queueing.py#L126-L128)、[#L383-L384](gradio/queueing.py#L383-L384) |
 | **fn_index → component_id 映射** | `LoadingStatus` 将后端 `fn_index` 维度转换为前端 `component_id` 维度，支持一个函数映射到多个输入/输出组件 | [state.svelte.ts#L18-L92](js/statustracker/static/state.svelte.ts#L18-L92) |
 | **瞬时属性分离** | `loading_status` 被排除在 `#pending_updates` 缓存之外，防止组件延迟挂载时过期 pending 覆盖已完成状态 | [init.svelte.ts#L477-L490](js/core/src/init.svelte.ts#L477-L490) |
 | **状态语义转换** | 后端 `"pending"` 在前端渲染层转换为 `"generating"`，更符合用户"正在处理"的认知 | [row/Index.svelte#L64-L68](js/row/Index.svelte#L64-L68)、[column/BaseColumn.svelte#L35-L42](js/column/BaseColumn.svelte#L35-L42) |
 | **响应式同步** | 组件 `shared_props` 的变化通过 `$effect` 立即同步到 `gradio.shared`，无需手动订阅 | [utils.svelte.ts#L437-L462](js/utils/src/utils.svelte.ts#L437-L462) |
 | **双路径状态更新** | 组件未挂载时就地修改 tree node 的 `shared_props`；已挂载时通过注册的 `_set_data` 回调直接更新组件内部状态 | [init.svelte.ts#L457-L503](js/core/src/init.svelte.ts#L457-L503) |
-| **直接读取模式** | 所有组件（叶子/布局）统一从 `gradio.shared.loading_status` 读取并自行决定是否渲染 `<StatusTracker>`，无额外数据流 | 见 [textbox/Index.svelte#L62-L71](js/textbox/Index.svelte#L62-L71) 等多处 |
+| **直接读取模式** | 所有组件（叶子/容器/Chatbot）统一从 `gradio.shared.loading_status` 读取并自行决定是否渲染 `<StatusTracker>`，无额外数据流；Chatbot 额外派生 `pending_message`/`generating` 传给内部气泡子组件 | 见 [textbox/Index.svelte#L62-L71](js/textbox/Index.svelte#L62-L71)、[chatbot/Index.svelte#L49-L98](js/chatbot/Index.svelte#L49-L98) 等多处 |
+| **tqdm monkey patch + ContextVar 注入** | `track_tqdm=True` 时通过 `patch_tqdm()` 把 `tqdm.tqdm` 的 `__init__/__iter__/update/close/__exit__` 替换掉；`create_tracker` 用 `utils.function_wrapper` 把 Progress 实例在执行前写入 `LocalContext.progress`，被 patch 的 tqdm 从 `LocalContext.progress.get(None)` 读出当前实例 | [helpers.py#L837-L902](gradio/helpers.py#L837-L902)、[helpers.py#L905-L915](gradio/helpers.py#L905-L915)、[utils.py#L993-L1070](gradio/utils.py#L993-L1070) |
+| **Blocks 组合组件透传** | ChatInterface（继承自 Blocks）把用户 fn 的 outputs 显式包含 `self.chatbot`，依赖系统的 `fn_index → component_id` 映射把 loading_status 送到 Chatbot 组件，ChatInterface 自身不感知进度状态 | [chat_interface.py#L566-L577](gradio/chat_interface.py#L566-L577)、[chatbot/Index.svelte#L49-L98](js/chatbot/Index.svelte#L49-L98) |
 | **show_progress 控制** | `BlockFunction.show_progress` 通过依赖配置传递，控制进度条显示级别（"full"/"minimal"/"hidden"） | [block_function.py#L131-L138](gradio/block_function.py#L131-L138) → [dependency.ts#L273-L278](js/core/src/dependency.ts#L273-L278) |
