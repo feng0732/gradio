@@ -543,6 +543,84 @@ dataset.click
 
 本章重点回答的场景：你上次用 Eager 模式跑完全部 examples，生成了完整的 `log.csv` 和 `indices.csv`。这次启动（无论 Eager 还是 Lazy 模式），用户点击了某个 example，代码怎么走？什么时候命中缓存？什么时候重新执行追加？两条路径的分叉点到底在哪里？
 
+---
+
+### 13.1 统一判断口径（先给结论）
+
+> **🔑 一句话结论：用户点击 example 时是否命中缓存，只看 `indices.csv` 中有没有该 example_id，和当前是 Eager 还是 Lazy 模式无关，和 `log.csv` 有没有内容也无关。**
+
+只要 `indices.csv` 的值列表里存在这个 `example_id` → **走路径 A：命中**，直接读 `log.csv` 对应行。
+只要 `indices.csv` 里没有 → **走路径 B：未命中**，调用 `cache(example_id=K)` 重新执行并追加写入。
+
+**为什么 Lazy 模式能命中 Eager 生成的旧缓存？**
+因为两者写出来的 `indices.csv` 和 `log.csv` 格式完全一致，`_get_cached_index_if_cached()` 这个函数只看文件内容，不关心是哪种模式写的。Eager 模式按顺序写了 `[0,1,2,3,4]`，Lazy 模式启动后点击 #2，`_get_cached_index_if_cached(2)` 查到 `2 in [0,1,2,3,4]` → 直接命中，和 Eager 模式下点击的行为一模一样。
+
+**为什么 Lazy 模式启动时不触发全量缓存复用？**
+因为 Lazy 模式的 `_start_caching()` 中 `self.cache_examples is True` 为 False（是字符串 `"lazy"`），根本不会调用 `cache()`，所以也就不会进入「log.csv 存在就全量复用」的分支。Lazy 模式启动时对缓存文件**零读写**，连验证都不做。
+
+---
+
+### 13.2 全场景判定矩阵
+
+下面把「当前模式 × 缓存文件状态 × 操作」三维度组合，给出统一的行为判定：
+
+| 序号 | 当前模式 | 已有缓存文件 | 操作 | 行为 | 是否命中/复用 | 依据代码位置 |
+|------|---------|-------------|------|------|--------------|-------------|
+| 1 | Eager | 无任何缓存文件 | 启动 | 遍历所有 example，逐个执行，写 log.csv + indices.csv | ❌ 全新缓存 | [helpers.py:512-577](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L512-L577) |
+| 2 | Eager | 已有完整 log.csv + indices.csv（全量） | 启动 | 打印 "Using cache from..."，直接返回，不执行任何 example | ✅ 全量复用 | [helpers.py:520-523](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L520-L523) |
+| 3 | Eager | 只有 log.csv，indices.csv 被删了 | 启动 | log.csv 存在 + example_id=None → 走全量复用分支，打印提示，不执行 | ✅ （但只判断 log.csv，不检查 indices） | [helpers.py:520](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L520) |
+| 4 | Lazy | 无任何缓存文件 | 启动 | 打印 "Will cache examples ... at first use."，不做任何读写 | -（零操作） | [helpers.py:310-319](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L310-L319) |
+| 5 | Lazy | 已有完整 log.csv + indices.csv（Eager 留下的） | 启动 | 打印提示 + "If method or examples have changed... delete this folder"，不做任何读写 | -（零操作） | [helpers.py:310-319](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L310-L319) |
+| 6 | Eager 已启动（缓存完整） | 有 | 点击 #K（在范围内） | _get_cached_index_if_cached(K) 查到 → 读 log.csv 第 K+1 行 | ✅ 命中 | [helpers.py:488-495](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L488-L495) |
+| 7 | Lazy 启动，之前 Eager 跑过全量 | 有完整 log.csv + indices.csv | 点击 #K（在范围内） | _get_cached_index_if_cached(K) 查到 → 读 log.csv 第 K+1 行 | ✅ 命中（复用 Eager 旧缓存） | [helpers.py:488-495](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/helpers.py#L488-L495) |
+| 8 | Lazy 启动，之前 Eager 跑过全量 | 有完整 log.csv + indices.csv | 点击 #N（新增的 example，超出旧索引范围） | 查不到 → cache(N) 追加写入 log.csv 和 indices.csv | ❌ 未命中，追加 | [helpers.py:588-591](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L588-L591) |
+| 9 | Eager/Lazy 都一样 | indices.csv 被删了，log.csv 还在 | 点击 #K | indices.csv 不存在 → None → cache(K) 追加 | ❌ 未命中，追加（旧 log.csv 中的 K 行成孤儿） | [helpers.py:488-495](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L488-L495) |
+| 10 | Eager/Lazy 都一样 | indices.csv 有 K，但 log.csv 行数不够 | 点击 #K | 命中，但读 log.csv 时 `cached_index+1 >= len(examples)` 抛 IndexError | ⚠️ 命中但读失败 | [helpers.py:596-597](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L596-L597) |
+| 11 | Lazy，完全新启动 | 无任何缓存文件 | 点击 #K | indices.csv 不存在 → None → cache(K) 追加（首次写入，会创建文件、写表头） | ❌ 首次写入 | [helpers.py:588-591](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L588-L591) |
+
+**记忆口诀：**
+- 🚀 **启动时**：Eager 看 `log.csv` 决定是否全量复用；Lazy 什么都不做
+- 👆 **点击时**：不管 Eager 还是 Lazy，**只看 `indices.csv` 有没有这个 id**，有就命中，没有就追加
+
+---
+
+### 13.3 三层判断的决策树
+
+从「用户打开页面 → 点击 example」的完整流程，一共三层判断：
+
+```
+启动阶段（launch）
+     │
+     ▼
+第一层：模式判断 (self.cache_examples is True ?)
+     ├─ True  (Eager) → 调用 cache()，进入第二层
+     └─ "lazy" (Lazy) → 跳过，什么都不做 ←──────┐
+                                                  │
+     点击阶段（用户点 example #K）                  │
+          │                                       │
+          ▼                                       │
+第二层：命中判断 (_get_cached_index_if_cached(K))  │
+     ┌───┴───┐                                   │
+     │       │                                   │
+  有 K？   没有 K？                               │
+     │       │                                   │
+     ▼       ▼                                   │
+  命中 ✅  未命中 → 调用 cache(example_id=K) → 进入第三层
+                                                 │
+第三层：全量复用判断 (log.csv.exists AND example_id is None)
+     │
+     ├─ 两个条件都满足 → 打印提示，直接返回（全量复用）
+     │
+     └─ 任一不满足 → 执行缓存逻辑，追加写入
+        （example_id=K 不为 None 时一定走这里）
+```
+
+**第三层判断是最容易误解的地方**：它只在 `cache()` 函数入口触发。Eager 模式启动时走 `cache()`（example_id=None）→ 可能命中全量复用。但点击时走的是 `cache(example_id=K)` → `example_id is not None` → **永远进入 else 分支执行**，不会触发全量复用。
+
+---
+
+### 13.4 点击时的总入口函数
+
 **总入口**：[load_from_cache(example_id)](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L582-L619)
 
 ```
