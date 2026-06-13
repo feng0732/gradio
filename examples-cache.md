@@ -176,6 +176,69 @@ Lazy 模式在构造时就会打印提示，告诉用户缓存目录位置，并
 
 ---
 
+### 3.4 环境变量的陷阱：GRADIO_CACHE_EXAMPLES=lazy 为什么不进入 lazy 模式
+
+这是最容易踩的坑之一：**设置 `GRADIO_CACHE_EXAMPLES=lazy` 并不会让程序进入 lazy 模式。**
+
+#### 为什么？
+
+**位置**：[helpers.py:156-162](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L156-L162)
+
+```python
+if cache_examples is None:
+    if (
+        os.getenv("GRADIO_CACHE_EXAMPLES", "").lower() in ["true", "lazy"]
+        and fn is not None
+        and outputs is not None
+    ):
+        self.cache_examples = True   # ⚠️  永远是布尔值 True！
+```
+
+`GRADIO_CACHE_EXAMPLES` 这个环境变量本质上是一个**布尔开关**，它只回答「要不要启用缓存」这个问题。值为 `"lazy"` 时只是被当成「真值」来判断（和 `"true"` 完全等价），**不会设置 cache_mode 为 lazy**。
+
+真正控制 lazy / eager 模式的是**另一个**环境变量：`GRADIO_CACHE_MODE`。
+
+**位置**：[helpers.py:172-182](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L172-L182)
+
+```python
+if (cache_mode_env := os.getenv("GRADIO_CACHE_MODE")) and cache_mode is None:
+    if cache_mode_env.lower() == "eager":
+        cache_mode = "eager"
+    elif cache_mode_env.lower() == "lazy":
+        cache_mode = "lazy"
+    else:
+        cache_mode = "eager"
+        warnings.warn(...)
+```
+
+然后才是模式切换：
+
+```python
+if self.cache_examples and cache_mode == "lazy":
+    self.cache_examples = "lazy"   # 从 bool 变成字符串
+```
+
+#### 正确的环境变量配置方式
+
+| 想要的效果 | 环境变量配置 |
+|-----------|-------------|
+| 启用缓存，eager 模式（启动时预缓存） | `GRADIO_CACHE_EXAMPLES=true` |
+| 启用缓存，lazy 模式（首次点击缓存） | `GRADIO_CACHE_EXAMPLES=true` **且** `GRADIO_CACHE_MODE=lazy` |
+| 启用缓存，lazy 模式（另一种等价写法） | `GRADIO_CACHE_EXAMPLES=lazy` **且** `GRADIO_CACHE_MODE=lazy` |
+| 禁用缓存 | `GRADIO_CACHE_EXAMPLES=false` 或不设 |
+
+只设 `GRADIO_CACHE_EXAMPLES=lazy` 但不设 `GRADIO_CACHE_MODE` → **等价于 eager 模式**。
+
+#### 为什么会有这个设计？
+
+追溯历史，早期 `cache_examples` 参数本身只接受布尔值，后来加入 lazy 模式时，为了不破坏已有 API，新增了 `cache_mode` 参数来控制模式。环境变量 `GRADIO_CACHE_EXAMPLES` 的 `"lazy"` 值可能是早期的遗留设计，或者是为了和 `cache_examples` 参数文档中「可以是 "lazy"」的说法保持一致（但实际上代码里 `cache_examples` 参数并不接受 `"lazy"` 字符串）。
+
+这也造成了**文档与代码的不一致**：
+- 文档说 `cache_examples` 参数可以是 `"lazy"`
+- 但代码里 `cache_examples` 只接受 `True`/`False`/`None`，`"lazy"` 实际通过 `cache_mode` 参数控制
+
+---
+
 ## 4. Examples.create() - 事件绑定阶段 ([helpers.py:352-471](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L352-L471))
 
 ### 4.1 注册启动事件
@@ -581,6 +644,152 @@ dataset.click
 **记忆口诀：**
 - 🚀 **启动时**：Eager 看 `log.csv` 决定是否全量复用；Lazy 什么都不做
 - 👆 **点击时**：不管 Eager 还是 Lazy，**只看 `indices.csv` 有没有这个 id**，有就命中，没有就追加
+
+---
+
+### 13.2.1 环境变量与 lazy 首次点击的相互干扰
+
+这是一个容易混淆的交互场景：**当你设置了 `GRADIO_CACHE_EXAMPLES=lazy` 时，你以为是 lazy 模式，实际是 eager 模式，导致「首次点击才缓存」的预期完全落空。**
+
+#### 干扰是怎么发生的
+
+```
+用户操作：
+  设 GRADIO_CACHE_EXAMPLES=lazy
+  （用户心想：嗯，lazy 模式，首次点击才计算，启动快）
+
+实际代码执行：
+  构造阶段：
+    cache_examples 参数为 None → 读环境变量
+    "lazy" in ["true", "lazy"] → True
+    self.cache_examples = True（布尔值，不是字符串 "lazy"）
+    
+    cache_mode 参数为 None → 读 GRADIO_CACHE_MODE
+    没设这个环境变量 → cache_mode 保持 None
+    
+    self.cache_examples and cache_mode == "lazy" ?
+    → True and None == "lazy" → False
+    → self.cache_examples 保持 True（eager 模式）
+
+  启动阶段：
+    _start_caching():
+      self.cache_examples is True ? → True（是布尔值 True）
+      → 调用 cache()，全量预缓存所有 example
+      → 启动时就把所有 example 都跑完了
+
+  用户首次点击 example #3：
+    load_from_cache(3):
+      _get_cached_index_if_cached(3) → 查到！
+      → 直接命中，读 log.csv 第 4 行
+
+  用户感受：
+    "哇，lazy 模式首次点击好快！"
+    ← 其实是 eager 模式启动时就全算完了 😅
+```
+
+**本质**：`GRADIO_CACHE_EXAMPLES=lazy` 这个环境变量值的字面意思（lazy 模式）和它的实际作用（只是启用缓存，模式仍为 eager）不一致，造成用户预期偏差。首次点击时看似「lazy 模式命中了缓存」，其实是「eager 模式启动时就已经缓存好了」。
+
+#### 如何验证当前到底是不是 lazy 模式
+
+看启动日志：
+- Eager 模式会打印 `Caching examples at: ...` 或 `Using cache from ...`
+- Lazy 模式会打印 `Will cache examples in '...' directory at first use.`
+
+如果启动时看到了 `Caching examples` 或 `Using cache from`，说明不是 lazy 模式。
+
+---
+
+### 13.2.2 首次点击代码的执行路径分析
+
+用户点击 example 时，代码路径是**先检查缓存索引，再决定是命中还是追加**，这个逻辑本身是正确的。让我们再确认一遍完整路径：
+
+**入口**：[load_from_cache(example_id)](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L582-L619)
+
+```python
+def load_from_cache(self, example_id: int) -> list[Any]:
+    # 第一步：先查索引
+    cached_index = self._get_cached_index_if_cached(example_id)
+    
+    if cached_index is None:
+        # 第二步：未命中才调用 cache() 追加
+        client_utils.synchronize_async(self.cache, example_id)
+        with open(self.cached_indices_file) as f:
+            cached_index = len(f.readlines()) - 1
+    
+    # 第三步：读 log.csv
+    with open(self.cached_file, encoding="utf-8") as cache:
+        examples = list(csv.reader(cache))
+    
+    if cached_index + 1 >= len(examples):
+        raise IndexError("Cached example not found in cache file")
+    
+    example_row = examples[cached_index + 1]
+    
+    # 第四步：反序列化
+    output = []
+    for component, value in zip(self.outputs, example_row, strict=False):
+        ...  # 尝试 ast.literal_eval → is_prop_update → read_from_flag
+    return output
+```
+
+**结论：`load_from_cache` 的逻辑是正确的，确实是先检查索引再决定。**
+
+---
+
+### 13.2.3 潜在问题：`cache(example_id=K)` 本身不做重复检查
+
+虽然 `load_from_cache` 已经做了检查，但 `cache()` 函数本身在 `example_id is not None` 时**不做重复检查**，直接进入执行分支：
+
+**位置**：[helpers.py:520-524](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L520-L524)
+
+```python
+if Path(self.cached_file).exists() and example_id is None:
+    # 只有全量模式才会跳过
+    print("Using cache from ...")
+    return
+else:
+    # example_id != None 时一定走这里
+    print("Caching examples at: ...")
+    ...
+    for i, example in enumerate(self.non_none_examples):
+        if example_id is not None and i != example_id:
+            continue
+        ...  # 执行用户函数 + 写文件
+```
+
+#### 会不会有问题？
+
+**正常路径（load_from_cache → cache）：没问题**，因为 `load_from_cache` 已经检查过了，确定未命中才调用。
+
+**但 `cache()` 是 public 方法**，如果外部代码直接调用 `examples.cache(example_id=5)`，就不会检查是否已经缓存过，会**重复执行并重复追加**。后果：
+1. 浪费计算资源（重复执行用户函数）
+2. `indices.csv` 出现重复的 `5`（追加在末尾）
+3. `log.csv` 出现重复的输出行
+4. 下次命中时 `list.index(5)` 返回第一次出现的位置 → 后续追加的行变成「孤儿数据」占磁盘
+
+#### 代码调整建议
+
+如果要让 `cache(example_id=K)` 更健壮，可以在进入 else 分支前、且 example_id 不为 None 时，再加一道索引检查：
+
+```python
+async def cache(self, example_id: int | None = None) -> None:
+    if self.root_block is None:
+        raise Error("Cannot cache examples if not in a Blocks context.")
+    if Path(self.cached_file).exists() and example_id is None:
+        print(f"Using cache from ...")
+        return
+    # 👇 新增：单个缓存时先检查是否已存在，避免重复执行和重复追加
+    if example_id is not None:
+        cached_index = self._get_cached_index_if_cached(example_id)
+        if cached_index is not None:
+            return  # 已缓存过，直接跳过
+    # 👆 新增结束
+    else:
+        print(f"Caching examples at: ...")
+        ...
+```
+
+这样即使 `cache()` 被外部直接调用，也能保证幂等性，不会重复执行。
 
 ---
 
