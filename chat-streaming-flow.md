@@ -77,10 +77,13 @@ async def _stream_fn(self, message, history, *args):
             yield response, history_          # 每次增量 yield
 ```
 
-**关键点：**
-- 每次 `yield` 输出的是**完整的最新 history**（而非增量 diff），history 包含所有对话消息
-- 第一个 `yield` 前先把用户消息追加到 history，再追加第一段 assistant 回复
-- 后续每次 yield 都将新的 assistant 片段追加到 history
+**关键点（核心机制）：**
+- `history` 参数是 `chatbot_state`（提交前已有的对话历史，**不含**当前用户消息）
+- 第 68 行：`history = self._append_message_to_history(message, history, "user")` —— 在此处将用户消息追加到 history，形成**固定基准 history_base**
+- 后续**所有** yield 都使用同一个 `history_base` 作为起点（而非在上一轮 yield 的 `history_` 基础上继续追加）
+- `_append_message_to_history` 内部做 `copy.deepcopy(history)` 然后 `extend`，因此每次 yield 产生的是一个**全新的 history 列表，但消息条数完全相同**
+- 变化的只有最后一条 assistant 消息的 `content` 字段：随着用户生成器每次 yield 累积的文本越来越长
+- 因此：每次增量返回**不是新增消息，而是替换最后一条助手消息的内容**（通过构造一个全新的 history 列表来实现）
 
 ### 2.2 事件注册链 — _setup_events
 
@@ -160,6 +163,99 @@ def handle_streaming_diffs(self, block_fn, data, session_hash, run, final, simpl
 ```
 
 diff 的格式为 `[action, path, value]`，支持 `replace`、`append`、`add`、`delete` 操作。
+
+### 2.6 生成器续跑：Iterator 的状态保存与恢复
+
+生成器的续跑依赖于 `app.iterators` 字典在 `call_process_api` 两次调用之间保存迭代器。整个生命周期涉及三个关键阶段：
+
+#### 阶段一：保存（Save）
+
+位置：[route_utils.py:401](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/route_utils.py#L399-L401)
+
+```python
+# call_process_api 函数末尾
+iterator = output.pop("iterator", None)
+if event_id is not None:
+    app.iterators[event_id] = iterator
+```
+
+- `process_api` 返回的 dict 中包含 `iterator` 字段，它是当前生成器迭代器对象的引用（具有内部 yield 位置状态）
+- 以 `event_id` 为 key 存入 `app.iterators: dict[str, AsyncIterator]`
+- 存储位置定义在 [routes.py:238-239](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/routes.py#L238-L239)
+
+#### 阶段二：恢复（Restore）
+
+位置：[route_utils.py:320-341](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/route_utils.py#L320-L341)
+
+```python
+def restore_session_state(app: App, body: PredictBodyInternal):
+    event_id = body.event_id
+    session_hash = getattr(body, "session_hash", None)
+    if session_hash is not None:
+        session_state = app.state_holder[session_hash]
+        if event_id is None:
+            iterator = None
+        elif event_id in app.iterators_to_reset:
+            # 如果事件被取消了（/reset 已处理），则返回 None 表示"从头开始"
+            iterator = None
+            app.iterators_to_reset.remove(event_id)
+        else:
+            # 正常情况：从字典中取出之前保存的迭代器
+            iterator = app.iterators.get(event_id)
+    else:
+        session_state = SessionState(app.get_blocks())
+        iterator = None
+    return session_state, iterator
+```
+
+- 每次 `call_process_api` 被 Queue 循环调用时，首先调用 `restore_session_state`
+- 若 `event_id` 对应迭代器存在且未被标记 reset，则取出传入 `process_api`
+- `process_api` 中的 `call_function` 检测到 `iterator is not None` 时，**跳过函数调用**，直接执行 `await async_iteration(iterator)` 取下一个 yield 值
+
+#### 阶段三：重置 / 清理（Reset）
+
+当用户点击 Stop 按钮（或事件正常完成、出错）时，触发清理：
+
+**触发方式 A：Stop 按钮 → Queue 内部**
+位置：[queueing.py:1082-1097](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/queueing.py#L1082-L1097)
+
+```python
+async def reset_iterators(self, event_id: str):
+    if event_id not in app.iterators:
+        return
+    async with app.lock:
+        try:
+            await safe_aclose_iterator(app.iterators[event_id])  # 关闭生成器
+        except Exception:
+            pass
+        del app.iterators[event_id]                           # 从字典移除
+        app.iterators_to_reset.add(event_id)                  # 加入 reset 标记集合
+```
+
+**触发方式 B：/reset 路由（前端主动调用）**
+位置：[routes.py:1421-1428](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/routes.py#L1421-L1428)
+
+```python
+if body.event_id in app.iterators:
+    async with app.lock:
+        await safe_aclose_iterator(app.iterators[body.event_id])
+    del app.iterators[body.event_id]
+    app.iterators_to_reset.add(body.event_id)
+```
+
+**触发方式 C：正常完成（生成器耗尽）**
+位置：[queueing.py:1087-1096](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/queueing.py#L1087-L1096)
+
+```python
+if event_id not in app.iterators:
+    return
+async with app.lock:
+    await safe_aclose_iterator(app.iterators[event_id])
+    del app.iterators[event_id]
+    app.iterators_to_reset.add(event_id)
+```
+
+**为什么需要 `iterators_to_reset` 集合？** 存在一种竞态：用户点击 Stop → 调用 `/reset` 清理 iterator → 但 Queue 的循环中该 event 可能已经调用了 `call_process_api`（`restore_session_state` 已经取到了 iterator），此时如果下一轮循环前 `iterators_to_reset` 没有被检查，会导致"已经取消的任务又继续跑"。因此 `restore_session_state` 中先检查 `iterators_to_reset`，若命中则返回 `None`，强制从头运行（实际上会因 StopIteration 立即退出）。
 
 ---
 
@@ -360,24 +456,121 @@ async handle_data(outputs: number[], data: unknown[]) {
 
 ## 5. 前端：Chatbot 组件展示
 
-### 5.1 ChatBot.svelte — 值驱动的消息渲染
+### 5.1 ChatBot.svelte — 值驱动的消息渲染与单条气泡持续增长
 
-文件：[ChatBot.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/ChatBot.svelte#L1-L150)
+文件：[ChatBot.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/ChatBot.svelte#L1-L350)
 
 ```svelte
 export let value: NormalisedMessage[] | null = [];
+let old_value: NormalisedMessage[] | null = null;
 
-// 当 value 变化时自动滚动
-async function scroll_on_value_update() {
-    if (!autoscroll) return;
-    if (is_at_bottom()) {
-        await tick();
-        scroll_to_bottom();
+// 响应式：每次 value 变化时重新分组
+$: groupedMessages = value && group_messages(value, display_consecutive_in_same_bubble);
+
+// 响应式：当 value 或 pending_message 变化时，触发自动滚动
+$: if (value || pending_message || _components) {
+    scroll_on_value_update();
+}
+
+// 响应式：value 与 old_value 深度不等时触发 change 事件
+$: {
+    if (!dequal(value, old_value)) {
+        old_value = value;
+        dispatch("change");
     }
 }
 ```
 
-ChatBot 组件接收 `value` 属性（`NormalisedMessage[]`），Svelte 的响应式绑定保证每次后端推送新数据时自动重新渲染。
+消息列表的渲染核心是 Svelte 的 `{#each}` 循环：
+
+```svelte
+{#each groupedMessages as messages, i}
+    <Message
+        messages={messages}
+        i={i}
+        ...
+    />
+{/each}
+```
+
+**为什么前端会显示"连续增长的单条回复气泡"而不是每次新增气泡？** 这里有四层协作机制：
+
+#### 层 1：后端保证 —— history 长度不变
+
+由 `_stream_fn` 的逻辑（第 2.1 节分析）可知，所有 yield 产生的 history 列表长度**完全相同**。例如一个典型的流式对话：
+
+| 阶段 | history 长度 | 最后一条消息内容 |
+|------|-------------|-----------------|
+| 用户提交 | 3（历史对话 1、历史对话 2、用户刚发的） | 用户消息："你好" |
+| 第 1 次 yield | 4 | assistant: "我" |
+| 第 2 次 yield | 4 | assistant: "我是" |
+| 第 3 次 yield | 4 | assistant: "我是一个" |
+| ... | 4 | ... |
+| 最终 yield | 4 | assistant: "我是一个 AI 助手" |
+
+因此 `value.length`（经过 `group_messages` 处理后 `groupedMessages.length`）在整个流式过程中**保持恒定**。
+
+#### 层 2：Svelte `#each` —— 索引作为隐式 key
+
+`{#each groupedMessages as messages, i}` 使用循环索引 `i` 作为组件的**隐式 identity key**（因为没有显式指定 `(key)`）。Svelte 的 diff 算法行为是：
+
+- 如果 `groupedMessages.length` 从 N 变为 N（不变）：**复用**所有已存在的 `<Message>` 组件实例，只更新它们的 `messages` prop
+- 如果长度从 N 变为 N+1：保留前 N 个组件，**新建**第 N+1 个 `<Message>`
+- 如果长度从 N 变为 N-1：销毁最后一个组件
+
+由于在流式过程中长度恒等，Svelte **不会销毁或新建任何 `<Message>` 组件**，只是将更新后的 `messages`（即 `groupedMessages[i]`）作为新 prop 传入已有的组件实例。这意味着：所有已渲染的气泡 DOM 节点**在原地被更新，完全不会被重建**。
+
+#### 层 3：group_messages —— role 一致则同一气泡
+
+文件：[utils.ts:260-295](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/utils.ts#L260-L295)
+
+`group_messages()` 将连续同角色的消息合并为一个气泡组：
+
+```typescript
+for (const message of messages) {
+    if (message.role === currentRole) {
+        currentGroup.push(message);           // 同角色 → 加入当前气泡
+    } else {
+        if (currentGroup.length > 0) groupedMessages.push(currentGroup);
+        currentGroup = [message];             // 角色切换 → 新建气泡
+        currentRole = message.role;
+    }
+}
+```
+
+由于每次的最后一条消息 role 都是 `"assistant"`（并且前面有一条 `"user"` 作为切换边界），因此 `groupedMessages` 中的最后一组始终是**同一个索引位置上的同一个气泡**——只有它内部包含的 `messages` 数组中那条消息的 `content` 变得更长。
+
+#### 层 4：Message / MessageContent —— 子组件响应式更新
+
+文件：[Message.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/Message.svelte#L1-L100)
+
+当 `<Message>` 组件收到新的 `messages` prop 时，Svelte 的响应式系统会对比 prop 变化：
+- `messages` 数组的长度不变（仍然只有 1 条 assistant 文本消息，除非 reasoning_tags 拆分了 thinking 消息）
+- `messages[0].content.text` 的字符串变得更长
+
+`<MessageContent>` 内部使用 Markdown 渲染器等，会根据新的 text prop 增量更新 DOM 中的文本节点。最终用户看到的效果就是：气泡大小不断增大，文字像"打字机"一样一个个（或一段段）显示出来。
+
+#### 自动滚动配合
+
+每次 `value` 变化时触发的 `scroll_on_value_update()`：
+
+```svelte
+$: if (value || pending_message || _components) {
+    scroll_on_value_update();
+}
+
+async function scroll_on_value_update(): Promise<void> {
+    if (!autoscroll) return;
+    if (is_at_bottom()) {
+        scroll_after_component_load = true;
+        await tick();                          // 等待 DOM 更新完成
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        scroll_to_bottom();                   // 滚动到底部
+    }
+}
+```
+
+`await tick()` 是关键——它确保 Svelte 的响应式更新已经把新文本渲染到 DOM，使得 `div.scrollHeight` 是最新的高度，然后再滚动。
 
 ### 5.2 Pending.svelte — 等待状态展示
 
@@ -476,24 +669,97 @@ SSE v2/v3 协议下：
 | 超时控制 | 无 | `time_limit` |
 | 前端提交方式 | Client.submit() → EventSource | Client.submit() → send_chunk() |
 
+### 7.6 聊天历史：替换同一条助手回复，不是新增消息
+
+这是流式聊天中最核心的设计之一。下面用具体数据示例展示整个生命周期中 history 的变化：
+
+#### 数据示例：一次典型的流式对话
+
+场景：已有历史 `[{user:"A"}, {assistant:"B"}, {user:"C"}, {assistant:"D"}]`，用户输入 `"你好"`，AI 流式回答 `"我是AI助手"`（分 4 次 yield）。
+
+**步骤 1：用户提交 → _stream_fn 初始化**
+```python
+# _stream_fn 入参
+message  = "你好"
+history  = [                       # chatbot_state 中的旧历史（不含当前用户消息）
+    {user:"A"}, {assistant:"B"}, {user:"C"}, {assistant:"D"}
+]
+
+# 第 961 行：history_base = history + 用户消息
+history  = [                       # 从此固定不变
+    {user:"A"}, {assistant:"B"}, {user:"C"}, {assistant:"D"}, {user:"你好"}
+]
+```
+
+**步骤 2：第 1 次 yield（AI 输出 "我"）**
+```
+history_ = deepcopy(history) + [ {assistant:"我"} ]
+        = [A, B, C, D, 你好, "我"]     ← 长度 6
+```
+
+**步骤 3：第 2 次 yield（AI 输出 "我是"）**
+```
+history_ = deepcopy(history) + [ {assistant:"我是"} ]     # 注意：不是 deepcopy(history_)！
+        = [A, B, C, D, 你好, "我是"]   ← 长度 6（不变），最后一条内容增长
+```
+
+**步骤 4：第 3 次 yield（AI 输出 "我是AI"）**
+```
+history_ = deepcopy(history) + [ {assistant:"我是AI"} ]
+        = [A, B, C, D, 你好, "我是AI"] ← 长度 6（不变），最后一条内容增长
+```
+
+**步骤 5：第 4 次（最终）yield（AI 输出 "我是AI助手"）**
+```
+history_ = deepcopy(history) + [ {assistant:"我是AI助手"} ]
+        = [A, B, C, D, 你好, "我是AI助手"]
+```
+
+#### 关键结论
+
+| 问题 | 答案 |
+|------|------|
+| 每次 yield 是新增消息吗？ | **不是。** 所有 yield 产生的 history 长度相同，都是 6 条 |
+| 实际发生了什么？ | **构造了全新的 history 列表**，通过 deepcopy 复用前 5 条，然后**替换最后一条助手消息的内容** |
+| 最后一条是同一个对象吗？ | **不是。** 每次 deepcopy + extend 创建的是全新的 Message 对象，只是内容恰好与之前的消息同构 |
+| 前端怎么知道在原地更新而不是新建气泡？ | Svelte 的 `{#each ..., i}` 用**索引 i** 作为 identity key，当数组长度 N → N 时，Svelte 复用已有组件并更新 props，不会创建/销毁 DOM |
+| 用户视觉感知 | 单个气泡里的文字持续增长（打字机效果） |
+
+#### 特殊情况：`reasoning_tags` 思考消息拆分
+
+如果配置了 `reasoning_tags=[("<thinking>", "</thinking>")]`，后端 `_extract_thinking_blocks`（[chatbot.py:641-700](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/components/chatbot.py#L641-L700)）会将单次回复拆分成**多条消息**：
+
+```
+第 1 次 yield（AI 输出 "<thinking>分析中</thinking>我"）
+→ 被拆为：
+  1. {role:assistant, content:"分析中", metadata:{title:"Reasoning", status:"pending"}}
+  2. {role:assistant, content:"我"}
+→ 此时 history 长度 = 6 + 1 = 7（因为 thinking 是额外的一条）
+```
+
+随着流式输出，thinking 消息可能先处于 `status="pending"`（显示 spinner），当标签闭合后变为 `status="done"`（折叠收起）。此时 history 的消息结构会**短暂增长**（因为思考内容尚未闭合时被视为 pending 段，闭合后拆分为独立的 thinking 消息）。
+
 ---
 
 ## 8. 涉及的关键文件索引
 
 | 层次 | 文件 | 核心职责 |
 |------|------|---------|
-| 高层接口 | [chat_interface.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/chat_interface.py) | ChatInterface 封装，事件链注册，_stream_fn 生成器包装 |
-| 组件定义 | [chatbot.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/components/chatbot.py) | ChatMessage/MessageDict 数据模型，postprocess 逻辑 |
+| 高层接口 | [chat_interface.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/chat_interface.py) | ChatInterface 封装，事件链注册，_stream_fn 生成器包装，_append_message_to_history |
+| 组件定义 | [chatbot.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/components/chatbot.py) | ChatMessage/MessageDict 数据模型，postprocess 逻辑，_extract_thinking_blocks |
 | 后端核心 | [blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/blocks.py) | process_api / call_function / handle_streaming_diffs |
-| 队列调度 | [queueing.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/queueing.py) | Queue.process_events 循环，消息发送 |
-| 路由层 | [routes.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/routes.py) | /queue/data SSE 端点，/queue/join 入队 |
+| 路由工具 | [route_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/route_utils.py) | call_process_api / restore_session_state：iterator 的保存与恢复入口 |
+| 队列调度 | [queueing.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/queueing.py) | Queue.process_events 循环，reset_iterators 清理 iterator |
+| 路由层 | [routes.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/routes.py) | /queue/data SSE 端点，/queue/join 入队，/reset iterator 清理 |
 | 消息定义 | [server_messages.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/server_messages.py) | ServerMessage 类型体系 |
 | 函数配置 | [block_function.py](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/block_function.py) | BlockFunction：connection 类型、time_limit 等 |
 | JS Client | [client.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/client/js/src/client.ts) | stream() / EventSource 管理 |
 | 提交逻辑 | [submit.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/client/js/src/utils/submit.ts) | submit() 异步迭代器，handle_message 分发 |
 | SSE 流 | [stream.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/client/js/src/utils/stream.ts) | open_stream / apply_diff_stream / readable_stream |
 | 消息解析 | [api_info.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/client/js/src/helpers/api_info.ts) | handle_message()：后端 msg → 前端 type 映射 |
-| 依赖管理 | [dependency.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/core/src/dependency.ts) | DependencyManager：事件循环、状态更新 |
+| 依赖管理 | [dependency.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/core/src/dependency.ts) | DependencyManager：事件循环、handle_data 状态更新 |
 | 加载状态 | [stores.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/core/src/stores.ts) | LoadingStatus 状态机 |
-| Chatbot UI | [ChatBot.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/ChatBot.svelte) | 消息列表渲染、自动滚动 |
+| Chatbot UI | [ChatBot.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/ChatBot.svelte) | 消息列表渲染（#each 索引 key）、自动滚动 |
+| Chatbot 工具 | [utils.ts](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/utils.ts) | group_messages（按 role 合并气泡）、is_last_bot_message |
+| 单条气泡 | [Message.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/Message.svelte) | 单条消息气泡组件，接收 messages prop 的响应式更新 |
 | 等待动画 | [Pending.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/Pending.svelte) | 生成中脉动动画 |
