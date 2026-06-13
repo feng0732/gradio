@@ -303,18 +303,19 @@ Python 客户端对 State 做了透明处理，用户无需手动管理：
 
 ## 五、持久生命周期管理
 
-State 的生命周期管理有两条独立的清理路径：**TTL 过期清理**和**会话容量淘汰**。它们操作粒度不同、触发条件不同、清理逻辑也不同，容易混淆。此外，TTL 的登记时机有一个容易忽略的细节：只读不写的 State 不会被 TTL 管理。
+State 的生命周期管理有三条独立的清理路径：**TTL 过期清理**、**会话容量淘汰**和**组件移除清理（reload/re-render）**。它们操作粒度不同、触发条件不同、清理逻辑也不同，容易混淆。此外，TTL 的登记时机有一个容易忽略的细节：只读不写的 State 不会被 TTL 管理。
 
-### 5.1 两条清理路径对比
+### 5.1 三条清理路径对比
 
-| | TTL 过期清理 | 会话容量淘汰（LRU） |
-|---|---|---|
-| **操作粒度** | 单个 State key（`state_data` 中的某一项） | 整个 `SessionState`（含该会话全部 State） |
-| **触发条件** | State 写入后经过 `time_to_live` 秒（会话关闭后切换为 1 小时） | 活跃会话数超过 `state_session_capacity` |
-| **触发位置** | [StateHolder.delete_state](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/state_holder.py#L51-L61) | [StateHolder.update](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/state_holder.py#L38-L43) |
-| **是否调 delete_callback** | ✅ 调用 `component.delete_callback(value)` | ❌ 不调用，整个 SessionState 直接丢弃 |
-| **运行频率** | 每秒扫描一次（`_delete_state` 后台任务） | 每次请求时即时检查 |
-| **涉及 `_state_ttl`** | ✅ 依赖 `_state_ttl` 判断是否过期 | ❌ 无关 |
+| | TTL 过期清理 | 会话容量淘汰（LRU） | 组件移除清理（reload/re-render） |
+|---|---|---|---|
+| **操作粒度** | 单个 State key | 整个 `SessionState`（含全部 State） | 单个 State key |
+| **触发条件** | State 写入后超过 `time_to_live` 秒（会话关闭后切换为 1 小时） | 活跃会话数超过 `state_session_capacity` | State 的 `_id` 从 `blocks_config.blocks` 中消失（源代码移除 State 定义 / re-render 不再创建该组件） |
+| **触发位置** | [StateHolder.delete_state](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/state_holder.py#L51-L61) | [StateHolder.update](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/state_holder.py#L38-L43) | [state_components 属性](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/state_holder.py#L142-L161)（副作用） |
+| **是否调 delete_callback** | ✅ 调用 `component.delete_callback(value)` | ❌ 不调用，整个 SessionState 直接丢弃 | ❌ 不调用，直接 `del state_data[_id]` |
+| **是否清理 `_state_ttl`** | ❌ 保留旧记录 | — 整个 SessionState 被丢弃 | ❌ 保留旧记录 |
+| **运行频率** | 每秒扫描一次（`_delete_state` 后台任务） | 每次请求时即时检查 | 每秒扫描一次（在 `_delete_state` 调用 `state_components` 时顺带触发） |
+| **涉及 `_state_ttl`** | ✅ 依赖 `_state_ttl` 判断是否过期 | ❌ 无关 | ❌ 无关（仅检查 `_id in blocks_config.blocks`） |
 
 ### 5.2 TTL 登记时机：只有写回时才登记
 
@@ -615,9 +616,174 @@ def __setitem__(self, key: int, value: Any):
 
 曾经被写回过的 State，一旦 TTL 过期被清理，反而比从未写回过的 State 更不稳定——除非再次写回刷新 `_state_ttl`。
 
-如果用户关闭页面：`is_closed = True`，TTL 覆盖为 3600 秒，1 小时后清理。
+### 5.10 第三条清理路径：Reload / Re-render 后 blocks 配置变更
 
-如果服务器会话数超过 10000：LRU 淘汰直接移除整个 `SessionState`，`delete_callback` 不会被调用。
+除了 **TTL 过期清理** 和 **LRU 会话容量淘汰** 之外，还有一条容易被忽略的清理路径：**State 组件从 blocks 配置中消失时的静默删除**。这条路径的触发条件、清理粒度和回调行为都与前两条有本质区别。
+
+#### 触发条件：blocks_config.blocks 中不再有该 State
+
+什么时候一个 State 的 `_id` 会从 `blocks_config.blocks` 中消失？有两种典型场景：
+
+**场景一：ServerReloader 热重载**
+
+[utils.py L187-L189](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/utils.py#L187-L189) 中，代码文件变更时热重载会重建整个 Blocks：
+
+```python
+self.running_app.state_holder.set_blocks(demo)   # demo 是重新创建的 Blocks
+for session in self.running_app.state_holder.session_data.values():
+    session.blocks_config = copy.copy(demo.default_config)   # 所有已有会话同步新配置
+```
+
+如果开发者：
+- 删除了某个 `gr.State(...)` 定义
+- 或代码结构变化导致组件 `_id` 重新分配（与之前值不一致）
+
+那么所有已有会话的 `blocks_config.blocks` 中就不再包含那个 State 的 `_id`。
+
+**场景二：Renderable 重新渲染**
+
+[renderable.py L82](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/renderable.py#L82) 中，`@gr.render` 装饰的动态渲染函数执行时：
+
+```python
+with container_copy:
+    self.fn(*args, **kwargs)
+    blocks_config.blocks[self.container_id] = container_copy
+```
+
+重新渲染后，容器内部的子组件集合可能变化——如果 State 所在的动态容器在某次渲染中没有重新创建该 State，它的 `_id` 就从 `blocks_config.blocks` 中消失了。
+
+#### 清理逻辑：静默删除，无回调
+
+[state_components 属性](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/state_holder.py#L138-L161) 的最开头就处理了这种情况：
+
+```python
+@property
+def state_components(self) -> Iterator[tuple[State, Any, bool]]:
+    ...
+    state_ids_to_delete = []
+    for _id in self.state_data:
+        if _id not in self.blocks_config.blocks:
+            # state may have been deleted in reload or re-render
+            state_ids_to_delete.append(_id)   # ← 登记到待删除列表
+            continue                          # ← 关键：直接跳过，不 yield
+        ...
+        # ← 只有在 blocks_config.blocks 中存在的 State 才会走到这里
+        #    并进入 TTL 过期判定 + delete_callback 流程
+    for _id in state_ids_to_delete:
+        del self.state_data[_id]              # ← 直接删除 state_data 中的值
+        # ⚠️ 完全没有调用 delete_callback
+        # ⚠️ 完全没有删除 _state_ttl[_id]
+```
+
+核心区别：**`continue` 跳过了 TTL 判定和 yield，所以 `delete_state` 中的 `delete_callback` 循环根本看不到这些 State。** 它们只是在属性遍历的末尾被 `del self.state_data[_id]` 静默移除。
+
+#### 完整时序示例
+
+假设开发者在热重载时删除了一个带 `delete_callback` 的 State：
+
+```
+时刻 T0:    State 初始定义
+my_state = gr.State(value=dict(cache=[]), time_to_live=600,
+                    delete_callback=lambda v: v["cache"].clear())
+
+时刻 T1:    用户会话建立 → state_data[id] = deepcopy(dict(cache=[]))
+            函数写回 → __setitem__ → state_data[id] = dict(cache=[1,2,3])
+                            → _state_ttl[id] = (600, T1)
+
+时刻 T2:    开发者修改代码，删除了 my_state 的定义 → 热重载触发
+            ServerReloader 重建 Blocks → demo.default_config 中无 my_state._id
+            所有会话的 session.blocks_config = copy(new_default_config)
+            → blocks_config.blocks 中已无该 _id
+
+时刻 T2+1s: _delete_state 扫描 → delete_state(session_id, expired_only=True)
+            → state_components 遍历：
+               for _id in state_data:
+                   _id not in blocks_config.blocks → True
+                   state_ids_to_delete.append(_id)
+                   continue  ← 跳过，不进入 delete_callback 判定流程
+            → for _id in state_ids_to_delete:
+                   del self.state_data[_id]  ← 静默删除 dict(cache=[1,2,3])
+            ⚠️ delete_callback 未被调用 → cache 列表未 clear
+            ⚠️ _state_ttl[id] 仍然保留 (600, T1) 记录
+```
+
+#### 组件重新出现：`_state_ttl` 残留与 TTL 过期的交互
+
+Blocks 配置变更清理后的 State 有一个特点：`_state_ttl` 记录没有被清理。如果后续该 State 的 `_id` 又重新出现在 `blocks_config.blocks` 中（典型场景：re-render 下一轮重新渲染了该 State、开发者撤销了删除操作又触发热重载），会发生什么？
+
+**场景：re-render 中 State 有条件地消失又出现**
+
+```python
+toggle = gr.Checkbox(label="启用 State")
+
+@gr.render(inputs=toggle)
+def dynamic_layout(enabled):
+    if enabled:
+        local_state = gr.State(value=0, time_to_live=300, delete_callback=cleanup_fn)
+        btn = gr.Button("操作")
+        btn.click(lambda s: s + 1, local_state, local_state)
+    else:
+        gr.Markdown("State 未创建")
+```
+
+完整时序：
+
+```
+时刻 T0:   toggle=True (初始) → re-render 创建了 local_state，_id=X
+           用户点击 btn → __setitem__(X, 5) → _state_ttl[X] = (300, T0)
+
+时刻 T10:  用户取消勾选 toggle → re-render 不创建 local_state
+           blocks_config.blocks 中已无 X
+
+时刻 T11:  _delete_state 扫描 → state_components 中 X 不在 blocks_config
+           state_ids_to_delete 加入 X → del state_data[X]
+           ⚠️ _state_ttl[X] = (300, T0) 仍然保留，delete_callback 未调用
+
+时刻 T20:  用户重新勾选 toggle → re-render 再次创建 State
+           ⚠️ 关键：这是一个全新的 gr.State 对象，_id 通常不等于 X（新分配）
+           但如果通过 key 参数强制复用同一个 _id，或者 reload 时 _id 恰好相同：
+
+           情况 A（新 _id = Y）：一切正常。state_data[Y] 和 _state_ttl[Y] 都是新登记的。
+             旧的 state_data[X] 已被删除，旧的 _state_ttl[X] 是孤儿记录但无影响。
+
+           情况 B（旧 _id = X 又出现在 blocks_config 中）：
+             T20+1s，_delete_state 扫描时：
+             → X in blocks_config.blocks → True
+             → X in state_data → False（T11 已删除），跳过此 _id（因为 for _id in state_data 只遍历存在的）
+             → 没有任何东西删除旧的 _state_ttl[X]
+
+             此时用户再次点击 btn → __setitem__(X, 10)：
+             → 覆盖 _state_ttl[X] = (300, T20)    ← 正常刷新，一切 OK
+             → state_data[X] = 10
+             → 之后 300 秒内无写回才会被 TTL 清理
+```
+
+**结论**：只要组件重新出现时通过 `__setitem__` 写回一次，新的 `_state_ttl` 就会覆盖旧记录，不会有问题。如果组件重新出现后只被读取（走 `__getitem__` 的 deepcopy 初始值路径），那它和 5.9 节分析的"TTL 过期后重新读取"行为完全一致——因为 `_state_ttl` 中的旧 `created_at` 已经过期，新放回的初始值下一轮 TTL 扫描又会被立刻判定过期并删除，进入循环。
+
+#### 三条清理路径的交互矩阵
+
+| 场景 | TTL 清理路径 | LRU 淘汰路径 | Blocks 变更路径 | 最终行为 |
+|------|-------------|-------------|----------------|---------|
+| State 正常写回，time_to_live 到期 | ✅ 触发，调 callback | 不触发 | 不触发 | 资源正确释放，`_state_ttl` 残留 |
+| 会话被 LRU 淘汰 | ❌ 来不及触发 | ✅ 整个会话移除 | ❌ 无需触发 | 资源未释放，无残留 |
+| State 被 reload 移除 | ❌ 直接 continue | 不触发 | ✅ 静默删除 | 资源未释放，`_state_ttl` 残留 |
+| State 移除后 blocks 配置又恢复，重新被写回 | 正常按新 TTL 计时 | 不触发 | 不触发（存在于 blocks） | ✅ 正常 |
+| State 移除后 blocks 配置又恢复，只被读取 | 旧 TTL 记录导致立刻过期 → 循环 | 不触发 | 不触发（存在于 blocks） | ❌ 陷入循环 |
+| 只读不写的 State，会话被 LRU 淘汰 | ❌ 不参与 TTL | ✅ 整个会话移除 | ❌ 无需触发 | 资源未释放 |
+| 只被读的 State，会话被关闭后 TTL 覆盖为 1 小时 | ❌ 不参与（未登记 TTL） | 不触发 | 不触发 | 永久存在于内存中，直到 LRU 淘汰 |
+
+#### 资源泄漏风险汇总
+
+从三条路径的 `delete_callback` 行为可以总结出资源清理的完整性矩阵：
+
+| State 场景 | TTL 过期清理是否调回调 | LRU 淘汰是否调回调 | Blocks 变更是否调回调 |
+|---|---|---|---|
+| 只在 inputs，从未写回 | 不参与（不登记 TTL） | ❌ | ❌ |
+| 写回过，且 TTL 到期 | ✅ | ❌ | ❌ |
+| 写回过，被 LRU 淘汰 | ❌（整个会话先被弹掉了） | ❌ | ❌ |
+| 写回过，被 reload/re-render 移除 | ❌（直接跳过） | ❌ | ❌ |
+
+**结论**：三种场景下，只有 State 被正常写回后因 TTL 过期被清理，才会调用 `delete_callback`。其他所有清理路径都不触发回调。如果 State 持有需要显式释放的资源（临时文件、网络连接、锁），应额外实现兜底机制（如 atexit 注册、结合心跳 `is_closed` 监听主动清理），不能依赖 `delete_callback` 的完整性。
 
 ---
 
