@@ -318,7 +318,48 @@ HTML 模板加载完成
 
 ### 路径 C：接口返回文件地址加前缀（`add_root_url`）
 
-**核心思想：后端 API 返回的 JSON 中，文件 URL 最初只是相对路径（如 `/file=/tmp/xxx.jpg`），必须在出站前给它加上 root 前缀，前端才能正确请求。**
+**核心思想：后端 API 返回的 JSON 中，文件 URL 最初是带 `/gradio_api/file=` 前缀的相对路径，必须在出站前给它加上 root 前缀，前端才能正确请求。**
+
+#### C.0 文件 URL 的生成：`move_files_to_cache`
+
+文件 URL 并非凭空出现，而是在 `move_files_to_cache` 中生成的。这个函数在后端 postprocess 之后、`add_root_url` 之前运行，负责把本地文件路径转为可访问的 URL。
+
+**同步版本** `gradio/processing_utils.py#L431-L502`，**异步版本** `gradio/processing_utils.py#L551-L623`，核心逻辑相同：
+
+```python
+# processing_utils.py#L481-L492 (同步) / L603-L614 (异步)
+url_prefix = (
+    f"{API_PREFIX}/stream/" if payload.is_stream else f"{API_PREFIX}/file="
+)
+# API_PREFIX = "/gradio_api"  (route_utils.py#L74)
+
+if block.proxy_url:
+    proxy_url = block.proxy_url.rstrip("/")
+    url = f"{API_PREFIX}/proxy={proxy_url}{url_prefix}{payload.path}"
+elif client_utils.is_http_url_like(payload.path) or payload.path.startswith(url_prefix):
+    url = payload.path          # 已经是 http URL 或已有前缀，原样保留
+else:
+    url = f"{url_prefix}{payload.path}"   # 拼接: /gradio_api/file= + 实际路径
+payload.url = url
+```
+
+关键点：**文件 URL 在生成时就自带 `/gradio_api/file=` 前缀**，与路由注册位置完全对应。
+
+三种 URL 前缀格式：
+
+| 场景 | 生成的 `payload.url` | 对应路由 |
+|------|---------------------|----------|
+| 普通文件 | `/gradio_api/file=/tmp/gradio/abc.png` | `router.get("/file={path_or_url:path}")` → `/gradio_api/file=...` |
+| 流式文件 | `/gradio_api/stream/abc123` | `router.get("/stream/{session_hash}/...")` → `/gradio_api/stream/...` |
+| 代理文件 | `/gradio_api/proxy=https://other/gradio_api/file=/...` | `router.get("/proxy=...")` → `/gradio_api/proxy=...` |
+
+对应的路由注册（均在 `router = APIRouter(prefix="/gradio_api")` 下）：
+
+- **主文件路由**：`@router.get("/file={path_or_url:path}")` → 完整路径 `/gradio_api/file={path}` （`gradio/routes.py#L1082-L1084`）
+- **废弃文件路由**：`@router.get("/file/{path:path}")` → 完整路径 `/gradio_api/file/{path}` （`gradio/routes.py#L1185-L1187`）
+- **流式文件路由**：`@router.get("/stream/{session_hash}/{run}/{component_id}/playlist-file")` （`gradio/routes.py#L1159`）
+
+> ⚠️ **易混淆点**：`/file=` 是路由路径的一部分（非查询参数），注册在 `router`（prefix=`/gradio_api`）下，因此完整匹配路径是 `/gradio_api/file=xxx`，而不是 `/file=xxx`。文档中的路由表「`GET /gradio_api/file={path}`」才是正确写法。
 
 #### C.1 调用链全景图
 
@@ -343,36 +384,26 @@ HTML 模板加载完成
     │            root_path=root_path                               (route_utils.py#L386-L398)
     │        )
     │
-    └─ process_api 中三次调用 add_root_url (blocks.py#L2258-2350):
+    └─ process_api 内部文件 URL 的两次变换:
         │
-        ├─ ① batch 分支的常规输出
-        │    if root_path is not None:
-        │        data = processing_utils.add_root_url(
-        │            data, root_path, None
-        │        )                                                   (blocks.py#L2258-L2259)
+        ├─ 第一步: postprocess_data → move_files_to_cache
+        │    本地路径 → 带 /gradio_api/file= 前缀的相对 URL
+        │    "/tmp/gradio/abc.png" → "/gradio_api/file=/tmp/gradio/abc.png"
+        │    (processing_utils.py#L481-L492 或 L603-L614)
         │
-        ├─ ② 非 batch 分支的常规输出
-        │    if root_path is not None:
-        │        data = processing_utils.add_root_url(
-        │            data, root_path, None
-        │        )                                                   (blocks.py#L2302-L2303)
+        ├─ 第二步: add_root_url (blocks.py#L2258-2350 中四次调用)
+        │    相对 URL → 带 root 的绝对 URL
+        │    "/gradio_api/file=/tmp/..." → "https://host/myapp/gradio/gradio_api/file=/tmp/..."
         │
-        ├─ ③ 流式输出的每一片段
-        │    await handle_streaming_outputs(
-        │        ..., root_path=root_path, ...
-        │    )
-        │      └─ for i, block in enumerate(outputs):
-        │            output_data = async_move_files_to_cache(...)
-        │            if root_path is not None:
-        │                output_data = add_root_url(
-        │                    output_data, root_path, None
-        │                )                                           (blocks.py#L2132-L2135)
-        │
-        └─ ④ gr.render() 的 render_config
-             if root_path is not None:
-                 output["render_config"] = add_root_url(
-                     output["render_config"], root_path, None
-                 )                                                   (blocks.py#L2347-L2350)
+        │    ① batch 分支
+        │       data = add_root_url(data, root_path, None)        (blocks.py#L2258-L2259)
+        │    ② 非 batch 分支
+        │       data = add_root_url(data, root_path, None)        (blocks.py#L2302-L2303)
+        │    ③ 流式输出的每一片段
+        │       output_data = add_root_url(output_data, root_path, None)
+        │                                                              (blocks.py#L2132-L2135)
+        │    ④ gr.render() 的 render_config
+        │       output["render_config"] = add_root_url(...)             (blocks.py#L2347-L2350)
 ```
 
 其他 API 路由也有类似的 `get_root_url` → `call_process_api` 模式：
@@ -418,45 +449,38 @@ def add_root_url(data: dict | list, root_url: str, previous_root_url: str | None
     return client_utils.traverse(data, _add_root_url, client_utils.is_file_obj_with_url)
 ```
 
-#### C.4 前后端文件 URL 约定
+#### C.4 文件 URL 的三阶段变换
 
-**后端存储的文件 URL 格式**（加前缀前）：
+以一个图片文件为例，追踪 URL 从产生到前端使用的完整变化：
 
-```python
-# 例如用户上传的图片、组件生成的文件等
-{
-    "url": "/file=/gradio_tmp/user_id/image_123.jpg",
-    "name": "image_123.jpg",
-    "size": 102400,
-    "mime_type": "image/jpeg",
-    ...
-}
 ```
+阶段 1: 用户函数返回本地路径
+  value = "/tmp/gradio/abc123/image.png"
 
-`/file=` 前缀对应路由：
-- `GET /gradio_api/file={path_or_url:path}` → `gradio/routes.py#L1082-L1084`
-- `GET /gradio_api/file/{path:path}`（废弃） → `gradio/routes.py#L1185-L1187`
+阶段 2: postprocess_data → move_files_to_cache (processing_utils.py#L481-L492)
+  url_prefix = f"{API_PREFIX}/file="  →  "/gradio_api/file="
+  payload.url = "/gradio_api/file=/tmp/gradio/abc123/image.png"
+  ↑ 此时是相对 URL，以 /gradio_api 开头
 
-**前端收到的文件 URL 格式**（加前缀后）：
+阶段 3: add_root_url (processing_utils.py#L626-L635)
+  root_url = "https://example.com/myapp/gradio"
+  file_dict["url"] = "https://example.com/myapp/gradio" + "/gradio_api/file=/tmp/gradio/abc123/image.png"
+                   = "https://example.com/myapp/gradio/gradio_api/file=/tmp/gradio/abc123/image.png"
+  ↑ 此时是绝对 URL
 
-```json
-{
-    "url": "https://example.com/myapp/gradio/file=/gradio_tmp/user_id/image_123.jpg",
-    "name": "image_123.jpg",
-    ...
-}
+阶段 4: 前端拿到 URL → <img src="https://example.com/myapp/gradio/gradio_api/file=/tmp/...">
+  浏览器发起 GET 请求 → 路径 A 剥离 /myapp/gradio → 子应用看到 /gradio_api/file=/tmp/...
+  → 匹配 router.get("/file={path_or_url:path}") → 返回文件二进制 ✅
 ```
-
-然后前端组件直接用这个 URL 做 `<img src>` 等操作，无需再拼接（因为路径 B 的 root 前缀已经由路径 C 加上了）。
 
 **路径 C 的特点**：
 
 | 谁来处理前缀 | `processing_utils.add_root_url`（后端在 JSON 序列化前修改） |
 |---|---|
-| 处理时机 | 后端 API 响应出站之前（postprocess 后、return 前） |
+| 处理时机 | 后端 API 响应出站之前（postprocess + move_files_to_cache 后、return 前） |
 | 影响范围 | 组件的 `value` 中文件对象（图片、视频、文件等），初始 config 中文件默认值，render_config 中文件 |
 | 开发者是否需要感知 | **不需要**。只要调用 `process_api` 时传入 `root_path`，自动处理 |
-| 核心约定 | 后端内部存「相对 URL」( `/file=xxx` )，出站时变为「绝对 URL」( `https://host/myapp/gradio/file=xxx` ) |
+| 核心约定 | `move_files_to_cache` 生成 `/gradio_api/file=xxx` 相对 URL → `add_root_url` 加 root 变为 `https://host/.../gradio_api/file=xxx` 绝对 URL |
 
 ---
 
@@ -469,7 +493,7 @@ def add_root_url(data: dict | list, root_url: str, previous_root_url: str | None
 | **方向** | 入站请求（浏览器→后端） | 出站请求（前端→后端） | 出站响应（后端→前端） |
 | **前缀处理者** | FastAPI `Mount` 中间件 | 前端 JS 读取 `config.root` 拼接 | `add_root_url` 后端递归遍历 |
 | **处理阶段** | 请求到达 Gradio 子应用 **之前** | 前端发起 fetch/axios **之前** | 后端 JSON 序列化 **之前** |
-| **影响的 URL 类型** | 所有后端路由匹配（/、/assets/*、/gradio_api/*、/file=*） | 静态资源 `<script>/<link>`、API 请求、自定义组件加载 | 响应 JSON 中的文件对象 `.url` 字段 |
+| **影响的 URL 类型** | 所有后端路由匹配（/、/assets/*、/gradio_api/*、/gradio_api/file=*） | 静态资源 `<script>/<link>`、API 请求、自定义组件加载 | 响应 JSON 中的文件对象 `.url` 字段 |
 | **开发者配置点** | `mount_gradio_app(path="/gradio")` | `root_path` 参数 / `x-forwarded-host` / `uvicorn --root-path` | 无需配置（依赖路径 B 推导出的 root_path） |
 | **不配置的后果** | 路由根本匹配不到，返回 404 | 前端请求少了前缀，发到主应用上，404 | 组件显示不出图片，因为 URL 是相对路径 |
 | **代码分布** | `gradio/routes.py` 路由注册 | `gradio/routes.py` 模板注入<br>`js/core/src/init.svelte.ts`<br>`client/js/src/helpers/init_helpers.ts` | `gradio/blocks.py`（process_api 内四处）<br>`gradio/processing_utils.py` |
@@ -527,26 +551,30 @@ def add_root_url(data: dict | list, root_url: str, previous_root_url: str | None
 │  ║ 传入 process_api(root_path=...)                             ║        │
 │  ╚════════════════════════════════════════════════════════════╝        │
 │                           ↓                                           │
-│  执行用户函数 → 生成图片文件: /tmp/gradio/generated_abc.png           │
+│  执行用户函数 → 生成图片文件: /tmp/gradio/abc123/generated.png        │
 │                                                                       │
 ├───────────────────────────────────────────────────────────────────────┤
 │  阶段 3: 返回响应（包含图片文件 URL）                                   │
 ├───────────────────────────────────────────────────────────────────────┤
 │                                                                       │
-│  postprocess 后得到:                                                  │
-│    data = [{"url": "/file=/tmp/gradio/generated_abc.png", ...}]      │
+│  第一步: postprocess_data → move_files_to_cache                       │
+│    url_prefix = "/gradio_api/file="                                   │
+│    payload.url = "/gradio_api/file=/tmp/gradio/abc123/generated.png" │
+│    ↑ 此时是相对 URL，以 /gradio_api 开头                              │
 │                           ↓                                           │
 │  ╔══ 路径 C (响应文件 URL 加前缀) ═════════════════════════════╗        │
 │  ║ add_root_url(data, "https://example.com/myapp/gradio", None) ║      │
 │  ║                                                             ║        │
 │  ║ 遍历到文件对象:                                             ║        │
-│  ║   1) 检查是否已 http → 否 (/file=...)                        ║        │
+│  ║   1) 检查是否已 http → 否 (/gradio_api/file=...)            ║        │
 │  ║   2) 拼前缀:                                                ║        │
-│  ║      "https://example.com/myapp/gradio" + "/file=/..."     ║        │
+│  ║      "https://example.com/myapp/gradio"                     ║        │
+│  ║      + "/gradio_api/file=/tmp/gradio/abc123/generated.png"  ║        │
 │  ║                                                             ║        │
 │  ║ 结果:                                                       ║        │
 │  ║   data = [{"url":                                          ║        │
-│  ║     "https://example.com/myapp/gradio/file=/tmp/...",      ║        │
+│  ║     "https://example.com/myapp/gradio/gradio_api/file=/tmp/ ║        │
+│  ║      gradio/abc123/generated.png",                          ║        │
 │  ║     ...}]                                                  ║        │
 │  ╚════════════════════════════════════════════════════════════╝        │
 │                           ↓                                           │
@@ -556,17 +584,23 @@ def add_root_url(data: dict | list, root_url: str, previous_root_url: str | None
 │  阶段 4: 前端展示图片（再次发起文件请求）                                │
 ├───────────────────────────────────────────────────────────────────────┤
 │                                                                       │
-│  前端 Image 组件拿到 url → <img src="https://example.com/myapp/...">  │
+│  前端 Image 组件拿到 url →                                             │
+│  <img src="https://example.com/myapp/gradio/gradio_api/file=/tmp/     │
+│            gradio/abc123/generated.png">                              │
 │                           ↓                                           │
-│  浏览器 GET https://example.com/myapp/gradio/file=/tmp/...png         │
+│  浏览器 GET https://example.com/myapp/gradio/gradio_api/file=/tmp/    │
+│              gradio/abc123/generated.png                              │
 │                           ↓                                           │
 │  ╔══ 路径 A (入站剥离) ═══════════════════════════════════════╗        │
 │  ║ FastAPI Mount:                                            ║        │
 │  ║   scope.root_path = "/myapp/gradio"                       ║        │
-│  ║   scope.path      = "/gradio_api/file=/tmp/...png"        ║        │
+│  ║   scope.path = "/gradio_api/file=/tmp/gradio/abc123/      ║        │
+│  ║                generated.png                               ║        │
 │  ╚════════════════════════════════════════════════════════════╝        │
 │                           ↓                                           │
-│  Gradio 路由匹配 GET /gradio_api/file=... → file_fetch() 返回图片二进制 │
+│  Gradio 路由匹配:                                                     │
+│    router(prefix="/gradio_api") + get("/file={path_or_url:path}")    │
+│    → 匹配 /gradio_api/file=/tmp/... → file_fetch() 返回图片二进制 ✅  │
 │                                                                       │
 └───────────────────────────────────────────────────────────────────────┘
 ```
@@ -680,6 +714,7 @@ outer_app = Starlette(routes=[Mount(PROXY_PREFIX, app=app)])
 | 路由 `GET /assets/{path}` | `gradio/routes.py` | L1046-L1048 |
 | 路由 `GET /svelte/{path}` | `gradio/routes.py` | L550-L553 |
 | 路由 `GET /gradio_api/file={path}` | `gradio/routes.py` | L1082-L1084 |
+| 路由 `GET /gradio_api/file/{path}` (废弃) | `gradio/routes.py` | L1185-L1187 |
 | 路由 `POST /gradio_api/call/{fn_index}` | `gradio/routes.py` | L1128 |
 | call 路由中推导 root_path | `gradio/routes.py` | L1208-L1213 |
 | `POST /gradio_api/run/{api_name}` 中推导 | `gradio/routes.py` | L1295-L1306 |
@@ -691,6 +726,9 @@ outer_app = Starlette(routes=[Mount(PROXY_PREFIX, app=app)])
 | 静态资源目录常量 | `gradio/route_utils.py` | L1142-L1157 |
 | `Blocks.process_api` 四次调用 add_root_url | `gradio/blocks.py` | L2258-L2350 |
 | `add_root_url` 文件 URL 加前缀核心实现 | `gradio/processing_utils.py` | L626-L635 |
+| `move_files_to_cache` 文件 URL 生成（同步） | `gradio/processing_utils.py` | L431-L502 |
+| `async_move_files_to_cache` 文件 URL 生成（异步） | `gradio/processing_utils.py` | L551-L623 |
+| `url_prefix = f"{API_PREFIX}/file="` 生成文件 URL 前缀 | `gradio/processing_utils.py` | L481-L482, L603-L604 |
 | 前端 `get_api_url` 拼接 API 基础地址 | `js/core/src/init.svelte.ts` | L45-L57 |
 | 前端 `resolve_root` 区别 API/文件的前缀策略 | `client/js/src/helpers/init_helpers.ts` | L24-L33 |
 | 前端 `load_component` 自定义组件加载 URL 拼接 | `js/build/out/component_loader.js` | L8-L120 |
