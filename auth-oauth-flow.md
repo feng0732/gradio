@@ -299,24 +299,155 @@ def login_check(user: str = Depends(get_current_user)):
     )
 ```
 
-**受 `login_check` 保护的 API 路由列表**（均通过 FastAPI `dependencies=[Depends(login_check)]` 注入）：
+**设计要点**：`login_check` 不返回用户身份，只负责"放行或拦截"。实际用户身份由各业务路由单独通过 `Depends(get_current_user)` 获取，用于第三层注入。
 
-| 路由 | 文件位置 | 说明 |
-|------|---------|------|
-| `GET /config` | [routes.py:954-955](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L954-L955) | 获取应用配置 |
-| `GET /info` | [routes.py:715-716](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L715-L716) | 获取 API 信息 |
-| `GET /openapi.json` | [routes.py:749](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L749) | OpenAPI 文档 |
-| `GET /dev/reload` | [routes.py:432](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L432) | 热重载 SSE |
-| `POST /run/{api_name}` | [routes.py:1269-1270](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1269-L1270) | 直接调用 API（不排队） |
-| `POST /api/{api_name}` | [routes.py:1271-1272](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1271-L1272) | 同上（兼容旧路径） |
-| `POST /call/v2/{api_name}` | [routes.py:1318-1319](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1318-L1319) | 调用 API（V2 格式） |
-| `POST /call/{api_name}` | [routes.py:1342-1343](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1342-L1343) | 调用 API（简单格式） |
-| `POST /queue/join` | [routes.py:1357](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1357) | 加入执行队列 |
-| `GET/HEAD /proxy={url}` | [routes.py:1055-1056](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1055-L1056) | 反向代理 |
-| `GET/HEAD /file={path}` | [routes.py:1082-1083](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1082-L1083) | 文件服务 |
-| `GET /file/{path}` | [routes.py:1185](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1185) | 旧版文件接口 |
+---
 
-**设计要点**：`login_check` 不返回用户身份，只负责"放行或拦截"。实际用户身份由各路由单独通过 `Depends(get_current_user)` 获取，用于第三层注入。
+#### 受 login_check 保护的接口全览
+
+共 **8 大类、19 条路由** 被 `dependencies=[Depends(login_check)]` 保护：
+
+| 类别 | 路由 | 方法 | 文件位置 | 说明 |
+|------|------|------|---------|------|
+| **配置与元信息** | `/config` | GET | [routes.py:954-955](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L954-L955) | 返回前端渲染所需的完整应用配置 |
+| | `/info` | GET | [routes.py:715-716](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L715-L716) | 返回 API 元信息（命名端点、参数等） |
+| | `/openapi.json` | GET | [routes.py:749](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L749) | OpenAPI 3.0 文档描述 |
+| **热重载** | `/dev/reload` | GET | [routes.py:432](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L432) | 开发模式下的代码变更 SSE 通知 |
+| **函数调用（不排队）** | `/run/{api_name}` | POST | [routes.py:1269-1270](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1269-L1270) | 直接同步执行（绕过队列） |
+| | `/api/{api_name}` | POST | [routes.py:1271-1272](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1271-L1272) | 同上，向后兼容旧路径 |
+| **函数调用（SSE 结果流）** | `/call/v2/{api_name}/{event_id}` | GET | [routes.py:1431-1434](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1431-L1434) | V2 格式：按 event_id 拉取执行结果的 SSE 流 |
+| | `/call/{api_name}/{event_id}` | GET | [routes.py:1434](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1434) | 简单格式：同上 |
+| **函数调用（请求-响应）** | `/call/v2/{api_name}` | POST | [routes.py:1318-1319](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1318-L1319) | V2 格式命名参数 POST，内部转队列 |
+| | `/call/{api_name}` | POST | [routes.py:1342-1343](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1342-L1343) | 简单格式数组参数 POST，内部转队列 |
+| **队列数据** | `/queue/join` | POST | [routes.py:1357](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1357) | 将函数调用提交到执行队列 |
+| | `/queue/data` | GET | [routes.py:1463](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1463) | 按 session_hash 订阅队列消息的 SSE 流（核心：进度/完成/错误事件） |
+| | `/queue/status` | GET | [routes.py:1668-1674](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1668-L1674) | 获取队列整体状态（排队人数、估算等待时间） |
+| **组件服务** | `/component_server` | POST | [routes.py:1632-1666](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1632-L1666) | 调用组件类上标记了 `@utils.gr_server_fn` 的服务端方法（如下拉框动态选项、表格搜索等） |
+| **文件上传与访问** | `/upload` | POST | [routes.py:1738](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1738) | 接收 multipart/form-data 文件上传，返回文件元信息 |
+| | `/proxy={url}` | GET/HEAD | [routes.py:1055-1056](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1055-L1056) | 通过 Gradio 服务端反向代理外部 URL |
+| | `/file={path}` | GET/HEAD | [routes.py:1082-1083](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1082-L1083) | 服务端文件读取（上传文件、组件静态文件等） |
+| | `/file/{path}` | GET | [routes.py:1185](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1185) | 旧版文件路径格式（已弃用但仍受保护） |
+| **监控面板** | `/monitoring` | GET | [routes.py:1869](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1869) | 监控看板入口，通过后控制台输出带密钥的看板 URL |
+| **录音处理** | `/process_recording` | POST | [routes.py:1913](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1913) | 服务端处理前端录制音视频：裁剪片段、添加缩放特效、FFmpeg 转码等 |
+
+---
+
+#### 重点类别详细说明
+
+##### 1. 事件结果拉取（/call/{api_name}/{event_id} 与 /queue/data）
+
+这是前端获取函数执行进度和结果的核心入口，两条路由共享 `queue_data_helper()`：
+
+- **`GET /call/{api_name}/{event_id}`**：[routes.py:1431-1461](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1431-L1461)
+  - 面向"简单格式"和"V2 格式"的请求-响应式调用
+  - `process_msg` 将队列事件（ProcessCompletedMessage / ProcessGeneratingMessage / HeartbeatMessage / UnexpectedErrorMessage）翻译为 SSE 的 `event:` 字段（complete / generating / heartbeat / error）
+  - 事件完成后自动关闭 SSE 流
+
+- **`GET /queue/data`**：[routes.py:1463-1577](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1463-L1577)
+  - 面向 Blocks 前端的主消息通道
+  - 按 `session_hash` 订阅，所有该会话的事件（进度、生成中、完成、错误、心跳）都从此流出
+  - `process_msg` 直接输出原始 EventMessage JSON，由前端自行解析
+  - 内部启动心跳协程，每 `heartbeat_rate` 秒推送一次 HeartbeatMessage
+  - 客户端断开时触发 `clean_events` 清理该会话的待处理事件
+
+##### 2. 队列数据（/queue/join、/queue/data、/queue/status）
+
+三条路由覆盖队列完整生命周期：
+
+- **`POST /queue/join`**：[routes.py:1357-1399](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1357-L1399)
+  - 接收 PredictBody，经 `queue_join_helper` 调用 `blocks._queue.push(body, request, username)` 入队
+  - 返回 `{event_id}` 供后续拉取结果
+  - username 随 Event 对象一起入队，出队执行时还原
+
+- **`GET /queue/data`**：见上一节
+
+- **`GET /queue/status`**：[routes.py:1668-1674](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1668-L1674)
+  - 返回 EstimationMessage（队列大小、平均等待时间等），供前端显示"您前面还有 N 人"
+
+##### 3. 组件服务（/component_server）
+
+[ routes.py:1632-1666](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1632-L1666)
+
+用于调用组件实例上被 `@utils.gr_server_fn` 装饰的方法，典型场景：
+
+- Dropdown 的 `server_fn=True` 动态选项加载
+- 服务端表格搜索 / 分页
+- 其他需要组件实例上下文的服务端交互
+
+调用链路：`body.component_id` → 从 state 或 blocks 中找到组件实例 → `getattr(block, body.fn_name)` → 校验 `_is_server_fn` 标记 → `special_args` 处理参数 → 执行函数。
+
+##### 4. 文件上传（/upload 与 /upload_progress）
+
+- **`POST /upload`**：[routes.py:1738-1772](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1738-L1772)
+  - 受 login_check 保护
+  - 内部调用 `upload_fn()` 解析 multipart 流，按 `blocks.max_file_size` 限制大小
+  - 可选 `upload_id` 查询参数关联进度追踪
+  - 上传文件先写入临时目录，后台任务 `move_uploaded_files_to_cache` 异步移入文件缓存
+
+- **`GET /upload_progress`**：[routes.py:1676-1722](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1676-L1722)
+  - **未受 login_check 保护**（SSE 断点续传场景下浏览器可能不带 Cookie 重新建连）
+  - 需通过 `upload_id` 查询参数才能订阅进度，本身不暴露文件内容
+
+##### 5. 监控（/monitoring、/monitoring/summary、/monitoring/{key}）
+
+三层保护：
+
+1. 路由层：`/monitoring` 受 `login_check` 保护（Basic Auth 下未登录无法进入）
+2. 功能层：未启用监控时返回 403 `Monitoring is not enabled.`
+3. 密钥层：`/monitoring/{key}` 用 `compare_passwords_securely` 校验 `app.analytics_key`，通过后才挂载内嵌的监控看板 Gradio app
+
+- **`GET /monitoring`**：[routes.py:1869-1882](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1869-L1882)
+  - 受 login_check 保护
+  - 通过后在控制台打印带密钥的看板 URL
+
+- **`GET /monitoring/summary`**：[routes.py:1884-1886](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1884-L1886)
+  - **未受 login_check 保护**
+  - 仅返回缓存的摘要统计（cached_event_analytics_summary），不含明细
+
+- **`GET /monitoring/{key}`**：[routes.py:1888-1911](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1888-L1911)
+  - **未受 login_check 保护**，但使用独立密钥 `app.analytics_key` 校验
+  - 通过后首次访问时动态 `mount_gradio_app` 挂载监控看板
+
+##### 6. 录音处理（/process_recording）
+
+[ routes.py:1913-1960](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1913-L1960)
+
+前端 `<Video>` / `<Audio>` 组件的"录制后处理"服务端入口：
+
+- 接收 multipart/form-data，含 `video` 文件字段和可选参数：
+  - `remove_segment_start` / `remove_segment_end`：裁剪片段
+  - `zoom_effects`：JSON 序列化的缩放特效列表
+- 受 `blocks.max_file_size` 限制
+- 使用 FFmpeg 在服务端执行裁剪/缩放/转码
+
+---
+
+#### 不受 login_check 保护但值得关注的路由
+
+以下路由 **未** 添加 `Depends(login_check)`，但在 Basic Auth 下可能被访问：
+
+| 路由 | 方法 | 说明 | 为何不保护 |
+|------|------|------|-----------|
+| `/login` | POST | 登录表单提交 | 登录前必须可访问 |
+| `/logout` | GET | 登出重定向 | 登录态内外都应可访问 |
+| `/user` | GET | 获取当前用户名 | 实际已通过 `Depends(get_current_user)`，未登录返回 null |
+| `/token` | GET | 返回当前 access-token | 仅回显 Cookie 中已有的 token，不暴露额外信息 |
+| `/app_id` | GET | 返回应用 app_id | 公开元信息 |
+| `/heartbeat/{session_hash}` | GET | 会话保活 SSE | 函数体内 `username = Depends(get_current_user)` 已在处理时获取，但未被路由级拦截；断连时用 username 触发 unload 事件 |
+| `/stream/{event_id}` | POST | 推送流式输入数据（如音频流） | 依赖 event_id 猜中才能访问 |
+| `/stream/{event_id}/close` | POST | 关闭流 | 同上 |
+| `/stream/{session_hash}/...` | GET | HLS 播放列表/分片 | 需同时猜中 session_hash + run + component_id |
+| `/reset` | POST | 重置迭代器 | 空操作 no-op，实际取消由 `/cancel` 处理 |
+| `/cancel` | POST | 取消正在执行的事件 | 需猜中 session_hash + fn_index + event_id |
+| `/upload_progress` | GET | 文件上传进度 SSE | 需猜中 upload_id，且仅暴露进度不暴露内容 |
+| `/startup-events` | GET | 触发启动事件 | 仅首次调用有效，幂等 |
+| `/monitoring/summary` | GET | 监控摘要 | 仅返回统计摘要 |
+| `/monitoring/{key}` | GET | 监控看板入口 | 用独立 analytics_key 校验 |
+| `/static/...`、`/assets/...` | GET | 前端静态资源 | 公开资源 |
+| `/custom_component/...` | GET | 自定义组件资源 | 公开资源 |
+| `/theme.css`、`/robots.txt` | GET | 主题/爬虫协议 | 公开资源 |
+| `/vibe-edit` 系列 | POST/GET | Vibe AI 代码编辑 | 需 vibe_mode 启用，且仅限开发模式 |
+| `/profiling/...` | GET/POST | 性能追踪 | PROFILING_ENABLED 编译时开关才启用 |
 
 ### 1.6 第三层：登录态注入（get_current_user → gr.Request.username）
 
