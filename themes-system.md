@@ -1,13 +1,21 @@
 # Gradio Themes 主题系统代码解析
 
-> **2026-06-13 勘误更新**：经过第二轮代码核查，发现并修正了第十一章中关于独立/嵌入模式样式链路的多处不准确描述，包括：
+> **2026-06-13 勘误更新（第二轮）**：经过第二轮代码核查，发现并修正了第十一章中关于独立/嵌入模式样式链路的多处不准确描述，包括：
 > - ✅ 修正用户自定义 CSS 的注入路径（独立模式实际由 `<Blocks>` 内部注入）
 > - ✅ 修正 `.theme-loaded` 类的使用差异（嵌入模式 `apply_theme` 缺失该类）
 > - ✅ 修正防闪屏机制的实际参与情况（仅独立模式有效）
 > - ✅ 发现并记录了 3 个代码 Bug（本地 stylesheets 注入失效、`prefix_css` 冗余 `remove()`）
 > - ✅ 补充 `css_ready` 变量在两种模式下的不同作用
-> 
-> 第十一章已全部重写，新增了详细的调用时机、代码位置和 Bug 说明。
+>
+> **2026-06-13 深度核查（第三轮）**：沿 wrapper 和容器结构完整追踪背景色作用节点，核心修正：
+> - ✅ **重大修正**：独立模式 `handle_theme_mode` 传入的是 `document.body`，**不是 wrapper**
+> - ✅ **重大修正**：独立模式背景色 `bg_element = <html>`（document.documentElement），之前误以为是 `.gradio-container`
+> - ✅ **重大修正**：嵌入模式背景色 `bg_element = wrapper = .gradio-container`，之前误以为是 `.main` 内部 div
+> - ✅ 补充 `handle_theme_mode` 在独立模式的调用时机：模块级 `if (browser)` 代码，在 onMount 前执行
+> - ✅ 补充三层背景叠加时序图（body CSS → html inline → :root.dark 变量）
+> - ✅ 澄清为什么背景色设到 `<html>`：消除 body margin（8px 默认样式）导致的白边问题
+>
+> 第十一章的"DOM 结构与挂载点"和"防闪屏时序"章节已完全重写。
 
 ## 一、整体架构概览
 
@@ -897,37 +905,102 @@ function apply_theme(target: HTMLDivElement, theme: "dark" | "light"): void {
 - 独立模式：模块初始化时调用 `handle_theme_mode(document.body)`（[+page.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/[...catchall]/+page.svelte) L172-L174）
 - 嵌入模式：`onMount` 中调用 `handle_theme_mode(wrapper)`（[Index.svelte](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte) L306-L307）
 
-#### DOM 结构与挂载点
+#### DOM 结构与挂载点（完整调用链追踪）
 
-先看最终渲染的 DOM 结构：
+**关键发现**：独立模式传入 `handle_theme_mode` 的 target 是 `document.body`，**不是** `wrapper`！而嵌入模式传入的是 `wrapper`（Embed 组件的最外层 div）。两者的参数来源完全不同，导致最终作用的 DOM 节点层级差异很大。
 
-**独立模式 DOM 树**：
+---
+
+**独立模式：完整调用链**
+
+1. **调用入口**（[+page.svelte L172-L174](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/[...catchall]/+page.svelte#L172-L174)）：
+```javascript
+if (browser) {
+    active_theme_mode = handle_theme_mode(document.body);  // ⚠️ 传的是 document.body，不是 wrapper！
+}
 ```
-document.body                           ← .dark / .theme-loaded 挂在这里
-└── <div class="gradio-container ...">  ← target.parentElement, bg_element
-    └── <div class="main ...">          ← target（<Embed> 的 wrapper）
+
+2. **apply_theme 入参**：`target = document.body`，`is_embed = false`
+
+3. **三变量计算**（[+page.svelte L158-L168](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/[...catchall]/+page.svelte#L158-L168)）：
+```javascript
+const dark_class_element = is_embed ? target.parentElement! : document.body;
+//            ↓ is_embed=false
+//            = document.body
+const bg_element = is_embed ? target : target.parentElement!;
+//            ↓ is_embed=false
+//            = document.body.parentElement
+//            = <html> (document.documentElement)
+bg_element.style.background = "var(--body-background-fill)";
+dark_class_element.classList.add("theme-loaded");
+```
+
+**最终渲染的 DOM 树**：
+```
+<html>                                    ← bg_element，内联 style="background: var(...)"
+└── <body>                                ← dark_class_element，class="theme-loaded dark"
+    └── <div class="gradio-container ...">  ← wrapper，通过 bind:wrapper 绑定（未被 apply_theme 使用）
+        └── <div class="main fillable app ...">
+            └── <Blocks ... />
+```
+
+| 变量 | 值 | 代码位置 | 说明 |
+|------|----|---------|------|
+| `target` | `document.body` | L173 | 直接传入 body 元素，与 wrapper 无关 |
+| `dark_class_element` | `document.body` | L159 | `.dark` / `.theme-loaded` 类挂在 body 上，全局生效 |
+| `bg_element` | `<html>` (document.documentElement) | L160 | 内联背景色**设到 html 根元素上**，整页背景 |
+
+---
+
+**嵌入模式：完整调用链**
+
+1. **调用入口**（[Index.svelte L306-L307](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte#L306-L307)）：
+```javascript
+onMount(async () => {
+    active_theme_mode = handle_theme_mode(wrapper);  // ⚠️ 传的是 wrapper
+```
+
+2. **wrapper 绑定位置**（[Embed.svelte L99-L108](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/core/src/Embed.svelte#L99-L108)）：
+```svelte
+<div
+    bind:this={wrapper}
+    class="gradio-container gradio-container-{version}"
+    ...
+>
+```
+wrapper 绑定在 `<Embed>` 的**最外层 div** 上，类名是 `gradio-container`。
+
+3. **apply_theme 入参**：`target = wrapper = <div class="gradio-container">`，`is_embed = true`
+
+4. **三变量计算**（[Index.svelte L269-L278](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte#L269-L278)）：
+```javascript
+const dark_class_element = is_embed ? target.parentElement! : document.body;
+//            ↓ is_embed=true
+//            = wrapper.parentElement
+//            = <gradio-app> 自定义元素
+const bg_element = is_embed ? target : target.parentElement!;
+//            ↓ is_embed=true
+//            = wrapper
+//            = <div class="gradio-container">
+bg_element.style.background = "var(--body-background-fill)";
+// 嵌入模式没有 .theme-loaded 类
+```
+
+**最终渲染的 DOM 树**：
+```
+<gradio-app>                                    ← dark_class_element，class="dark"
+└── <div class="gradio-container gradio-container-4.0.0 embed-container">  ← bg_element = target = wrapper
+    │                                              内联 style="background: var(...)"
+    ├── <div class="nav-holder"> (可选)
+    └── <div class="main fillable">
         └── <Blocks ... />
 ```
 
-| 变量 | 值 | 说明 |
-|------|----|------|
-| `target` | `<div class="main ...">` | `wrapper` 绑定到 `<Embed>` 的内部 div |
-| `dark_class_element` | `document.body` | `.dark` 类挂在 body 上，全局生效 |
-| `bg_element` | `target.parentElement` | 背景色设到 `.gradio-container` 上 |
-
-**嵌入模式 DOM 树**：
-```
-<gradio-app>                           ← .dark 挂在这里（target.parentElement）
-└── <div class="gradio-container gradio-container-xxx embed-container">  ← target（wrapper）
-    └── <div class="main ...">         ← bg_element，背景色设到这里
-        └── <Blocks ... />
-```
-
-| 变量 | 值 | 说明 |
-|------|----|------|
-| `target` | `<div class="gradio-container ...">` | `wrapper` 绑定到 `<Embed>` 的最外层 div |
-| `dark_class_element` | `<gradio-app>` 自定义元素 | `.dark` 类挂在自定义元素上，不污染宿主 body |
-| `bg_element` | `target`（`.gradio-container`） | 背景色设到容器自身 |
+| 变量 | 值 | 代码位置 | 说明 |
+|------|----|---------|------|
+| `target` | `<div class="gradio-container ...">` | Index L307 + Embed L100 | wrapper 绑定在 Embed 最外层 |
+| `dark_class_element` | `<gradio-app>` 自定义元素 | Index L270 | `.dark` 类挂在自定义元素上，不污染宿主 body |
+| `bg_element` | `<div class="gradio-container ...">` | Index L271 (same as target) | 内联背景色**设到 gradio-container 上**，局部作用域 |
 
 #### CSS 选择器匹配逻辑
 
@@ -1011,21 +1084,48 @@ function sync_system_theme(target): "light" | "dark" {
 }
 ```
 
-**独立模式时序**：
-1. 浏览器加载 SSR 输出的 HTML，此时 JS 尚未执行，body 上没有任何类
-2. 若系统是深色模式，`body:not(.theme-loaded)` 生效，body 背景强制设为 `--neutral-950`（深色），避免白色闪烁
-3. 同时 `body` 的默认背景是 `var(--body-background-fill)`，但此时主题 CSS 变量可能还未加载完成
-4. JS 加载完成，模块初始化时调用 `handle_theme_mode(document.body)` → 触发 `apply_theme()`
-5. `apply_theme()` 给 `document.body` 加上 `.theme-loaded` 和 `.dark` 两个类
-6. `.theme-loaded` 加上后，`:not(.theme-loaded)` 伪类不匹配，兜底深色背景规则失效
-7. 此时 `/theme.css` 已加载完成，主题 CSS 中的 `:root .dark` 规则接管，暗模式变量正常生效
-8. 背景色平滑过渡，用户看不到白屏闪烁
+**独立模式时序（三层背景叠加生效）**：
 
-**嵌入模式为什么不参与**：
-1. 嵌入模式是纯客户端渲染，没有 SSR 输出的 HTML，不存在"先看到 SSR 白色背景"的问题
-2. 嵌入模式的 `apply_theme()` 没有添加 `.theme-loaded` 类的代码（L269-278）
-3. 嵌入模式使用 `css_ready` 机制，`Blocks` 组件在 `css_ready === true` 时才渲染，从源头避免 FOUC
-4. `+layout.svelte` 属于 SvelteKit 项目，嵌入模式（SPA）根本不会加载这个文件
+需要理解三层背景的叠加关系：`+layout.svelte` 的 CSS 规则、`apply_theme` 内联到 `<html>` 的 style、主题 CSS 中 `:root .dark` 的变量值。
+
+1. **初始状态（HTML 刚解析，JS 未执行）**：
+   - `<body>` 上没有任何类
+   - `+layout.svelte` 中 `:global(body)` 设置 `background: var(--body-background-fill)`
+   - 但此时 `/theme.css` 的 `<link>` 可能尚未加载完成，`--body-background-fill` 变量可能未定义
+   - 若系统是深色模式，`body:not(.theme-loaded)` 生效，body 背景兜底设为 `--neutral-950`（深色）→ **防闪屏核心**
+
+2. **JS 初始化，模块级代码执行**（[+page.svelte L172-L174](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/app/src/routes/[...catchall]/+page.svelte#L172-L174)）：
+   - `handle_theme_mode(document.body)` 在 Svelte 组件 onMount **之前**就被调用（模块级 `if (browser)` 代码）
+   - 此时 `<Embed>` 组件可能还未挂载，wrapper 甚至可能还不存在
+
+3. **apply_theme 执行**：
+   - `bg_element = document.body.parentElement` = **`<html>` 元素**
+   - 设置 `<html style="background: var(--body-background-fill)">` 内联样式
+   - 给 `<body>` 加上 `class="theme-loaded dark"`（假设系统是深色模式）
+
+4. **过渡交接**：
+   - body 获得 `.theme-loaded` 类 → `body:not(.theme-loaded)` 不匹配 → 兜底 `--neutral-950` 规则失效
+   - 此时 `/theme.css` 通过 `<svelte:head>` 的 `<link>` 已加载完成，`--body-background-fill` 变量有值
+   - `<html>` 内联 style 引用的 `var(--body-background-fill)` 从 `:root.dark, :root .dark` 选择器中取到暗模式值
+   - body 的 `background: var(--body-background-fill)` 也同步生效（因为变量相同，视觉上与 html 一致）
+
+5. **最终状态**：
+   - `<html>`: `style="background: var(--body-background-fill)"` → 取暗模式值
+   - `<body>`: `class="theme-loaded dark"` + CSS `background: var(--body-background-fill)` → 取暗模式值
+   - 两者变量值相同，整页背景无缝过渡，无闪烁
+
+**为什么背景色要设到 `<html>` 而不是 `<body>`？**
+
+因为 body 默认有 `margin: 8px`（浏览器默认样式），如果只给 body 设背景，margin 区域会露出 html 的白色。设到 `<html>` 上能确保浏览器窗口的每个像素都被主题背景色覆盖。
+
+---
+
+**嵌入模式为什么不参与防闪屏机制**：
+1. **没有 SSR**：嵌入模式是纯客户端渲染，没有 SSR 输出的 HTML，不存在"先看到 SSR 白色背景"的问题
+2. **没有 `.theme-loaded`**：嵌入模式的 `apply_theme()` 没有添加 `.theme-loaded` 类的代码（[Index.svelte L269-L278](file:///d:/fz/0601/solo-dogfeeding/code/246-gradio/js/spa/src/Index.svelte#L269-L278)）
+3. **`css_ready` 延迟渲染**：嵌入模式使用 `css_ready` 机制，`<Blocks>` 组件在 `css_ready === true` 时才渲染（L595），所有 CSS 加载完成后才显示内容，从源头避免 FOUC
+4. **文件不共享**：`+layout.svelte` 属于 SvelteKit 项目（独立模式），嵌入模式（SPA）根本不会加载这个文件，所以 `body:not(.theme-loaded)` 规则对嵌入模式无效
+5. **背景色设到局部**：嵌入模式的 `bg_element = wrapper = .gradio-container`，背景色只在 Gradio 容器内生效，不影响宿主页面
 
 ---
 
@@ -1215,9 +1315,10 @@ self.embed_radius = embed_radius or getattr(self, "embed_radius", "*radius_sm")
 | **Google Fonts** | `<svelte:head>` 静态 `<link>`（`+page.svelte` L424-L428） | `mount_css()` 动态 `<link>`（`Index.svelte` L160-L161） |
 | **本地 stylesheets** | 仅加载绝对 URL，相对 URL 被 `{#if}` 过滤（`+page.svelte` L426） | 所有 URL 都 fetch，但相对 URL 的 `prefix_css` 结果被丢弃（Bug，L164-L168） |
 | **用户自定义 CSS** | `<Blocks>` 内部 `<svelte:head>` + `{@html}` 内联（`Blocks.svelte` L463-L469） | `Index.svelte` 手动创建 `<style>` 写入 `textContent`（`Index.svelte` L139-L148） |
+| **handle_theme_mode 入参** | `document.body`（`+page.svelte` L173，与 wrapper 无关） | `wrapper`（`Index.svelte` L307，绑定到 Embed 最外层） |
 | **`.dark` 挂载点** | `document.body`（`+page.svelte` L159） | `<gradio-app>` 自定义元素（`Index.svelte` L270） |
-| **背景色设置** | `target.parentElement`（`.gradio-container`） | `target`（`.main` 内部 div） |
-| **`.theme-loaded`** | 有，`apply_theme` 中添加（`+page.svelte` L162） | 无，`apply_theme` 中缺失对应代码 |
+| **背景色设置 (bg_element)** | `target.parentElement` = **`<html>` 元素**（`+page.svelte` L160） | `target` = **`.gradio-container`**（`Index.svelte` L271） |
+| **`.theme-loaded`** | 有，`apply_theme` 中添加到 body（`+page.svelte` L162） | 无，`apply_theme` 中缺失对应代码 |
 | **防闪屏机制** | `+layout.svelte` 中 `@media` 兜底 + `body:not(.theme-loaded)` | 无，使用 `css_ready` 机制延迟渲染避免 FOUC |
 | **`css_ready` 作用** | 标记变量，不阻塞渲染（`+page.svelte` L255, L299） | `<Blocks>` 渲染前置条件，等 CSS 加载完才渲染（`Index.svelte` L595） |
 | **CSS 作用域隔离** | `prefix_css()` 加前缀（`Blocks.svelte` L468） | `prefix_css()` 加前缀（`Index.svelte` L144） |
@@ -1238,13 +1339,22 @@ self.embed_radius = embed_radius or getattr(self, "embed_radius", "*radius_sm")
 
 5. **⚠️ prefix_css 中的冗余 remove()**：`prefix_css()` 内部会先调用 `style_element.remove()` 将传入的 `<style>` 从 DOM 中移除，但之后将处理后的字符串赋值给 `style_element.textContent`。在支持 `adoptedStyleSheets` 的浏览器中，元素已不在 DOM 中，样式可能无法生效。这可能是历史遗留的设计冗余。
 
-6. **两种防闪屏机制**：
-   - 独立模式：**`.theme-loaded` 类 + 媒体查询兜底** —— SSR 输出的 HTML 先显示深色背景，JS 执行后加 `.theme-loaded` 解除兜底
+6. **背景色作用节点的本质差异**：
+   - 独立模式：`bg_element = document.body.parentElement` = **`<html>` 根元素** —— 覆盖整个浏览器窗口，消除 body margin 导致的白边
+   - 嵌入模式：`bg_element = wrapper` = **`<div class="gradio-container">`** —— 只在 Gradio 容器内部生效，不污染宿主页面
+
+7. **handle_theme_mode 入参差异是理解的钥匙**：
+   - 独立模式传入 `document.body`（与 wrapper 无关，模块级代码在 onMount 前执行）
+   - 嵌入模式传入 `wrapper`（绑定到 Embed 最外层，onMount 中才执行）
+   - 这个初始参数的差异，通过 `is_embed ? ... : ...` 三元表达式层层传递，最终导致完全不同的 DOM 作用路径
+
+8. **两种防闪屏机制**：
+   - 独立模式：**`.theme-loaded` 类 + 媒体查询兜底** + **`<html>` 内联 background** —— 三层叠加（body CSS → html inline → :root.dark 变量）实现无缝过渡
    - 嵌入模式：**`css_ready` 延迟渲染** —— 等 CSS 全部加载完成后才渲染 `<Blocks>` 组件，从源头避免 FOUC
 
-7. **CDN 适配的关键**：`mount_css()` 中的 origin 判断是嵌入模式下的隐形基础设施——当 Gradio 静态资源从 CDN 提供时，能正确把 `/theme.css` 转成 `https://cdn.xxx.com/theme.css`。
+9. **CDN 适配的关键**：`mount_css()` 中的 origin 判断是嵌入模式下的隐形基础设施——当 Gradio 静态资源从 CDN 提供时，能正确把 `/theme.css` 转成 `https://cdn.xxx.com/theme.css`。
 
-8. **prefix_css 的双重输出**：同时输出原始规则和前缀版本，保证了向后兼容——旧的自定义 CSS 即使不做前缀也能工作，同时新的前缀版本确保不污染宿主页面。
+10. **prefix_css 的双重输出**：同时输出原始规则和前缀版本，保证了向后兼容——旧的自定义 CSS 即使不做前缀也能工作，同时新的前缀版本确保不污染宿主页面。
 
 ---
 
