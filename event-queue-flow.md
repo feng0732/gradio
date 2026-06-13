@@ -1025,3 +1025,226 @@ sse_stream() 取出消息
 | 前端 SSE 断连 | stream.onerror | 不修改（服务端不知情） | 不修改（服务端不知情） | 前端 close_stream() | 前端构造 broken_connection，广播给所有 callbacks |
 | 队列满 | push() 返回 queue_full | 不入队，不修改 | 不入队，不修改 | 无（不入队） | HTTP 503 + 前端 fire_error |
 | 验证失败 | push() 返回 validator_error | 不入队，不修改 | 不入队，不修改 | 无（不入队） | HTTP 422 + 前端 fire_error |
+
+---
+
+## 11. 前端 unexpected_error 收尾的精确状态变化
+
+`unexpected_error` 是**框架层**错误，不是单个事件的业务错误。它的消息结构特殊（无 event_id），导致分发和清理逻辑也与普通错误不同。
+
+### 11.0 前置：前端 SSE 消息分发机制回顾
+
+位置：[stream.ts:41-77](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/client/js/src/utils/stream.ts#L41-L77)
+
+```
+stream.onmessage(event):
+  │
+  ├─ msg == "close_stream" → close_stream() + return
+  │
+  ├─ event_id = _data.event_id
+  │
+  ├─ if (!event_id) → 【广播路径】
+  │     Promise.all(Object.keys(event_callbacks).map(
+  │       id => event_callbacks[id](_data)
+  │     ))
+  │
+  └─ if (event_id && event_callbacks[event_id]) → 【单播路径】
+        if (msg == "process_completed") unclosed_events.delete(event_id)
+        setTimeout(fn, 0, _data) 或 直接 fn(_data)
+        ← 分帧渲染，避免消息风暴阻塞浏览器
+```
+
+**关键**：`UnexpectedErrorMessage` 的 `msg` 字段是 `"unexpected_error"`，**没有 event_id**（继承自 `BaseMessage` 但未赋值，见 [server_messages.py:73-77](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/gradio/server_messages.py#L73-L77)），所以走**广播路径**。
+
+### 11.1 unexpected_error 的事件结束流程
+
+位置：[submit.ts:491-599](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/client/js/src/utils/submit.ts#L491-L599)
+
+每个事件的 callback 收到广播后，执行以下流程：
+
+```
+callback(_data):
+  │
+  ├─ handle_message(_data, last_status)
+  │     → msg == "unexpected_error"
+  │     → 返回 { type: "unexpected_error",
+  │              status: { stage: "error", message, session_not_found, ... } }
+  │
+  ├─ type == "unexpected_error" → fire_event({
+  │     type: "status",
+  │     stage: "error",
+  │     message,
+  │     broken: false,              // unexpected_error 不是连接问题
+  │     session_not_found: bool,
+  │     ...
+  │   })
+  │
+  ├─ 【data 块跳过】: data 为 undefined，跳过 data 相关处理
+  │   （unexpected_error 没有 data 字段）
+  │
+  └─ status?.stage === "complete" || status?.stage === "error"
+       │
+       ├─ YES → 【进入收尾清理】
+       │     │
+       │     ├─ if (event_callbacks[event_id])
+       │     │     delete event_callbacks[event_id]
+       │     │
+       │     ├─ if (event_id in pending_diff_streams)
+       │     │     delete pending_diff_streams[event_id]
+       │     │
+       │     └─ close()
+       │
+       └─ NO → 不清理（unexpected_error 走 YES 分支）
+```
+
+#### close() 的具体行为
+
+位置：[submit.ts:640-647](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/client/js/src/utils/submit.ts#L640-L647)
+
+```typescript
+function close(): void {
+    done = true;
+    while (resolvers.length > 0)
+        (resolvers.shift())({ value: undefined, done: true });
+}
+```
+
+- `done = true`：后续 `next()` 调用直接返回 `{ done: true }`
+- 清空 `resolvers` 队列：所有正在 `await iterator.next()` 的 Promise 立即 resolve 为结束状态
+- **不修改**任何全局状态（`stream_status`、`unclosed_events` 等都不动）
+
+### 11.2 各状态结构的精确变化
+
+按全局状态逐一梳理：
+
+| 全局状态 | 变化 | 代码位置 |
+|---------|------|---------|
+| **event_callbacks[event_id]** | **被 delete** | [submit.ts:592-593](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/client/js/src/utils/submit.ts#L592-L593) |
+| **pending_diff_streams[event_id]** | **被 delete** | [submit.ts:595-596](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/client/js/src/utils/submit.ts#L595-L596) |
+| **pending_stream_messages[event_id]** | **不清理**（残留） | — |
+| **unclosed_events** | **不清理**（残留） | — |
+| **stream_status.open** | **仍然 true**（SSE 连接保持打开） | — |
+| **iterator.done** | 变为 true（每个事件自己的） | [submit.ts:640-641](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/client/js/src/utils/submit.ts#L640-L641) |
+
+#### 关于 pending_stream_messages 的残留
+
+`pending_stream_messages` 是**事件还没注册 callback 时的暂存区**（竞态缓冲）。当 SSE 消息先到、callback 还没注册时，消息先存在这里，等 callback 注册后再回放。
+
+unexpected_error 路径**只清理已注册的 callback**，但 `pending_stream_messages` 中的消息不会被清。
+
+但在实际中，unexpected_error 通常发生在事件已入队且 callback 已注册之后，所以 `pending_stream_messages` 一般是空的。
+
+#### 关于 unclosed_events 的残留
+
+`unclosed_events` 集合只有在收到 `process_completed` 消息时才会 `delete(event_id)`：
+
+```typescript
+// stream.ts:56-62
+if (_data.msg === "process_completed" && ...) {
+    unclosed_events.delete(event_id);
+}
+```
+
+而 `unexpected_error` 消息：
+- 没有 event_id → 走广播路径 → 不执行 `unclosed_events.delete`
+- msg 是 `"unexpected_error"` → 不是 `"process_completed"` → 不删除
+
+所以 `unclosed_events` 中**仍然保留着这些事件的 ID**。
+
+### 11.3 全局 SSE 连接状态
+
+**结论：SSE 连接在 unexpected_error 后仍然保持打开。**
+
+原因：
+1. `stream_status.open` 没有被修改 → 仍然是 `true`
+2. `close_stream()` 没有被调用 → `abort_controller.abort()` 没执行
+3. SSE 的 `EventSource` 本身没有被关闭
+
+#### 后续会发生什么？
+
+取决于服务端的情况：
+
+| 场景 | 后续行为 |
+|------|---------|
+| **服务端停止**（最常见） | SSE 流会不断循环（每次等 10s 超时 → 注入 UnexpectedErrorMessage → yield），直到连接被底层 TCP 断开或进程退出。前端会持续收到多条 `unexpected_error` 消息，但此时 `event_callbacks` 已经空了，所以广播路径的 `Promise.all(Object.keys(event_callbacks).map(...))` 实际上什么都不做（空数组） |
+| **session_not_found** | SSE 连接可能还在，但服务端已无该 session 的消息队列，后续可能持续超时或断开 |
+| **其他 unexpected_error** | SSE 连接保持，后续消息继续到达，但因 event_callbacks 已空，无实际处理 |
+
+#### 与 broken_connection 的对比
+
+`broken_connection` 是 SSE `onerror` 触发的（连接层错误），此时：
+- SSE 连接**已经断开**（`instance.readyState = instance.CLOSED`）
+- 但 `stream_status.open` 仍然是 `true`（`close_stream()` 没被调用）
+- 这是一个状态不一致：`stream_status.open` 是"逻辑上是否认为连接打开"，而 `EventSource.readyState` 是"物理连接状态"
+
+代码位置：[readable_stream() in stream.ts:217-219](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/client/js/src/utils/stream.ts#L217-L219)
+
+### 11.4 完整的清理触发链路图
+
+```
+服务端 UnexpectedErrorMessage
+       │
+       ▼ (SSE 通道)
+前端 stream.onmessage
+       │
+       ├─ event_id 为空 → 走广播路径
+       │   └─ 遍历所有 event_callbacks，逐个调用 callback
+       │
+       ▼ （每个 callback 内部）
+handle_message() → type="unexpected_error", status.stage="error"
+       │
+       ├─ fire_event({ type: "status", stage: "error" })
+       │   → 通知该事件的所有订阅者
+       │
+       ├─ status.stage === "error" → true
+       │   │
+       │   ├─ delete event_callbacks[event_id]   ← 从全局映射移除
+       │   ├─ delete pending_diff_streams[event_id] ← 清理 diff 缓冲
+       │   └─ close()
+       │        ├─ done = true                    ← iterator 标记结束
+       │        └─ 清空 resolvers                 ← 所有 await 立即返回
+       │
+       └─ callback 执行完毕
+           └─ （注意：callback 是在 setTimeout 或直接调用中执行的，
+                  执行完就结束了，没有额外清理）
+
+▼ （全局视角）
+所有 event_callbacks 都被清空
+  │
+  ├─ pending_diff_streams 对应项被清空
+  ├─ pending_stream_messages 残留（如有）
+  ├─ unclosed_events 残留（所有 event_id 仍在集合中）
+  ├─ stream_status.open 仍为 true
+  └─ SSE 物理连接可能还在（取决于服务端是否继续发送）
+```
+
+### 11.5 与"正常完成"路径的清理对比
+
+| 清理项 | 正常完成 (process_completed) | unexpected_error | broken_connection | POST /cancel 前端侧 |
+|--------|----------------------------|------------------|-------------------|-------------------|
+| `event_callbacks[event_id]` | ✅ 删除 | ✅ 删除（广播所有） | ✅ 删除（广播所有） | ✅ 删除 |
+| `pending_diff_streams[event_id]` | ✅ 删除 | ✅ 删除 | ✅ 删除 | ✅ 删除 |
+| `pending_stream_messages[event_id]` | ❌ 不清理 | ❌ 不清理 | ❌ 不清理 | ❌ 不清理 |
+| `unclosed_events.delete(event_id)` | ✅ 在 stream.onmessage 中删除 | ❌ 不删除 | ❌ 不删除 | ❌ 不删除 |
+| `stream_status.open` | 最后一个事件完成 → CloseStreamMessage → 变为 false | ❌ 仍为 true | ❌ 仍为 true（物理已断） | ✅ 最后一个事件完成后变为 false |
+| `close_stream()` 调用 | ✅ 收到 close_stream 时调用 | ❌ 不调用 | ❌ 不调用 | ✅ 收到 close_stream 时调用 |
+| iterator `done` | ✅ 变为 true | ✅ 变为 true | ✅ 变为 true | ✅ 变为 true |
+
+**关键发现**：`unexpected_error` 和 `broken_connection` 都不会触发 `unclosed_events` 的清理，也不会调用 `close_stream()`。这是因为这两个路径都不经过 `msg === "process_completed"` 的判断分支。
+
+### 11.6 Client.close() 的作用
+
+位置：[client.ts:310-313](file:///d:/fz/0601/solo-dogfeeding/code/239-gradio/client/js/src/client.ts#L310-L313)
+
+```typescript
+close(): void {
+    this.closed = true;
+    close_stream(this.stream_status, this.abort_controller);
+}
+```
+
+这是**应用层**主动关闭整个 Client 的方法，会：
+- 设置 `this.closed = true`
+- 调用 `close_stream()` → `stream_status.open = false` + `abort_controller.abort()`
+
+但 `unexpected_error` 路径**不会**自动调用这个方法。需要业务代码自己监听 `status.stage === "error"` 事件，然后决定是否调用 `client.close()`。
