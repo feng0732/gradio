@@ -253,13 +253,27 @@ with self:
 
 当 `child_interface.render()` 被调用时，子 Blocks 的构造函数已经执行完毕。此时子 Blocks 的 `default_config` 中已经包含了完整的 `blocks`（组件字典）和 `fns`（事件函数字典），布局树 `children` 也已构建好。
 
-关键点：**子 Blocks 的所有组件 ID 和函数 ID 都是全局唯一的**，因为它们在构造时就通过 `Context.id` 自增分配。但它们的 `fns` 字典的 key（`_id`）从 0 开始编号，可能与父容器的 `fns` key 冲突。
+关键点：**子 Blocks 的所有组件 `_id` 是全局唯一的**（通过 `Context.id` 自增分配），但**函数 ID（`BlockFunction._id`）是每个 `BlocksConfig` 独立从 0 开始编号的**。因此子的 `fns` 字典的 key（0, 1, 2...）可能与父容器的 `fns` key 冲突，这就是为什么需要 `dependency_offset` 重新编号。
 
 ### 8.3 `Blocks.render()` 的六步合并过程
 
 [blocks.py#L1457-L1517](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1457-L1517) 是核心合并逻辑。当在父 Blocks 的 `with` 上下文中调用 `child.render()` 时，`root_context` 指向父的 `BlocksConfig`，`Context.root_block` 指向父 Blocks 实例。
 
-**第一步：冲突检测**（L1460-L1470）
+首先明确两个关键前提：`self.blocks` 和 `self.fns` 是 property（[blocks.py#L1187-L1196](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1187-L1196)：
+
+```python
+@property
+def blocks(self) -> dict[int, Component | Block]:
+    return self.default_config.blocks
+
+@property
+def fns(self) -> dict[int, BlockFunction]:
+    return self.default_config.fns
+```
+
+它们直接返回 `self.default_config.blocks` 和 `self.default_config.fns` 字典。合并操作只复制引用，不会清空子的字典。**合并后 child 的 default_config 仍保留所有 block 和 BlockFunction 的引用**。
+
+**第一步：冲突检测（L1460-L1470）
 
 ```python
 if self._id in root_context.blocks:
@@ -311,10 +325,24 @@ for dependency in self.fns.values():
 逐条解析：
 
 - **(a) 重编号 `_id`**：子 Blocks 的 `fn._id` 从 0 开始编号（例如 0, 1, 2），加上偏移后变为 3, 4, 5，与父的 0, 1, 2 不冲突。
+  ⚠️ **重要**：`dependency._id += dependency_offset` 是**原地修改 `BlockFunction` 对象的属性**。同一个对象同时被子和父的 fns 字典引用，修改后子的 fns 字典中 key（旧 `_id`）与 value 的 `_id`（新 `_id`）不一致。
 
-- **(b) 重映射 target**：`dependency.targets` 是 `list[tuple[int | None, str]]`，每个元组是 `(block_id, event_name)`。当 `target[0] == self._id` 时，说明这个事件是由子 Blocks 自身触发的（最典型的就是 `Blocks.load()` 事件——它的 target 是 Blocks 本身的 `_id`）。嵌入后，这个事件应该由根 Blocks 触发，所以将 `block_id` 替换为 `Context.root_block._id`。
+- **(b) 重映射 target（代码意图正确但实现完全无效）**：`dependency.targets` 是 `list[tuple[int | None, str]]`，每个元组是 `(block_id, event_name)`。代码意图是：当 `target[0] == self._id` 时（最典型的就是 `Blocks.load()` 事件，它的 target 是子 Blocks 本身的 `_id`），嵌入后这个事件应该由根 Blocks 触发，所以将 `block_id` 替换为 `Context.root_block._id`。
 
-  > ⚠️ 注意一个潜在的代码问题：`for target in dependency.targets` 遍历的是 tuple，`target = (Context.root_block._id, target[1])` 只是重新绑定了局部变量 `target`，并未修改 `dependency.targets` 列表中的元素。这意味着 target 的实际重映射可能没有生效——除非 targets 列表中的 tuple 在 `set_event_trigger` 阶段就是通过 `EventListenerMethod` 构造的且后续由 `get_config()` 直接序列化。实际上，`BlockFunction.get_config()`（[block_function.py#L138-L175](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/block_function.py#L138-L175)）直接序列化 `self.targets`，所以如果这里没有原地修改，load 事件的 target 仍指向子 Blocks 的 `_id`。但从前端的角度看，只要子 Blocks 的 `_id` 在 `root_context.blocks` 中存在（已通过 `update` 合并），前端仍能找到对应的组件来绑定事件。
+  但这段代码有两个根本性缺陷导致它**完全没有实际效果**：
+
+  1. **tuple 是不可变对象**：`(block_id, event_name)` 一旦创建就不能修改。代码试图给 `target[0]` 重新赋值，但 tuple 元素无法原地修改。
+
+  2. **循环变量重新绑定不修改列表**：`for target in dependency.targets:` 中 `target` 是局部循环变量。`target = (Context.root_block._id, target[1])` 只是让 `target` 变量指向一个新创建的 tuple，**完全没有修改 `dependency.targets` 列表中的原始元素**。
+
+  正确的写法应该是通过索引原地修改列表：
+  ```python
+  for i, target in enumerate(dependency.targets):
+      if target[0] == self._id:
+          dependency.targets[i] = (Context.root_block._id, target[1])
+  ```
+
+  > 那为什么还能工作？因为即使 target 中的 block_id 仍是子 Blocks 的 `_id`，这个 `_id` 已经通过 `root_context.blocks.update(self.blocks)` 被合并到父的 blocks 字典中了。前端仍然能找到这个 block_id 对应的组件（子 Blocks 本身也是一个 Block 实例），并将 load 事件绑定到它上面。所以虽然 target 没有被重写为根 Blocks，但事件仍然能触发——只是触发者是子 Blocks 而不是根 Blocks。
 
 - **(c) API 名称去重**：如果子的 API 名称与父的重复，自动追加后缀。例如两个子 Interface 都有 `/predict`，会变成 `/predict` 和 `/predict_1`。
 
@@ -323,6 +351,14 @@ for dependency in self.fns.values():
 - **(e) trigger_after 偏移**：链式事件（`.then()`/`.success()`/`.failure()`）通过 `trigger_after` 指向前一个函数的 `_id`，偏移后指向合并后的正确位置。
 
 - **(f) 写入父 fns**：用偏移后的 `_id` 作为 key，将依赖写入父的 `fns` 字典。
+
+  > ⚠️ **重要细节**：`root_context.fns[dependency._id] = dependency` 只是将同一个 `BlockFunction` 对象的引用存入父的 fns 字典。**child 的 `default_config.fns` 字典仍然保留对该 `BlockFunction` 对象的引用**，没有被清空。
+  >
+  > 但这里有一个不一致：由于 `dependency._id += dependency_offset` 是**原地修改**对象属性，child 的 fns 字典中存储的 `BlockFunction` 对象的 `_id` 已经变了，但字典的 key 还是原来的旧 `_id`。例如：
+  > - 合并前：`child.fns = {0: BlockFunction(_id=0), 1: BlockFunction(_id=1)}`
+  > - 合并后：`child.fns = {0: BlockFunction(_id=3), 1: BlockFunction(_id=4)}` （key 不变，但 value._id 已变）
+  >
+  > 这导致 `child.fns[0]` 能找到对象，但 `child.fns[0]._id == 3`，key 与 value 的 `_id` 不一致。这就是为什么 child 的 fns 字典在运行时不再被使用——它的 key 已经失效了。
 
 **第五步：更新父 fn_id 计数器**（L1509）
 
@@ -367,6 +403,60 @@ fns: {
 
 所有组件和事件函数都在一个扁平的字典中，不再有层级关系。**嵌套在运行时被消解为扁平结构**。
 
+### 8.5 三个关键代码事实的最终确认
+
+针对之前三个悬而未决的问题，通过代码追踪得出以下确定结论：
+
+**事实一：child 的 default_config 在 render 后仍保留 blocks/fns 引用**
+
+`self.blocks` 和 `self.fns` 是 property（[blocks.py#L1187-L1196](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1187-L1196)），返回 `self.default_config.blocks` 和 `self.default_config.fns` 字典。
+
+- `root_context.blocks.update(self.blocks)` 是**字典引用复制**，不删除也不修改子的字典
+- `root_context.fns[dependency._id] = dependency` 也是**对象引用复制**，同一个 `BlockFunction` 对象同时存在于父子两个字典中
+
+合并后：
+- 子的 `default_config.blocks`：仍完整保留所有组件引用
+- 子的 `default_config.fns`：仍完整保留所有 `BlockFunction` 引用，但由于 `dependency._id` 被**原地加偏移**，导致字典 key（旧 `_id`）与 value 的 `_id`（新 `_id`）不一致
+
+**事实二：运行时只从根 BlocksConfig 读取 blocks 与 fns**
+
+Gradio 运行时的请求处理**完全绑定在根 Blocks 实例上**：
+
+1. `demo.launch()` 启动时，FastAPI 路由绑定到根 Blocks 的方法（`call_api`、`process_api`、`call_function` 等）
+2. 这些方法内部通过 `self.fns[fn_index]` 查找 `BlockFunction`，这里的 `self` 永远是根 Blocks 实例
+3. 前端收到的 config 是 `root_block.get_config_file()` 序列化的结果，其中的 `fn_index` 是根 fns 字典偏移后的 key
+
+关键代码位置：
+- `call_api`: [blocks.py#L1560](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1560)
+- `process_api`: [blocks.py#L1604](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1604)
+- `call_function`: [blocks.py#L1687](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1687)
+- 队列 `predict`: [blocks.py#L2214](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L2214)
+
+**事实三：target 重写循环完全没有修改 dependency.targets**
+
+[blocks.py#L1486-L1488](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1486-L1488) 的代码：
+
+```python
+for target in dependency.targets:
+    if target[0] == self._id:
+        target = (Context.root_block._id, target[1])
+```
+
+有两个根本性缺陷导致它**完全无效**：
+
+1. **tuple 是不可变对象**：`dependency.targets` 是 `list[tuple[int | None, str]]`（见 [blocks.py#L725-L731](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L725-L731) 和 [block_function.py#L31](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/block_function.py#L31)），tuple 一旦创建就不能修改其元素。
+
+2. **循环变量重新绑定不修改列表**：`for target in ...` 中 `target` 是局部变量。`target = (...)` 只是让局部变量指向一个新 tuple，**完全没有修改 `dependency.targets` 列表中的原始元素**。
+
+正确写法应该是：
+```python
+for i, target in enumerate(dependency.targets):
+    if target[0] == self._id:
+        dependency.targets[i] = (Context.root_block._id, target[1])
+```
+
+> 为什么还能工作？因为即使 target 的 block_id 仍是子 Blocks 的 `_id`，这个 `_id` 已经通过 `root_context.blocks.update(self.blocks)` 被合并到父的 blocks 字典中。前端仍然能找到这个 block_id 对应的组件（子 Blocks 本身也是一个 Block 实例），并将 load 事件绑定到它上面。事件仍然能触发，只是触发者是子 Blocks 而不是根 Blocks。
+
 ---
 
 ## 9. Interface 为何只保留一套运行时配置
@@ -392,15 +482,29 @@ self.config = self.get_config_file()  # L542
 
 所有信息已被序列化到 `BlocksConfig` 中。`input_components` 和 `output_components` 的 `_id` 已经记录在 `BlockFunction.inputs` 和 `BlockFunction.outputs` 中；`fn` 已经被 `BlockFunction.fn` 持有；`flagging_callback` 已经被 `FlagMethod` 闭包捕获。
 
-### 9.2 运行阶段：仅 BlocksConfig 和 BlockFunction 驱动
+### 9.2 运行阶段：仅根 BlocksConfig 和 BlockFunction 驱动
 
-Gradio 运行时的请求处理流程是：
+Gradio 运行时的请求处理流程**完全绑定在根 Blocks 实例上**，这是"一套运行时配置"的根本原因。
 
-1. 前端发送事件请求，携带 `fn_index`
-2. 后端通过 `self.fns[fn_index]` 找到 `BlockFunction`
-3. 从 `BlockFunction.inputs` 取出输入组件的 `_id`，从 `blocks` 字典取出组件实例
+**启动时的路由绑定**：当调用 `demo.launch()`（`demo` 是根 Blocks）时，FastAPI 路由绑定到根 Blocks 的方法上。关键代码在 `Blocks.launch()` → `Blocks.get_block_name()` → `call_api`/`process_api` 等方法中。
+
+**运行时的事件处理流程**：
+
+1. 前端发送事件请求，携带 `fn_index`（这是根 fns 字典的偏移后的 key）
+2. 后端通过 `self.fns[fn_index]` 找到 `BlockFunction`。这里的 `self` **永远是根 Blocks 实例**，因为路由绑定在根上。
+   - `call_api`: [blocks.py#L1560](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1560) → `fn = self.fns[fn_index]`
+   - `process_api`: [blocks.py#L1604](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1604) → `block_fn = self.fns[block_fn]`
+   - `call_function`: [blocks.py#L1687](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1687) → `dependency = self.fns[fn_index]`
+   - `predict`（队列处理）: [blocks.py#L2214](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L2214) → `block_fn = self.fns[block_fn]`
+3. 从 `BlockFunction.inputs` 取出输入组件的 `_id`，从 `self.blocks`（根的 blocks 字典）取出组件实例
 4. 调用 `BlockFunction.fn`（即用户函数或 `FlagMethod` 闭包）
 5. 将结果通过 `BlockFunction.outputs` 中的组件 `_id` 返回前端
+
+**为什么只从根读取？** 原因有三：
+
+1. **路由绑定**：FastAPI 路由只绑定在根 Blocks 上，请求到达时 `self` 就是根实例
+2. **前端配置**：前端收到的 config 是 `root_block.get_config_file()` 序列化的 JSON，其中的 `dependencies` 数组的 index 就是根 fns 字典的偏移后的 key
+3. **子配置已失效**：child 的 `default_config.fns` 字典虽然仍保留引用，但 key 与 `BlockFunction._id` 已经不一致（因为 `_id` 被原地加了偏移），无法再通过 `child.fns[fn_index]` 正确查找
 
 全程不需要访问 Interface 的 `input_components`、`output_components`、`fn` 等属性。`BlockFunction` 持有所有运行时必要信息的引用。
 
@@ -425,7 +529,9 @@ class FlagMethod:
 
 - **组件引用可能指向过时的列表**：`self.input_components` 仍是构造时的组件对象列表，但这些组件的 `_id` 已经在父的 `blocks` 字典中被注册。Interface 自身持有的 `default_config.blocks` 和 `default_config.fns` 已被合并到父中，Interface 的 `BlocksConfig` 实质上变为空壳。
 
-- **事件函数已被搬走**：`Blocks.render()` 的 `root_context.fns[dependency._id] = dependency` 将子的 `BlockFunction` 搬入父的 `fns` 字典。子的 `default_config.fns` 中虽然仍保留引用，但运行时只有父的 `fns` 字典被使用。
+- **事件函数被复制引用而非搬走**：`Blocks.render()` 的 `root_context.fns[dependency._id] = dependency` 只是将 `BlockFunction` 对象的**引用复制**到父的 `fns` 字典。子的 `default_config.fns` 字典中虽然仍保留对同一对象的引用，但由于 `dependency._id` 被**原地修改**（加了偏移），导致子的 fns 字典的 key（旧 `_id`）与 value 的 `_id`（新 `_id`）不一致。例如子的 `fns[0]` 指向的对象的 `_id` 可能已经是 3，无法再通过 `fns[0]` 正确索引。
+
+- **子的 blocks 字典同样保留引用**：`root_context.blocks.update(self.blocks)` 也是引用复制，子的 `default_config.blocks` 字典仍然包含所有组件的引用。但组件的 `page` 属性被重写为根页面，且运行时只通过根的 blocks 字典访问组件。
 
 - **唯一例外：`self.config`**：Interface 在 `__init__` 末尾通过 `self.config = self.get_config_file()` 保存了一份 JSON 配置。但如果 Interface 作为子组件嵌入父 Blocks，这份配置不会被使用——父 Blocks 会在自己的 `__exit__` 中重新调用 `self.get_config_file()` 生成包含所有子组件的全局配置。
 
