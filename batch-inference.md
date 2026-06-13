@@ -474,6 +474,61 @@ routes.predict() ── L1273
     返回 ORJSONResponse(output)
 ```
 
+#### 9.2.1 直连接口的两种请求格式
+
+`PredictBody` 中的 `batched` 字段（[data_classes.py L98-L100](file:///d:/fz/0601/solo-dogfeeding/code/256-gradio/gradio/data_classes.py#L98-L100)）是直连接口请求格式的关键开关：
+
+```python
+batched: bool | None = (
+    False  # Whether the data is a batch of samples (i.e. called from the queue if batch=True) or a single sample (i.e. called from the UI)
+)
+```
+
+直连接口支持**两种请求格式**，由 `batched` 字段区分：
+
+| 格式 | `batched` 值 | 请求 body | 适用场景 |
+|------|-------------|-----------|---------|
+| **单请求格式**（默认） | `False` 或不传 | `{"data": [inp1, inp2]}` | UI 单次调用、简单 API 调用 |
+| **显式批量格式** | `True` | `{"data": [[inp1_a, inp1_b], [inp2_a, inp2_b]], "batched": true}` | 客户端自行合并多个样本后调用 |
+
+#### 9.2.2 两种格式的接口约定（基于测试用例）
+
+测试用例在 [test_routes.py L200-L226](file:///d:/fz/0601/solo-dogfeeding/code/256-gradio/test/test_routes.py#L200-L226) 中明确了两种格式的行为：
+
+```python
+def batch_fn(x):
+    results = []
+    for word in x:
+        results.append(f"Hello {word}")
+    return (results,)
+
+btn.click(batch_fn, inputs=text, outputs=text, batch=True, api_name="pred")
+```
+
+**场景 1：单请求格式（batched=False 或省略）**
+```
+请求：POST /api/pred/
+Body: {"data": ["test"]}
+返回：{"data": ["Hello test"]}
+```
+- 调用方传单个样本：`data = ["test"]`（1 个输入参数，值为 "test"）
+- 服务端自动包装为批：`[["test"]]`
+- 函数收到：`x = ["test"]`（批大小为 1）
+- 函数返回：`(["Hello test"],)`
+- 服务端自动拆包：`["Hello test"]`
+
+**场景 2：显式批量格式（batched=True）**
+```
+请求：POST /api/pred/
+Body: {"data": [["test", "test2"]], "batched": true}
+返回：{"data": [["Hello test", "Hello test2"]]}
+```
+- 调用方自行合并：`data = [["test", "test2"]]`（1 个输入参数，内含 2 个样本）
+- 服务端**不包装**，直接透传
+- 函数收到：`x = ["test", "test2"]`（批大小为 2）
+- 函数返回：`(["Hello test", "Hello test2"],)`
+- 服务端**不拆包**，直接返回
+
 #### api_open 开关的作用
 
 在 [routes.py L1284](file:///d:/fz/0601/solo-dogfeeding/code/256-gradio/gradio/routes.py#L1284) 有一个关键的门控：
@@ -673,14 +728,19 @@ if batch:
 
 | 场景 | `fn.batch` | `body.batched` | `batch_in_single_out` | 是否包装 |
 |------|-----------|---------------|----------------------|---------|
-| 直连 `/run/` 调用 batch 函数 | True | **False**（默认值，不经过 process_events） | **True** | ✅ 在 `call_process_api` 包装 |
+| 直连 `/run/` 单请求格式调用 batch 函数 | True | **False**（默认值，不经过 process_events） | **True** | ✅ 在 `call_process_api` 包装 |
+| 直连 `/run/` 显式批量格式调用 batch 函数 | True | **True**（调用方显式传入） | **False** | ❌ 不包装，直接透传 |
 | 队列 `/queue/join` 调用 batch 函数（无论批大小） | True | **True**（process_events L827 设置） | False | ❌ 已在 process_events 中合并，无需再包装 |
 | 直连调用普通函数 | False | False | False | ❌ 不需要 |
 | 队列调用普通函数 | False | False | False | ❌ 不需要 |
 
+**直连接口两条分支的核心区别：**
+- 调用方传 `batched=False`（或不传）→ 触发 `batch_in_single_out`，服务端负责包装/拆包
+- 调用方传 `batched=True` → 不触发包装，调用方自行保证数据是批格式，服务端直接透传
+
 #### 在完整调用链中的位置
 
-以直连接口为例：
+**分支 A：直连接口单请求格式（batched=False 或省略）**
 
 ```
 POST /run/{api_name}
@@ -703,6 +763,34 @@ POST /run/{api_name}
                     ▼
               返回结果
 ```
+
+**分支 B：直连接口显式批量格式（batched=True）**
+
+```
+POST /run/{api_name}
+Body: {"data": [[s1, s2, s3]], "batched": true}
+    │
+    └── routes.predict()  [routes.py L1273]
+            │
+            │  body.batched = True （调用方显式传入）
+            │
+            └── route_utils.call_process_api()  [route_utils.py L362]
+                    │
+                    │  batch_in_single_out = not True and True = False
+                    │  → 不触发包装，直接透传
+                    │
+                    ├──► blocks.process_api()  [blocks.py L2174]
+                    │       batch=True 分支
+                    │       校验：所有输入长度相同、不超过 max_batch_size
+                    │       → 逐样本 preprocess → 函数调用 → 逐样本 postprocess
+                    │
+                    └──► output["data"] 原样返回（不拆包）
+                    │
+                    ▼
+              返回结果
+```
+
+两条分支的唯一分叉点就是 `call_process_api()` L377 的 `batch_in_single_out` 判断。
 
 以队列接口为例（批大小为 1，函数为 batch 模式）：
 
@@ -734,10 +822,50 @@ POST /queue/join
 - **所在文件**：[route_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/256-gradio/gradio/route_utils.py)
 - **所在函数**：`call_process_api()` L377-L416
 - **层级**：路由层和核心处理层之间的**适配层**
-- **唯一触发场景**：**直连推理接口**（`/run/` 或 `/api/`）调用 batch 模式的函数
-- **不触发场景**：所有走队列的请求，即使批大小为 1，因为 `process_events()` 已经把 `body.batched` 设为 `True`
+- **唯一触发场景**：直连推理接口（`/run/` 或 `/api/`）以**单请求格式**（`batched=False` 或省略）调用 batch 模式的函数
+- **不触发场景**：
+  1. 所有走队列的请求（即使批大小为 1），因为 `process_events()` 已经把 `body.batched` 设为 `True`
+  2. 直连接口以**显式批量格式**（`batched=True`）调用，调用方自行保证数据格式
 
-这个设计的目的是：**让 batch 模式的函数对调用方透明**。无论请求来自直连还是队列，函数只需要实现一套批处理签名，适配层自动处理单请求的格式转换。
+这个设计的目的是：**让 batch 模式的函数对调用方透明**。无论请求来自直连还是队列，无论调用方使用单请求还是显式批量格式，函数只需要实现一套批处理签名，适配层自动处理格式转换。
+
+#### 9.6.1 边界条件与注意事项
+
+**边界 1：显式批量格式下的校验**
+
+当 `batched=True` 时，`process_api()` 的 batch 分支（[blocks.py L2220-L2261](file:///d:/fz/0601/solo-dogfeeding/code/256-gradio/gradio/blocks.py#L2220-L2261)）会执行严格校验：
+
+```python
+if not all(x == batch_size for x in batch_sizes):
+    raise ValueError(f"All inputs to a batch function must have the same length...")
+if batch_size > max_batch_size:
+    raise ValueError(f"Batch size ({batch_size}) exceeds the max_batch_size...")
+```
+
+如果调用方传了 `batched=True` 但数据格式不对（各参数长度不一致，或超过 `max_batch_size`），会直接报错。
+
+**边界 2：非 batch 函数下 batched=True 的行为**
+
+如果函数是普通函数（`fn.batch=False`），即使调用方传了 `batched=True`，也不会触发 batch 分支。`body.batched` 只在 `call_process_api()` 的 `batch_in_single_out` 判断中使用，而 `process_api()` 走哪个分支完全取决于 `block_fn.batch`。
+
+此时数据会被当成普通单输入处理，列表整个作为一个值传入函数，结果可能不符合预期。
+
+**边界 3：显式批量格式与 api_open**
+
+显式批量格式必须走直连接口（`/run/` 或 `/api/`），因此同样受 `api_open` 开关控制。如果 `api_open=False`（如在 HF Space 中），直连接口被禁用，所有请求必须走队列，也就无法使用显式批量格式。
+
+#### 9.6.2 直连接口两条分支的完整对比
+
+| 维度 | 单请求格式（默认） | 显式批量格式 |
+|------|-------------------|-------------|
+| `body.batched` | `False`（或省略） | `True` |
+| 请求示例 | `{"data": ["test"]}` | `{"data": [["test", "test2"]], "batched": true}` |
+| 触发 `batch_in_single_out` | ✅ 是 | ❌ 否 |
+| 服务端包装 | 输入加一层列表，输出拆一层列表 | 不包装，直接透传 |
+| 函数收到的输入 | `["test"]`（批大小 1） | `["test", "test2"]`（批大小 2） |
+| 服务端返回示例 | `["Hello test"]` | `[["Hello test", "Hello test2"]]` |
+| 数据格式校验 | 隐式保证（包装后批大小恒为 1） | 显式校验（长度一致性、max_batch_size） |
+| 适用场景 | UI 单次调用、简单脚本 | 客户端自行合批、高吞吐场景 |
 
 ### 9.7 请求入口到包装逻辑的完整分层图
 
