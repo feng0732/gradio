@@ -6,31 +6,53 @@
 
 ## 1. 核心架构概览
 
-### 1.1 协议版本
+### 1.1 协议版本：代码事实
 
-Gradio 支持多种通信协议，协议类型定义在 [data_classes.py:403](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/data_classes.py#L403)：
+#### 1.1.1 类型定义 vs 运行时
+
+协议字段的**类型定义**在 [types.ts:202](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/types.ts#L202) 和 [data_classes.py:403](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/data_classes.py#L403) 中声明了 6 种候选值：
 
 ```typescript
+// 仅为 TypeScript/Pydantic 类型声明，不代表运行时全部出现
 protocol: "ws" | "sse" | "sse_v1" | "sse_v2" | "sse_v2.1" | "sse_v3"
 ```
 
-**当前服务端实际只使用 `sse_v3`**，硬编码在 [blocks.py:2404](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/blocks.py#L2404)：
+但在**运行时**，服务端只在一个地方给 `config.protocol` 赋值，且硬编码为 `sse_v3`：
 
+[blocks.py:2404](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/blocks.py#L2404)：
 ```python
-"protocol": "sse_v3",
+"protocol": "sse_v3",   # 唯一赋值点，没有条件分支
 ```
 
-各协议版本的历史和现状：
+全局搜索 `gradio/` 目录下所有 Python 文件，`protocol.*=.*"sse_` 仅此一处出现。因此**当前版本运行时只使用 `sse_v3`**，无论什么启动参数、环境变量都无法改变。
 
-| 版本 | 状态 | 说明 |
-|------|------|------|
-| **ws** | ❌ 已弃用 | 客户端遇到直接抛异常 [submit.ts:78-79](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L78-L79) |
-| **sse** | ⚠️ 客户端遗留兼容 | 客户端有分支逻辑，但**当前服务端不返回此值、不支持此协议** |
-| **sse_v1** | ✅ 可用 | 引入 event_id + 会话级连接复用 |
-| **sse_v2/v2.1** | ✅ 可用 | 在 v1 基础上增加增量 diff 输出 |
-| **sse_v3** | ✅ 当前默认 | 服务端控制流关闭时机，更稳定 |
+#### 1.1.2 各版本在代码中的真实地位
 
-> **关键事实**：`sse` 协议在当前代码库中是**客户端单向兼容逻辑**。服务端永远不会返回 `protocol: "sse"`（始终返回 `"sse_v3"`），所以客户端的 `sse` 分支是死代码。详见 [3.3 节](#33-旧版-sse-客户端遗留兼容逻辑) 分析。
+根据代码可达性分析，各版本的状态如下：
+
+| 版本 | 运行时可达？ | 在代码中的角色 |
+|------|------------|--------------|
+| **ws** | ❌ 不可达 | 死分支，客户端一遇到就抛异常 [submit.ts:78-79](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L78-L79) |
+| **sse** | ❌ 不可达 | **历史兼容分支**，服务端没有任何代码能返回此值，详见 [3.3 节](#33-旧版-sse-纯历史兼容分支当前不可达) |
+| **sse_v1** | ❌ 不可达 | **历史兼容分支**，与 sse_v2/sse_v3 共用同一提交入口，但运行时服务端不返回此值 |
+| **sse_v2/v2.1** | ❌ 不可达 | **历史兼容分支**，同上。与 sse_v1 的差异仅在 3 处条件判断（见下表） |
+| **sse_v3** | ✅ 唯一活跃 | 当前实际使用的协议 |
+
+> **为什么客户端保留了 sse_v1/sse_v2 的条件判断？**
+>
+> 这是**向后兼容旧服务端**的设计。如果客户端连接到较老版本的 Gradio Server（其 config.protocol 返回 sse_v1 或 sse_v2），客户端仍能正常工作。但**在本代码库内**，服务端只发 sse_v3。
+
+#### 1.1.3 sse_v1 vs sse_v2 vs sse_v3 在客户端的实际差异
+
+四者共用同一大分支（[submit.ts:395-631](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L395-L631)），区别仅在 3 处条件判断：
+
+| 差异点 | 代码位置 | sse_v1 | sse_v2/v2.1 | sse_v3 |
+|-------|---------|--------|------------|--------|
+| **生成器增量 diff** | [submit.ts:551-557](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L551-L557) | ❌ 不应用 | ✅ 应用 `apply_diff_stream` | ✅ 应用 |
+| **回调异常时是否关 SSE** | [submit.ts:611-615](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L611-L615) | ❌ 只关迭代器 | ✅ 关 SSE 连接 | ✅ 关 SSE 连接 |
+| **process_completed 删 unclosed_events** | [stream.ts:55-62](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/stream.ts#L55-L62) | ✅ 删除 | ✅ 删除 | ✅ 删除 |
+
+> 注意注释（[submit.ts:402](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L402)）声称 "v3 only closes the stream when the backend sends the close stream message"，但**代码中 sse_v2 和 sse_v3 在上述 3 处判断中行为完全相同**，没有单独针对 v3 的分支。该注释与代码事实不一致。实际行为：**sse_v1 异常时不关 SSE；sse_v2+（含 v2, v2.1, v3）异常时都关 SSE**。正常完成时所有版本都由服务端发 `close_stream` 关闭。
 
 ### 1.2 核心模块
 
@@ -177,16 +199,25 @@ class FileData(GradioModel):
 
 ## 3. 任务提交：各协议版本对比
 
-### 3.1 总览：当前有效的提交与收尾方式
+### 3.1 总览：提交入口、结果接收、收尾时机
 
-| 协议版本 | 提交入口 | 结果接收 | 单请求迭代器收尾 | SSE 连接关闭 |
-|---------|---------|---------|----------------|-------------|
-| **非队列** | `POST /run/{api}` | 同步 HTTP 响应 | 响应返回即结束 | 无 SSE 连接 |
-| **sse_v1** | `POST /queue/join` → event_id | `GET /queue/data` SSE 流 | callback 检测 complete/error 后 `close()` | 服务端发 `close_stream` |
-| **sse_v2/v2.1** | 同 sse_v1 | 同 sse_v1 | 同 sse_v1 + diff 增量 | 同 sse_v1 |
-| **sse_v3** | 同 sse_v1 | 同 sse_v1 | 同 sse_v1 | **仅服务端发 close_stream 才关** |
+**按代码事实列出所有分支（含不可达的历史兼容分支）：**
 
-> **`close()` vs 关闭 SSE 连接**：`close()` 只是结束本请求的 AsyncIterator 迭代（设 `done = true`），**不会关闭 SSE 连接**。SSE 连接的关闭由服务端的 `close_stream` 消息控制。
+| 分支条件 | 提交入口 | 结果接收 | 单请求迭代器 `close()` 时机 | SSE 连接关闭时机 |
+|---------|---------|---------|-------------------------|----------------|
+| **非队列** <br/>`skip_queue() = true` | `POST /run/{api}` | 同步 HTTP 响应 | 响应返回即 `close()` | 无 SSE 连接 |
+| **sse（旧版）** <br/>`protocol === "sse"` | `GET /queue/data?fn_index=X&session_hash=Y` 建 SSE 即提交 | 同一 SSE 连接上收消息 | 收到 `process_completed` 且 data 到达后 `close()` | 回调中主动调用 `stream.close()` |
+| **sse_v1** <br/>`protocol === "sse_v1"` | `POST /queue/join` → event_id | 共享 `GET /queue/data?session_hash=Y` | callback 检测 complete/error → `close()` | **正常**：服务端发 `close_stream` <br/>**异常**：只 `close()` 迭代器，SSE 不关 |
+| **sse_v2/v2.1** <br/>`protocol === "sse_v2\|sse_v2.1"` | 同 sse_v1 | 同 sse_v1 | 同 sse_v1 + 生成器中间结果应用 `apply_diff_stream` | **正常**：服务端发 `close_stream` <br/>**异常**：立即调 `close_stream()` 关 SSE |
+| **sse_v3** <br/>`protocol === "sse_v3"`（**当前运行时唯一可达**） | 同 sse_v1 | 同 sse_v1 | 同 sse_v2 | 与 sse_v2 **代码完全相同**，无独立分支 |
+
+> **关键区分：`close()` vs 关闭 SSE 连接**
+>
+> | 操作 | 代码位置 | 作用 | 是否影响 SSE |
+> |------|---------|------|------------|
+> | `close()` | [submit.ts:640-647](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L640-L647) | 设 `done=true`，resolve 迭代器 Promise | ❌ 不影响 |
+> | `close_stream()` | [stream.ts:91-99](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/stream.ts#L91-L99) | 设 `open=false` + `abort_controller.abort()` | ✅ 关闭 SSE 连接 |
+> | 收到 `close_stream` 消息 | [stream.ts:43-45](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/stream.ts#L43-L45) | 调用 `close_stream()` | ✅ 关闭 SSE 连接 |
 
 ### 3.2 非队列模式（直接调用）
 
@@ -216,26 +247,28 @@ async def predict(api_name, body, request, username):
 - 无状态维护，无 SSE 连接
 - 不支持生成器函数的中间输出
 
-### 3.3 旧版 SSE（客户端遗留兼容逻辑）
+### 3.3 旧版 SSE：纯历史兼容分支，当前不可达
 
 **代码位置** [submit.ts:266-394](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L266-L394)
 
-**事实：当前服务端不支持此协议分支，它是客户端的遗留兼容代码。** 依据如下：
+**当前代码库内，服务端没有任何代码路径能让此分支被执行。** 它是为兼容更早版本 Gradio 服务端保留的历史遗留。以下是代码证据：
 
-1. **服务端硬编码 `protocol: "sse_v3"`** [blocks.py:2404](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/blocks.py#L2404)，永远不会返回 `"sse"`
-2. **服务端消息类型不包含 `send_hash` / `send_data`** — [server_messages.py](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/server_messages.py) 只有 `estimation`、`process_starts`、`process_generating`、`process_completed`、`heartbeat`、`close_stream`、`unexpected_error`、`progress`、`log`
-3. **服务端 `GET /queue/data` 只接收 `session_hash` 参数** [routes.py:1463-1467](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/routes.py#L1463-L1467)，不使用 `fn_index`，不支持旧版 sse 那种带 `fn_index` 的建连方式
-4. **`SSE_URL_V0` 和 `SSE_DATA_URL_V0` 常量未被任何代码引用**，是死常量
+| 证据 | 文件 | 事实 |
+|------|------|------|
+| config.protocol 唯一赋值点 | [blocks.py:2404](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/blocks.py#L2404) | 硬编码 `"sse_v3"`，永远不会返回 `"sse"` |
+| 服务端消息类型 | [server_messages.py](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/server_messages.py) | 只有 9 种消息，**无** `send_hash` / `send_data`（客户端此分支依赖它们） |
+| `GET /queue/data` 参数 | [routes.py:1463-1467](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/routes.py#L1463-L1467) | 只接收 `session_hash`，**不接收** `fn_index`。此分支的 URL 带 `fn_index` 参数，但服务端会忽略，导致无法入队 |
+| `SSE_URL_V0` / `SSE_DATA_URL_V0` | [constants.ts:4-5](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/constants.ts#L4-L5) | 定义了但无任何代码引用，是死常量 |
 
-**客户端 `sse` 分支的设计意图**（基于代码推测，但当前不可达）：
+**此分支的设计意图**（基于代码推测，仅对更老服务端有效）：
 
-- 客户端直接 `GET /queue/data?fn_index=X&session_hash=Y` 建立 SSE 连接
-- 通过 SSE 流收到 `send_data` 消息后，再 `POST /queue/data` 提交实际数据
-- 每个请求一条独立 SSE 连接，不共享
-- 客户端收到 `process_completed` 后主动 `stream.close()` 关闭本连接
-- `handle_message` 中对 `send_data` 和 `send_hash` 的处理 [api_info.ts:256-259](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/helpers/api_info.ts#L256-L259) 是为这个分支预留的
+1. 客户端直接 `GET /queue/data?fn_index=X&session_hash=Y` 建立 SSE 连接，相当于把 "提交" 和 "接收" 合并成一步
+2. 服务端推送 `send_hash` / `send_data` 消息，客户端响应后真正入队
+3. 每个请求独立一条 SSE 连接，无共享
+4. 收到 `process_completed` 后客户端主动调 `stream.close()` 关闭本连接
+5. `handle_message` 中 `send_hash` / `send_data` 的 case [api_info.ts:256-259](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/helpers/api_info.ts#L256-L259) 就是为此分支预留的
 
-**结论**：`sse` 分支是为兼容早期 Gradio 版本（可能使用 v0 格式）保留的，当前服务端部署不可能走到这个分支。
+**结论**：此分支是为兼容早期 Gradio 版本（可能是 v0.x 的 v0 协议格式）保留的前置兼容代码。在本代码库部署的服务端上，`protocol` 永远是 `sse_v3`，所以此分支在**当前版本运行时不可达**。
 
 ### 3.4 SSE v1+：当前唯一有效的队列协议
 
@@ -347,49 +380,67 @@ if (
 }
 ```
 
-### 3.6 sse_v3 与 sse_v1/v2 的差异：SSE 连接关闭策略
+### 3.6 sse_v1 vs sse_v2 vs sse_v3：SSE 关闭策略与 Diff 差异
 
-sse_v3 的关键改进在于**异常时是否关闭 SSE 连接**：
+三个版本共用同一大分支（[submit.ts:395-631](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L395-L631)），差异仅在 3 处条件判断，全部集中在 `sse_v2+`（即 sse_v2, sse_v2.1, sse_v3）与 sse_v1 之间。**sse_v2、sse_v2.1、sse_v3 三者在代码中行为完全一致，无独立分支。**
 
-**sse_v1/v2**：回调内发生异常时，只关闭本请求的迭代器（`close()`），不关闭 SSE 连接。连接依赖服务端的 `close_stream` 来关闭。
+#### 差异 1：生成器增量 Diff（sse_v1 vs sse_v2+）
 
-**sse_v3**：回调内发生异常时，**同时关闭 SSE 连接** [submit.ts:611-615](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L611-L615)：
-
+[submit.ts:551-557](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L551-L557)：
 ```typescript
-if (["sse_v2", "sse_v2.1", "sse_v3"].includes(protocol)) {
-    close_stream(stream_status, that.abort_controller);
+if (
+    data &&
+    dependency.connection !== "stream" &&
+    ["sse_v2", "sse_v2.1", "sse_v3"].includes(protocol)  // ← sse_v1 不在此列表
+) {
+    apply_diff_stream(pending_diff_streams, event_id!, data);
+}
+```
+
+- **sse_v1**：生成器每次 `yield` 时服务端都发送完整的当前输出
+- **sse_v2+**：首次发送完整数据，后续只发送 diff 增量，客户端用 `apply_diff_stream()` 累积为完整数据
+
+#### 差异 2：回调异常时是否关 SSE（sse_v1 vs sse_v2+）
+
+[submit.ts:611-615](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L611-L615)（位于 callback 的 `catch` 块内）：
+```typescript
+if (["sse_v2", "sse_v2.1", "sse_v3"].includes(protocol)) {  // ← sse_v1 不在此列表
+    close_stream(stream_status, that.abort_controller);  // 关 SSE
     stream_status.open = false;
     close();
 }
+// sse_v1 异常时不会执行上述代码，只在 catch 外 fire error 事件后自然 close()
 ```
 
-> 注意：代码中 sse_v2/v2.1 也走了这个关闭分支，但注释说 "v3 only closes the stream when the backend sends the close stream message"，这与代码略有出入。实际代码中，**sse_v2+ 在异常时都会立即关闭 SSE 连接**，而正常完成时都由服务端发 `close_stream` 关闭。
+- **sse_v1**：回调内抛异常 → 只 `close()` 本请求迭代器，**SSE 连接保持**（其他并发请求可能继续收消息）
+- **sse_v2+**：回调内抛异常 → 立即调用 `close_stream()` 关闭整条 SSE 连接 + `close()` 迭代器
 
-**服务端关闭逻辑** [routes.py:1525-1559](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/routes.py#L1525-L1559)：
+#### 差异 3：process_completed 时清理 unclosed_events（所有版本相同）
 
-```python
-# 每次 process_completed 后检查
-if isinstance(message, ProcessCompletedMessage) and message.event_id:
-    blocks._queue.pending_event_ids_session[session_hash].remove(message.event_id)
-    
-    # 会话内所有事件都完成了 → 发 close_stream 并关闭 SSE
-    if message.msg == ServerMessage.server_stopped or (
-        message.msg == ServerMessage.process_completed
-        and len(blocks._queue.pending_event_ids_session[session_hash]) == 0
-    ):
-        message = CloseStreamMessage()
-        yield process_msg(message)
-        return  # 结束 SSE 响应
-```
-
-**客户端收到 close_stream** [stream.ts:43-46](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/stream.ts#L43-L46)：
-
+[stream.ts:55-62](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/stream.ts#L55-L62)：
 ```typescript
-if (_data.msg === "close_stream") {
-    close_stream(stream_status, that.abort_controller);  // 设 open=false, abort
-    return;  // 不交给任何回调
+if (
+    _data.msg === "process_completed" &&
+    ["sse", "sse_v1", "sse_v2", "sse_v2.1", "sse_v3"].includes(config.protocol)  // ← 所有版本
+) {
+    unclosed_events.delete(event_id);
 }
 ```
+
+所有 sse_* 版本（含旧版 sse）在收到 `process_completed` 时都会从 `unclosed_events` Set 中删除该 event_id。
+
+#### 注释与代码不一致之处
+
+[submit.ts:402](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/submit.ts#L402) 的注释写道：
+```
+// v3 only closes the stream when the backend sends the close stream message.
+```
+
+但**代码中不存在任何只针对 v3 的单独判断**。上述所有条件判断要么包含 `sse_v2 + sse_v2.1 + sse_v3` 三者，要么包含全部版本。此注释与代码事实不符，应理解为：v3 设计上意图让服务端完全主导流关闭，但代码实现中（为简化？）sse_v2 和 v3 的行为相同。
+
+#### 正常完成时：所有 sse_v1+ 版本 SSE 关闭策略一致
+
+服务端每次 `process_completed` 后检查会话内是否还有未完成事件 [routes.py:1525-1559](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/gradio/routes.py#L1525-L1559)。若全部完成则发送 `CloseStreamMessage`，客户端在 [stream.ts:43-45](file:///d:/fz/0601/solo-dogfeeding/code/247-gradio/client/js/src/utils/stream.ts#L43-L45) 无条件关闭 SSE。**此逻辑不区分 sse_v1/v2/v3，所有版本行为一致。**
 
 ---
 
