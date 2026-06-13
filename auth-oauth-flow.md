@@ -305,30 +305,33 @@ def login_check(user: str = Depends(get_current_user)):
 
 #### 受 login_check 保护的接口全览
 
-共 **8 大类、19 条路由** 被 `dependencies=[Depends(login_check)]` 保护：
+按代码精确统计：**10 大类、20 条语义路由、共 29 个 FastAPI 路由装饰器** 被 `dependencies=[Depends(login_check)]` 保护（同一语义路由可能注册多个装饰器以兼容尾斜杠、多 HTTP 方法等变体）。
 
-| 类别 | 路由 | 方法 | 文件位置 | 说明 |
-|------|------|------|---------|------|
-| **配置与元信息** | `/config` | GET | [routes.py:954-955](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L954-L955) | 返回前端渲染所需的完整应用配置 |
-| | `/info` | GET | [routes.py:715-716](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L715-L716) | 返回 API 元信息（命名端点、参数等） |
-| | `/openapi.json` | GET | [routes.py:749](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L749) | OpenAPI 3.0 文档描述 |
-| **热重载** | `/dev/reload` | GET | [routes.py:432](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L432) | 开发模式下的代码变更 SSE 通知 |
-| **函数调用（不排队）** | `/run/{api_name}` | POST | [routes.py:1269-1270](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1269-L1270) | 直接同步执行（绕过队列） |
-| | `/api/{api_name}` | POST | [routes.py:1271-1272](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1271-L1272) | 同上，向后兼容旧路径 |
-| **函数调用（SSE 结果流）** | `/call/v2/{api_name}/{event_id}` | GET | [routes.py:1431-1434](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1431-L1434) | V2 格式：按 event_id 拉取执行结果的 SSE 流 |
-| | `/call/{api_name}/{event_id}` | GET | [routes.py:1434](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1434) | 简单格式：同上 |
-| **函数调用（请求-响应）** | `/call/v2/{api_name}` | POST | [routes.py:1318-1319](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1318-L1319) | V2 格式命名参数 POST，内部转队列 |
-| | `/call/{api_name}` | POST | [routes.py:1342-1343](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1342-L1343) | 简单格式数组参数 POST，内部转队列 |
-| **队列数据** | `/queue/join` | POST | [routes.py:1357](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1357) | 将函数调用提交到执行队列 |
-| | `/queue/data` | GET | [routes.py:1463](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1463) | 按 session_hash 订阅队列消息的 SSE 流（核心：进度/完成/错误事件） |
-| | `/queue/status` | GET | [routes.py:1668-1674](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1668-L1674) | 获取队列整体状态（排队人数、估算等待时间） |
-| **组件服务** | `/component_server` | POST | [routes.py:1632-1666](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1632-L1666) | 调用组件类上标记了 `@utils.gr_server_fn` 的服务端方法（如下拉框动态选项、表格搜索等） |
-| **文件上传与访问** | `/upload` | POST | [routes.py:1738](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1738) | 接收 multipart/form-data 文件上传，返回文件元信息 |
-| | `/proxy={url}` | GET/HEAD | [routes.py:1055-1056](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1055-L1056) | 通过 Gradio 服务端反向代理外部 URL |
-| | `/file={path}` | GET/HEAD | [routes.py:1082-1083](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1082-L1083) | 服务端文件读取（上传文件、组件静态文件等） |
-| | `/file/{path}` | GET | [routes.py:1185](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1185) | 旧版文件路径格式（已弃用但仍受保护） |
-| **监控面板** | `/monitoring` | GET | [routes.py:1869](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1869) | 监控看板入口，通过后控制台输出带密钥的看板 URL |
-| **录音处理** | `/process_recording` | POST | [routes.py:1913](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1913) | 服务端处理前端录制音视频：裁剪片段、添加缩放特效、FFmpeg 转码等 |
+下表按语义路由列出，标注每组对应的装饰器数量：
+
+| 类别 | 语义路由 | 方法 | 装饰器数 | 文件位置 | 说明 |
+|------|---------|------|---------|---------|------|
+| **配置与元信息** | `/config` | GET | 2 (`/config`, `/config/`) | [routes.py:954-955](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L954-L955) | 返回前端渲染所需的完整应用配置 |
+| | `/info` | GET | 2 (`/info`, `/info/`) | [routes.py:715-716](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L715-L716) | 返回 API 元信息（命名端点、参数等） |
+| | `/openapi.json` | GET | 1 | [routes.py:749](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L749) | OpenAPI 3.0 文档描述 |
+| **热重载** | `/dev/reload` | GET | 1 | [routes.py:432](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L432) | 开发模式下的代码变更 SSE 通知 |
+| **函数调用（不排队）** | `/run/{api_name}` | POST | 2 (`/run/{api_name}`, `/run/{api_name}/`) | [routes.py:1269-1270](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1269-L1270) | 直接同步执行（绕过队列） |
+| | `/api/{api_name}` | POST | 2 (`/api/{api_name}`, `/api/{api_name}/`) | [routes.py:1271-1272](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1271-L1272) | 同上，向后兼容旧路径 |
+| **函数调用（请求-响应）** | `/call/v2/{api_name}` | POST | 2 (`/call/v2/{api_name}`, `/call/v2/{api_name}/`) | [routes.py:1318-1319](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1318-L1319) | V2 格式命名参数 POST，内部转队列 |
+| | `/call/{api_name}` | POST | 2 (`/call/{api_name}`, `/call/{api_name}/`) | [routes.py:1342-1343](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1342-L1343) | 简单格式数组参数 POST，内部转队列 |
+| **函数调用（SSE 结果流）** | `/call/v2/{api_name}/{event_id}` | GET | 1 | [routes.py:1431-1434](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1431-L1434) | V2 格式：按 event_id 拉取执行结果的 SSE 流 |
+| | `/call/{api_name}/{event_id}` | GET | 1 | [routes.py:1434](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1434) | 简单格式：同上 |
+| **队列数据** | `/queue/join` | POST | 1 | [routes.py:1357](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1357) | 将函数调用提交到执行队列 |
+| | `/queue/data` | GET | 1 | [routes.py:1463](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1463) | 按 session_hash 订阅队列消息的 SSE 流（核心：进度/完成/错误事件） |
+| | `/queue/status` | GET | 1 | [routes.py:1668-1674](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1668-L1674) | 获取队列整体状态（排队人数、估算等待时间） |
+| **组件服务** | `/component_server` | POST | 2 (`/component_server`, `/component_server/`) | [routes.py:1632-1666](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1632-L1666) | 调用组件类上标记了 `@utils.gr_server_fn` 的服务端方法（如下拉框动态选项、表格搜索等） |
+| **文件上传与访问** | `/upload` | POST | 1 | [routes.py:1738](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1738) | 接收 multipart/form-data 文件上传，返回文件元信息 |
+| | `/proxy={url}` | GET/HEAD | 2 (GET + HEAD) | [routes.py:1055-1056](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1055-L1056) | 通过 Gradio 服务端反向代理外部 URL |
+| | `/file={path}` | GET/HEAD | 2 (GET + HEAD) | [routes.py:1082-1083](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1082-L1083) | 服务端文件读取（上传文件、组件静态文件等） |
+| | `/file/{path}` | GET | 1 | [routes.py:1185](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1185) | 旧版文件路径格式（已弃用但仍受保护） |
+| **监控面板** | `/monitoring` | GET | 1 | [routes.py:1869](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1869) | 监控看板入口，通过后控制台输出带密钥的看板 URL |
+| **录音处理** | `/process_recording` | POST | 1 | [routes.py:1913](file:///d:/fz/0601/solo-dogfeeding/code/254-gradio/gradio/routes.py#L1913) | 服务端处理前端录制音视频：裁剪片段、添加缩放特效、FFmpeg 转码等 |
+| **合计** | **20 条语义路由** | — | **29 个装饰器** | — | 分属 **10 大类** |
 
 ---
 
