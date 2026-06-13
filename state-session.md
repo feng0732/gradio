@@ -533,6 +533,87 @@ my_state = gr.State(value=0, time_to_live=300, delete_callback=lambda v: print(f
 3. **5 分钟内无写回**：`_delete_state` 每秒扫描，`state_components` 判定 `(now - created_at).seconds = 301 > 300`，`expired = True`
 4. **清理**：`delete_state` 调用 `delete_callback(42)`，打印"清理: 42"，从 `state_data` 中删除该 key
 5. **用户 A 再次请求**：`__getitem__` 发现 `state_data` 中已无该 key → `deepcopy(0)`（回到初始值），但 `_state_ttl` 仍保留旧记录
+6. **下一秒 `_delete_state` 扫描**：`state_components` 发现 `_id in _state_ttl` 为 True，用旧的 `created_at` 计算 → `(now - 旧时刻) >> 300` → `expired = True` → **立刻又被删掉**
+7. **循环**：只要该会话还活着且 State 只被读不被写，每次读取放回初始值 → 下一秒又被判定过期删除 → 永远无法持有初始值
+
+### 5.9 TTL 清理后重新读取的过期循环问题
+
+上面的步骤 5-7 揭示了一个微妙的行为：**TTL 清理只删 `state_data`，不删 `_state_ttl`**。这导致被清理过的 State 在重新读取后会被旧的 TTL 记录立刻判定为过期。
+
+#### 根因：`delete_state` 的不对称清理
+
+[delete_state](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/state_holder.py#L51-L61) 的清理逻辑：
+
+```python
+def delete_state(self, session_id: str, expired_only: bool = False):
+    ...
+    for component, value, expired in session_state.state_components:
+        if not expired_only or expired:
+            component.delete_callback(value)
+            to_delete.append(component._id)
+    for component in to_delete:
+        del session_state.state_data[component]   # ← 只删 state_data
+        # ⚠️ 没有删除 _state_ttl[component]
+```
+
+`_state_ttl` 中的记录 `(time_to_live, created_at)` 被原样保留。当下次 `__getitem__` 重新把初始值放回 `state_data` 时，这个旧记录仍然存在。
+
+#### 过期判定的连锁反应
+
+[state_components](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/state_holder.py#L149-L159) 的判定逻辑：
+
+```python
+if isinstance(block, State) and _id in self._state_ttl:
+    time_to_live, created_at = self._state_ttl[_id]   # ← 用的是旧 created_at
+    ...
+    (datetime.datetime.now() - created_at).total_seconds() > time_to_live,
+```
+
+由于 `created_at` 是最初 `__setitem__` 的时刻，而 TTL 已经过期了一次，所以 `now - 旧created_at` 只会比 `time_to_live` 更大。重新放回的初始值在下一轮扫描中必然被判定为过期。
+
+#### 完整时序
+
+```
+时刻 T0: __setitem__ → _state_ttl[id] = (300, T0), state_data[id] = 42
+时刻 T0+300s: _delete_state 扫描 → expired=True → del state_data[id]
+              ⚠️ _state_ttl[id] = (300, T0) 仍然存在
+时刻 T0+301s: __getitem__ → state_data 中无该 key → deepcopy(0) 放回
+              state_data[id] = 0
+              ⚠️ 没有更新 _state_ttl（__getitem__ 不碰 _state_ttl）
+时刻 T0+302s: _delete_state 扫描 → _id in _state_ttl 为 True
+              time_to_live=300, created_at=T0
+              now - T0 = 302s > 300 → expired=True → del state_data[id]
+              ⚠️ 初始值 0 只存活了约 1 秒就被再次删除
+```
+
+#### 打破循环的唯一方式：重新写回
+
+只有 `__setitem__` 才会用当前时刻覆盖 `_state_ttl`：
+
+```python
+def __setitem__(self, key: int, value: Any):
+    ...
+    self._state_ttl[key] = (
+        block.time_to_live,
+        datetime.datetime.now(),    # ← 重置 created_at 为当前时刻
+    )
+    self.state_data[key] = value
+```
+
+所以如果函数同时把 State 作为输出写回，`_state_ttl` 会被刷新，TTL 计时重新开始，循环不会出现。
+
+#### 未登记 TTL 的 State 反而不受影响
+
+对比上一节分析的"只读不写的 State 不登记 TTL"——这类 State 因为 `_state_ttl` 中没有记录，`state_components` 直接跳过，TTL 清理路径根本不会触及它们。它们通过 `__getitem__` 放回初始值后能稳定存在，不会被反复删除。
+
+**这形成了一个反直觉的结论**：
+
+| 场景 | TTL 清理后重新读取 | 行为 |
+|------|-------------------|------|
+| State 只在 inputs，从未在 outputs | `_state_ttl` 无记录 | ✅ 初始值稳定存在，不受 TTL 扫描影响 |
+| State 在 outputs 中写回过至少一次 | `_state_ttl` 有旧记录 | ❌ 初始值被放回后下一秒又被删除，循环往复 |
+
+曾经被写回过的 State，一旦 TTL 过期被清理，反而比从未写回过的 State 更不稳定——除非再次写回刷新 `_state_ttl`。
 
 如果用户关闭页面：`is_closed = True`，TTL 覆盖为 3600 秒，1 小时后清理。
 
