@@ -303,82 +303,87 @@ Python 客户端对 State 做了透明处理，用户无需手动管理：
 
 ## 五、持久生命周期管理
 
-State 的生命周期从创建到销毁经历多个阶段，涉及多层机制。
+State 的生命周期管理有两条独立的清理路径：**TTL 过期清理**和**会话容量淘汰**。它们操作粒度不同、触发条件不同、清理逻辑也不同，容易混淆。此外，TTL 的登记时机有一个容易忽略的细节：只读不写的 State 不会被 TTL 管理。
 
-### 5.1 生命周期阶段
+### 5.1 两条清理路径对比
 
-```
-创建 → 首次访问（deepcopy 初始值）→ 多次读写 → 标记关闭 → TTL 过期 / 会话淘汰 → 删除（回调）
-```
+| | TTL 过期清理 | 会话容量淘汰（LRU） |
+|---|---|---|
+| **操作粒度** | 单个 State key（`state_data` 中的某一项） | 整个 `SessionState`（含该会话全部 State） |
+| **触发条件** | State 写入后经过 `time_to_live` 秒（会话关闭后切换为 1 小时） | 活跃会话数超过 `state_session_capacity` |
+| **触发位置** | [StateHolder.delete_state](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/state_holder.py#L51-L61) | [StateHolder.update](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/state_holder.py#L38-L43) |
+| **是否调 delete_callback** | ✅ 调用 `component.delete_callback(value)` | ❌ 不调用，整个 SessionState 直接丢弃 |
+| **运行频率** | 每秒扫描一次（`_delete_state` 后台任务） | 每次请求时即时检查 |
+| **涉及 `_state_ttl`** | ✅ 依赖 `_state_ttl` 判断是否过期 | ❌ 无关 |
 
-### 5.2 创建阶段
+### 5.2 TTL 登记时机：只有写回时才登记
 
-State 值并非在组件定义时就创建会话副本，而是**延迟到首次访问**：
-
-```python
-# SessionState.__getitem__
-if key not in self.state_data:
-    self.state_data[key] = deepcopy(getattr(block, "value", None))
-```
-
-这种惰性初始化避免了不必要的内容占用——如果某个会话从未访问某个 State，就不会为其分配内存。
-
-### 5.3 读写阶段
-
-每次事件处理循环：
-
-1. `process_api` → `preprocess_data`：从 `SessionState` 读取 State 值注入函数参数
-2. 函数执行
-3. `postprocess_data`：将返回值写回 `SessionState`
-4. `get_state_ids_to_track`：检测 State 是否变化，触发 `.change` 事件
-
-### 5.4 心跳保活机制
-
-[heartbeat 端点](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/routes.py#L1195-L1266) 是保持会话活跃的关键：
+`_state_ttl` 的登记**只发生在 `SessionState.__setitem__` 中**：
 
 ```python
-@router.get("/heartbeat/{session_hash}")
-def heartbeat(session_hash, request, background_tasks, username):
-    async def iterator():
-        while True:
-            yield "data: ALIVE\n\n"
-            await asyncio.sleep(heartbeat_rate)
-            ...
+# SessionState.__setitem__（state_holder.py L92-L101）
+def __setitem__(self, key: int, value: Any):
+    from gradio.components import State
+    block = self.blocks_config.blocks.get(key)
+    if isinstance(block, State):
+        self._state_ttl[key] = (          # ← 登记存活时间和当前时刻
+            block.time_to_live,
+            datetime.datetime.now(),
+        )
+        self.state_data[key] = value
+    else:
+        self.blocks_config.blocks[key] = value
+    ...
 ```
 
-前端通过 SSE (Server-Sent Events) 与心跳端点保持长连接。只要连接存在，会话就被视为活跃。当连接断开时（用户关闭标签页或刷新页面），触发以下逻辑：
+而 `__getitem__`（读取 State 值时）只做惰性初始化，**不登记 TTL**：
 
 ```python
-# 标记会话为关闭状态
-if session_hash in app.state_holder.session_data:
-    app.state_holder.session_data[session_hash].is_closed = True
-# 触发 unload 事件
-for fn_index in unload_fn_indices:
-    background_tasks.add_task(route_utils.call_process_api, ...)
+# SessionState.__getitem__（state_holder.py L83-L90）
+def __getitem__(self, key: int) -> Any:
+    block = self.blocks_config.blocks[key]
+    if block.stateful:
+        if key not in self.state_data:
+            self.state_data[key] = deepcopy(getattr(block, "value", None))  # 仅写入 state_data
+        return self.state_data[key]                                         # 不碰 _state_ttl
+    else:
+        return block
 ```
 
-### 5.5 关闭后的 TTL 管理
+这意味着：
 
-会话关闭后，State 不会立即删除，而是进入 TTL 倒计时：
+**如果 State 只作为函数输入被读取，但从未作为函数输出被写回，那么 `_state_ttl` 中不会有该 State 的记录。**
+
+具体场景：假设一个 State 只出现在 `inputs` 中而从未出现在 `outputs` 中：
 
 ```python
-# SessionState
-self.STATE_TTL_WHEN_CLOSED = (
-    1 if os.getenv("GRADIO_IS_E2E_TEST", None) else 3600  # 默认1小时
-)
+counter = gr.State(0)
+
+def read_only_fn(count):
+    return f"当前计数: {count}"    # 没有写回 counter
+
+btn.click(read_only_fn, [counter], [textbox])   # counter 只在 inputs，不在 outputs
 ```
 
-[state_components 属性](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/state_holder.py#L139-L161) 计算每个 State 是否已过期：
+此时：
+1. 第一次请求时，`preprocess_data` 调用 `state[counter._id]`，触发 `__getitem__`，`deepcopy(0)` 写入 `state_data`，但 `_state_ttl` 中没有登记
+2. 函数执行后，`counter` 不在 `outputs` 中，`postprocess_data` 不会对它调用 `state[counter._id] = ...`
+3. 结果：`state_data` 中有值，但 `_state_ttl` 中没有记录
+
+### 5.3 未登记 TTL 的 State 在清理时的命运
+
+TTL 过期清理的核心是 [state_components 属性](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/state_holder.py#L138-L161)：
 
 ```python
 @property
 def state_components(self) -> Iterator[tuple[State, Any, bool]]:
     for _id in self.state_data:
+        ...
         block = self.blocks_config.blocks[_id]
-        if isinstance(block, State) and _id in self._state_ttl:
+        if isinstance(block, State) and _id in self._state_ttl:   # ← 关键：跳过未登记的
             time_to_live, created_at = self._state_ttl[_id]
             if self.is_closed:
-                time_to_live = self.STATE_TTL_WHEN_CLOSED  # 关闭后使用短 TTL
+                time_to_live = self.STATE_TTL_WHEN_CLOSED
             value = self.state_data[_id]
             yield (
                 block, value,
@@ -386,94 +391,152 @@ def state_components(self) -> Iterator[tuple[State, Any, bool]]:
             )
 ```
 
-### 5.6 定期清理
+**`_id in self._state_ttl` 这个条件**意味着：
 
-[route_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/route_utils.py#L1027-L1038) 中的后台任务每秒扫描一次过期状态：
+- 未登记 TTL 的 State **不会被 yield 出来**
+- `delete_all_expired_state` 遍历 `state_components`，不会看到这些 State
+- 因此这些 State **永远不会被 TTL 清理路径删除**
+- 它们只会在 **LRU 淘汰**时随整个 `SessionState` 一起被丢弃（但不会调 `delete_callback`）
 
-```python
-async def _delete_state(app: App):
-    while True:
-        app.state_holder.delete_all_expired_state()
-        await asyncio.sleep(1)
+这个设计是合理的：只读不写的 State 通常持有初始值（如配置常量），没有资源需要释放，不需要 TTL 管理。而 `delete_callback` 也是为需要显式清理的资源（如临时文件、数据库连接）设计的，这些资源只有在 State 被更新后才存在。
+
+### 5.4 TTL 过期清理的完整流程
+
+```
+_delete_state（每秒触发）
+  └─ StateHolder.delete_all_expired_state()
+       └─ 遍历所有 session_id
+            └─ StateHolder.delete_state(session_id, expired_only=True)
+                 └─ 遍历 session_state.state_components（仅含已登记 TTL 的 State）
+                      └─ 对每个 (component, value, expired):
+                           ├─ 如果 expired_only=True 且 expired=False → 跳过
+                           ├─ 如果 expired=True → 调用 component.delete_callback(value)
+                           └─ 从 session_state.state_data 中删除该 key
 ```
 
-[StateHolder.delete_state](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/state_holder.py#L51-L61) 执行实际的删除并调用 `delete_callback`：
+注意：TTL 清理只删 `state_data` 中的个别 key，**不删除 `SessionState` 本身**。即使所有 State 都过期被清理了，空的 `SessionState` 仍然留在 `StateHolder.session_data` 中。
+
+### 5.5 LRU 淘汰的完整流程
+
+LRU 淘汰发生在每次请求访问 `StateHolder` 时：
 
 ```python
-def delete_state(self, session_id: str, expired_only: bool = False):
+# StateHolder.__getitem__（state_holder.py L28-L33）
+def __getitem__(self, session_id: str) -> SessionState:
     if session_id not in self.session_data:
-        return
-    to_delete = []
-    session_state = self.session_data[session_id]
-    for component, value, expired in session_state.state_components:
-        if not expired_only or expired:
-            component.delete_callback(value)   # 调用用户定义的清理回调
-            to_delete.append(component._id)
-    for component in to_delete:
-        del session_state.state_data[component]
-```
+        self.session_data[session_id] = SessionState(self.blocks)
+    self.update(session_id)                                    # ← 触发 LRU 检查
+    self.time_last_used[session_id] = datetime.datetime.now()
+    return self.session_data[session_id]
 
-### 5.7 LRU 淘汰
-
-当活跃会话数量超过 `state_session_capacity`（默认 10000）时，最久未使用的会话被淘汰：
-
-```python
+# StateHolder.update（state_holder.py L38-L43）
 def update(self, session_id: str):
     with self.lock:
         if session_id in self.session_data:
-            self.session_data.move_to_end(session_id)  # 移到 OrderedDict 末尾
+            self.session_data.move_to_end(session_id)          # 当前会话移到末尾
         if len(self.session_data) > self.capacity:
-            self.session_data.popitem(last=False)        # 淘汰最旧的
+            self.session_data.popitem(last=False)              # 淘汰最旧的会话
 ```
 
-### 5.8 生命周期全景图
+关键点：
+- `OrderedDict` 保证插入/访问顺序，`move_to_end` 把当前会话移到最新位置
+- `popitem(last=False)` 弹出最久未访问的会话（FIFO 头部）
+- **被淘汰的 `SessionState` 直接从 `session_data` 中移除，不调任何 `delete_callback`**
+- 这意味着如果 State 设置了 `delete_callback` 用于资源清理，LRU 淘汰时该回调不会被调用——这是一个潜在的内存/资源泄漏点
+
+### 5.6 心跳断开与会话关闭
+
+[heartbeat 端点](file:///d:/fz/0601/solo-dogfeeding/code/253-gradio/gradio/routes.py#L1195-L1266) 的 SSE 连接断开时，会话被标记为关闭：
+
+```python
+# routes.py L1250-L1253
+if session_hash in app.state_holder.session_data:
+    app.state_holder.session_data[session_hash].is_closed = True
+```
+
+`is_closed = True` 不直接删除任何 State，但它改变了 TTL 过期判定中的 `time_to_live`：
+
+```python
+# state_components 属性中
+if self.is_closed:
+    time_to_live = self.STATE_TTL_WHEN_CLOSED   # 3600 秒（1 小时）
+```
+
+**会话关闭前后 TTL 行为的变化**：
+
+| | 会话活跃（`is_closed=False`） | 会话关闭（`is_closed=True`） |
+|---|---|---|
+| `time_to_live=None`（默认） | `math.inf` → 永不过期 | 3600 秒 → 1 小时后过期 |
+| `time_to_live=60` | 60 秒后过期 | 3600 秒后过期（覆盖用户设置） |
+| 未登记 `_state_ttl` | 不参与 TTL 清理 | 仍然不参与 TTL 清理 |
+
+关闭后覆盖为固定 1 小时的目的是给用户"重新打开标签页"的缓冲时间——如果用户在 1 小时内恢复连接（相同 `session_hash`），State 还在。
+
+### 5.7 完整生命周期全景图
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │          用户打开页面                │
-                    └──────────────┬──────────────────────┘
-                                   │
-                    ┌──────────────▼──────────────────────┐
-                    │   前端生成 session_hash              │
-                    │   建立心跳 SSE 连接                  │
-                    └──────────────┬──────────────────────┘
-                                   │
-                    ┌──────────────▼──────────────────────┐
-                    │   首次请求到达                        │
-                    │   StateHolder 自动创建 SessionState  │
-                    └──────────────┬──────────────────────┘
-                                   │
-                    ┌──────────────▼──────────────────────┐
-                    │   State 首次访问                      │
-                    │   deepcopy(初始值) → state_data      │
-                    └──────────────┬──────────────────────┘
-                                   │
-               ┌───────────────────┼───────────────────┐
-               │                   │                   │
-    ┌──────────▼─────────┐ ┌──────▼──────┐ ┌─────────▼──────────┐
-    │  读取: state[id]   │ │ 函数执行    │ │ 写入: state[id]=v  │
-    │  (preprocess_data) │ │             │ │ (postprocess_data) │
-    └────────────────────┘ └─────────────┘ └────────────────────┘
-                                   │
-                    ┌──────────────▼──────────────────────┐
-                    │   用户关闭页面 / 刷新                 │
-                    │   心跳 SSE 断开                       │
-                    │   is_closed = True                   │
-                    │   TTL 切换为 1 小时                   │
-                    └──────────────┬──────────────────────┘
-                                   │
-                    ┌──────────────▼──────────────────────┐
-                    │   _delete_state 后台任务              │
-                    │   每秒扫描过期 State                  │
-                    │   调用 delete_callback(value)         │
-                    │   从 state_data 中删除                │
-                    └──────────────┬──────────────────────┘
-                                   │
-                    ┌──────────────▼──────────────────────┐
-                    │   或: LRU 淘汰（会话超过 capacity）   │
-                    │   最久未使用的 SessionState 被移除    │
-                    └─────────────────────────────────────┘
+ ┌──────────────────────────────────────────────────────────────┐
+ │                      用户打开页面                              │
+ │  前端生成 session_hash，建立心跳 SSE 连接                       │
+ └────────────────────────┬─────────────────────────────────────┘
+                          │
+ ┌────────────────────────▼─────────────────────────────────────┐
+ │              首次请求到达                                      │
+ │  StateHolder.__getitem__ → 创建 SessionState                  │
+ │  StateHolder.update → LRU 检查（可能淘汰最旧会话）              │
+ └────────────────────────┬─────────────────────────────────────┘
+                          │
+          ┌───────────────┼───────────────┐
+          │                               │
+ ┌────────▼─────────┐          ┌──────────▼──────────────────────┐
+ │  State 作为输入    │          │  State 作为输出                   │
+ │  __getitem__      │          │  __setitem__                     │
+ │  → deepcopy 初始值│          │  → 登记 _state_ttl               │
+ │    写入 state_data│          │  → 写入 state_data               │
+ │  ⚠️ 不登记 TTL    │          │  ✅ 登记 TTL                     │
+ └───────────────────┘          └─────────────────────────────────┘
+                          │
+           ┌──────────────┴──────────────────┐
+           │                                 │
+ ┌─────────▼──────────────┐    ┌─────────────▼─────────────────────┐
+ │   TTL 过期清理路径       │    │   LRU 淘汰路径                     │
+ │   （每秒扫描）           │    │   （每次请求即时触发）               │
+ │                        │    │                                   │
+ │   只处理 _state_ttl    │    │   不看 _state_ttl                  │
+ │   中已登记的 State      │    │   直接弹掉整个 SessionState         │
+ │                        │    │                                   │
+ │   删除粒度：            │    │   删除粒度：                        │
+ │   单个 state_data key  │    │   整个 SessionState 对象            │
+ │                        │    │                                   │
+ │   ✅ 调 delete_callback│    │   ❌ 不调 delete_callback          │
+ │                        │    │                                   │
+ │   会话仍存在于          │    │   会话从 session_data 中消失        │
+ │   session_data 中      │    │                                   │
+ └────────────────────────┘    └───────────────────────────────────┘
+                          │
+ ┌────────────────────────▼─────────────────────────────────────┐
+ │              心跳 SSE 断开（关闭标签页/刷新）                    │
+ │  is_closed = True                                             │
+ │  所有已登记 TTL 的 State 的 time_to_live 被覆盖为 3600 秒      │
+ │  未登记 TTL 的 State 仍不受 TTL 管理                           │
+ └──────────────────────────────────────────────────────────────┘
 ```
+
+### 5.8 一个完整的 TTL 生命周期示例
+
+```python
+my_state = gr.State(value=0, time_to_live=300, delete_callback=lambda v: print(f"清理: {v}"))
+```
+
+1. **用户 A 首次请求**：`preprocess_data` 调用 `state[my_state._id]` → `__getitem__` → `state_data[id] = 0`，**未登记 TTL**
+2. **函数返回新值**：`postprocess_data` 调用 `state[my_state._id] = 42` → `__setitem__` → `_state_ttl[id] = (300, now)`，**登记 TTL**
+3. **5 分钟内无写回**：`_delete_state` 每秒扫描，`state_components` 判定 `(now - created_at).seconds = 301 > 300`，`expired = True`
+4. **清理**：`delete_state` 调用 `delete_callback(42)`，打印"清理: 42"，从 `state_data` 中删除该 key
+5. **用户 A 再次请求**：`__getitem__` 发现 `state_data` 中已无该 key → `deepcopy(0)`（回到初始值），但 `_state_ttl` 仍保留旧记录
+
+如果用户关闭页面：`is_closed = True`，TTL 覆盖为 3600 秒，1 小时后清理。
+
+如果服务器会话数超过 10000：LRU 淘汰直接移除整个 `SessionState`，`delete_callback` 不会被调用。
 
 ---
 
