@@ -20,7 +20,7 @@ Gradio 的路由体系基于 FastAPI 构建，分为三个核心层次：
 ├───────────────────────────────────────────────────────────┤
 │                前端资源服务层 (Static/Assets)              │
 │  /static  /assets  /favicon.ico  /file=  /svelte          │
-│  ── 可剥离为独立 StaticWorkerPool 多进程服务 ──            │
+│  ── 可剥离为独立 StaticWorkerPool 多进程服务（需 Node 代理分流）──│
 └───────────────────────────────────────────────────────────┘
 ```
 
@@ -319,9 +319,16 @@ class StaticWorkerPool:
     def __init__(self, num_workers: int, config: StaticServerConfig, ports: list[int]):
         ...
     def start(self): ...       # spawn N 个子进程
-    def get_next_url(self) -> str: ...  # 轮询分发
+    def get_next_url(self) -> str: ...  # 预留的轮询接口（详见下方说明）
     def shutdown(self): ...
 ```
+
+> ⚠️ **关于 `get_next_url()` 的说明**：该方法在
+> [static_server.py:229-233](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/static_server.py#L229-L233)
+> 定义，实现了 Round-Robin 端口选择逻辑，但在当前代码库中**零调用点**。
+> 它是 Python 侧预留的分流接口，实际线上流量分发由 Node 代理侧的
+> `classifyRoute` + `workerIndex` 完成（见第九章 9.2 节）。不应将此预留接口
+> 等同于运行时的线上分流行为。
 
 每个静态工作进程是一个**独立的 FastAPI 应用**（[static_server.py:52-167](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/static_server.py#L52-L167)），
 包含以下路由：
@@ -354,10 +361,11 @@ if resolved_num_workers is not None and resolved_num_workers >= 1:
     self._static_worker_pool.start()
 ```
 
-> **边界要点**：静态资源服务是**可独立部署的资源层边界**。
-> `StaticWorkerPool` 通过「多进程 + 轮询」实现水平扩展，
-> 与主服务之间仅通过 HTTP 通信，无共享状态。这是 Gradio 性能优化的重要架构决策——
-> 将 I/O 密集型的文件服务从 CPU/状态密集型的主服务中解耦。
+> **边界要点**：静态资源服务是**可独立部署的资源层边界**——但「可独立部署」仅在实际有
+> 流量分发器（即 Node 代理）时才生效。在拓扑 3（SSR + Node 代理）下，
+> `StaticWorkerPool` 通过「多进程 + Node 侧轮询分发」实现水平扩展，
+> 将 I/O 密集型的文件服务从 CPU/状态密集型的主服务中解耦。在拓扑 2（无 Node）
+> 下，Worker 进程虽已启动，但无流量入口指向它（详见第十一章 11.1 节）。
 
 ---
 
@@ -420,8 +428,10 @@ Python 退居为内部 API 服务。
    不立即生成路由，而是存入 `_deferred_apis`，到 `launch()` 时才通过 Blocks 体系
    统一生成。这保证所有 API 都走同一套队列/并发/SSE 管线。
 
-3. **资源层可剥离是性能架构的关键**：`StaticWorkerPool` 把文件 I/O 从主进程移出，
-   配合 Node 代理的 SSR 架构，Gradio 可以支撑高并发的静态资源访问而不阻塞核心 API。
+3. **资源层可剥离是性能架构的关键（拓扑 3 下生效）**：在 Node 代理模式下，
+   `StaticWorkerPool` 把文件 I/O 从主进程移出，Gradio 可以支撑高并发的静态资源访问
+   而不阻塞核心 API。但在无 Node 代理的拓扑下，Worker 进程虽已启动却不接收线上流量，
+   文件 I/O 仍在主进程中处理。
 
 4. **`/gradio_api` 前缀是重要的隔离设计**：所有业务 API 统一前缀，便于鉴权、
    监控、代理分流，也为未来 API 服务独立部署预留了架构空间。
@@ -1007,7 +1017,8 @@ Node 侧 `proxy_index.js` 完成。详见[第十一章 11.2 节](#112-node-代�
 
 ③ StaticWorkerPool(ports=[7862,7863]).start()
    → multiprocessing.Process × 2 分别在 7862 / 7863 启动 uvicorn
-   → 轮询 /health 确认每个 Worker 就绪
+   → 启动阶段健康检查重试（httpx.get /health，最多 50 次/端口），确认每个 Worker 就绪
+   → ⚠️ 这里的「重试」是启动阶段的内部验证，与线上流量的轮询分发是不同的概念
 
 ④ ★ 最后启动 Node 前端代理（避免 502 窗口期）：
    start_node_server(
@@ -1017,7 +1028,7 @@ Node 侧 `proxy_index.js` 完成。详见[第十一章 11.2 节](#112-node-代�
    )
    → Node 通过 PORT=7860、GRADIO_PYTHON_PORT=7861、
          GRADIO_STATIC_WORKER_PORTS=7862,7863 启动
-   → 轮询 HEAD / 直到 Node 返回非 5xx
+   → 重试 HEAD / 直到 Node 返回非 5xx
    → Node 在 7860 就绪，对外宣告完成
 
 ⑤ local_url 更新为 http://localhost:7860/（Node 端口，不再是 7861）
@@ -1087,7 +1098,7 @@ Worker 进程是一个**功能完整的独立 FastAPI 应用**，拥有自己的
 | 拓扑 | 分发器是否存在 | Worker 端口是否被分发器感知 | Worker 是否接收线上流量 |
 |------|--------------|-------------------------|---------------------|
 | 拓扑 1（单进程） | 无 | N/A | ❌ |
-| 拓扑 2（Workers 无 Node） | ❌ Python 主服务不做分流 | Worker 端口在 `StaticWorkerPool.ports` 中，但无人读取 | ❌ |
+| 拓扑 2（Workers 无 Node） | ❌ Python 主服务不做分流 | Worker 端口在 `StaticWorkerPool.ports` 中，仅被 `start()` 内部健康检查读取；无线上流量分发器读取 | ❌ |
 | 拓扑 3（Node 代理 + Workers） | ✅ Node `classifyRoute` | ✅ 环境变量 `GRADIO_STATIC_WORKER_PORTS` | ✅ |
 
 **拓扑 2 的详细证据**：
@@ -1109,6 +1120,20 @@ Worker 进程是一个**功能完整的独立 FastAPI 应用**，拥有自己的
 `enable_static_workers` 和 `_static_prefixes` 的存在痕迹表明，Python 侧曾计划实现
 分流机制（让主服务根据路径前缀将请求转发到 Worker），但该功能未完成，最终由
 Node 代理侧的 `classifyRoute` 替代实现了同样的分流目标。
+
+#### 术语澄清：「轮询」在本文档中的三种含义
+
+文档中「轮询」一词出现在不同上下文中，含义不同，不可混用：
+
+| 上下文 | 代码位置 | 含义 | 是否涉及线上流量 |
+|--------|---------|------|----------------|
+| 启动阶段健康检查 | [static_server.py:220-227](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/static_server.py#L220-L227) `for _ in range(50): httpx.get(...)` | 重试请求直到 Worker 就绪 | ❌ 仅启动时执行一次 |
+| Python 预留分流接口 | [static_server.py:229-233](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/gradio/static_server.py#L229-L233) `get_next_url()` | Round-Robin 端口选择 | ❌ 零调用点，未参与运行时 |
+| Node 线上流量分发 | [proxy_index.js:74-76](file:///d:/fz/0601/solo-dogfeeding/code/242-gradio/js/app/proxy_index.js#L74-L76) `workerIndex++ % N` | 运行时请求均衡分发 | ✅ 拓扑 3 下实际生效 |
+
+**常见混淆**：将「健康检查重试」或「`get_next_url` 预留接口」误认为线上分流证据。
+前者仅证明 Worker 进程已就绪，后者仅证明 Python 侧曾计划实现分流。
+只有 Node 侧的 `workerIndex` 递增逻辑才是运行时实际生效的流量分发。
 
 ### 11.2 Node 代理如何选择 Worker
 
