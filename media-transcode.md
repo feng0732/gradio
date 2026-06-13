@@ -18,10 +18,11 @@
 ┌──────────────────────────────────────────────────────────────────────┐
 │                         后端 (Python)                                 │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐  │
-│  │  upload 路由  │───▶│ preprocess   │───▶│  用户预测函数        │  │
+│  │ upload 路由  │───▶│ preprocess   │───▶│  用户预测函数        │  │
 │  └──────────────┘    └──────────────┘    └──────────┬───────────┘  │
-│                                                     │                │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────▼───────────┐  │
+│         │            move_files_to_cache            │                │
+│         ▼                    ▲                      ▼                │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐  │
 │  │  file 路由   │◀───│ postprocess  │◀───│  move_files_to_cache │  │
 │  └──────────────┘    └──────────────┘    └──────────────────────┘  │
 └──────────────────────────────────────────────────────────────────────┘
@@ -55,7 +56,16 @@ Upload.svelte
 
 **路由**：[routes.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/routes.py#L1738-L1772) 中的 `upload_file`
 
-**落盘位置**：`app.uploaded_file_dir`（上传文件暂存目录）
+**落盘函数**：[upload_fn()](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/route_utils.py#L1258-L1320)
+
+**落盘位置**：`app.uploaded_file_dir`
+
+落盘目录结构：
+```
+{uploaded_file_dir}/{sha256_hash}/{filename}
+```
+
+其中 `sha256_hash` 是文件内容的哈希，用于去重。
 
 **核心逻辑**：
 ```python
@@ -68,6 +78,12 @@ output_files, files_to_copy, locations = await upload_fn(
     force_move=False,
     upload_progress=file_upload_statuses if upload_id else None,
 )
+
+# 后台异步将文件从临时位置移动到最终位置
+if files_to_copy:
+    bg_tasks.add_task(
+        move_uploaded_files_to_cache, files_to_copy, locations
+    )
 ```
 
 **返回格式**：`FileData` 对象列表
@@ -82,15 +98,147 @@ FileData(
 
 ---
 
-## 3. 格式处理（转码）
+## 3. 文件缓存与 URL 生成机制
+
+### 3.1 缓存目录层级
+
+Gradio 有三层文件存储，各司其职：
+
+| 层级 | 目录变量 | 位置来源 | 用途 | 生命周期 |
+|------|---------|---------|------|---------|
+| 第一层 | `uploaded_file_dir` | `get_upload_folder()` | 上传文件暂存 | 请求期间 |
+| 第二层 | `GRADIO_CACHE` (block cache) | `get_upload_folder()` | 处理后的媒体文件缓存 | 组件生命周期 |
+| 第三层 | 系统临时目录 | `tempfile.gettempdir()` | 转码过程中的临时文件 | 函数调用结束 |
+
+> **注意**：`uploaded_file_dir` 和 `GRADIO_CACHE` 实际上是同一个根目录（都是 `get_upload_folder()`），它们的区别在于：
+> - `uploaded_file_dir` 是上传路由使用的目录变量名
+> - `GRADIO_CACHE` 是每个 Block 实例持有的缓存目录变量名
+> - 两者都指向 `GRADIO_TEMP_DIR` 环境变量或 `{tempdir}/gradio`
+
+### 3.2 move_files_to_cache 详解
+
+**位置**：[processing_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/processing_utils.py#L431-L502)
+
+**核心作用**：
+1. 将文件从上传目录/用户路径移动/复制到 block cache
+2. 生成可访问的 URL（`/file=...` 或 `/stream/...`）
+3. 安全检查（SSRF 防护、路径白名单）
+
+**调用时机（共 4 个场景）**：
+
+| 调用场景 | 代码位置 | 方向 | 参数 |
+|---------|---------|------|------|
+| 组件初始化 | [base.py L214](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/components/base.py#L214-L219) | 初始值 → 前端 | `postprocess=True, keep_in_cache=True` |
+| 输入 preprocess 前 | [blocks.py L1849](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/blocks.py#L1849-L1853) | 前端上传 → 后端 | `check_in_upload_folder=True` |
+| 输出 postprocess 后 | [blocks.py L2062](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/blocks.py#L2062-L2066) | 后端输出 → 前端 | `postprocess=True` |
+| 流式输出 | [blocks.py L2127](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/blocks.py#L2127-L2131) | 流式输出 → 前端 | `postprocess=True` |
+
+**URL 生成规则**：
+```python
+# 普通文件
+url = f"{API_PREFIX}/file={payload.path}"
+
+# 流式文件（is_stream=True）
+url = f"{API_PREFIX}/stream/" + ...
+```
+
+### 3.3 move_resource_to_block_cache
+
+Block 级别的文件缓存方法，是 move_files_to_cache 的底层实现之一。
+
+**同步版本**：[blocks.py L375](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/blocks.py#L375-L410)
+**异步版本**：[blocks.py L335](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/blocks.py#L335-L373)
+
+**处理逻辑**：
+- 如果是 HTTP URL：下载到 cache dir（SSRF 防护）
+- 如果是本地路径且不在 cache dir 内：复制到 cache dir
+- 如果已经在 cache dir 内：直接返回路径
+- 所有文件路径记入 `self.temp_files` 集合，用于生命周期管理
+
+---
+
+## 4. 两种文件 URL：/file= 与 /stream/
+
+### 4.1 /file= URL（普通文件服务）
+
+**路由**：[routes.py L1082-L1086](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/routes.py#L1082-L1086)
+```
+GET  /gradio_api/file={path}
+HEAD /gradio_api/file={path}
+```
+
+**处理函数**：[file_fetch()](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/route_utils.py#L1190-L1256)
+
+**特点**：
+- 直接从磁盘读取文件
+- 支持 HTTP Range 请求（断点续传/拖动播放）
+- 有完整的安全检查（路径白名单、目录遍历防护）
+- MIME 类型判断：安全类型 inline 播放，其他 attachment 下载
+- 用于所有非流式的媒体文件播放
+
+**安全机制**：
+```python
+# 路径白名单检查
+allowed, reason = is_allowed_file(
+    abs_path,
+    blocked_paths=blocks_or_config.blocked_paths,
+    allowed_paths=blocks_or_config.allowed_paths + _StaticFiles.all_paths,
+    created_paths=[upload_dir, str(get_cache_folder())],
+)
+```
+
+### 4.2 /stream/ URL（HLS 流媒体服务）
+
+**路由**：
+- Playlist：`/gradio_api/stream/{session_hash}/{run}/{component_id}/playlist.m3u8`
+- 分片：`/gradio_api/stream/{session_hash}/{run}/{component_id}/{segment_id}.{ext}`
+- 合并文件：`/gradio_api/stream/{session_hash}/{run}/{component_id}/playlist-file`
+
+**实现位置**：[routes.py L1104-L1180](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/routes.py#L1104-L1180)
+
+**存储结构**：[MediaStream 类](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/route_utils.py#L1062-L1082)
+```python
+class MediaStream:
+    segments: list[MediaStreamChunk]   # 内存中的分片列表
+    combined_file: str | None           # 合并后的文件路径
+    ended: bool                         # 流是否结束
+    max_duration: int                   # 最大分片时长
+```
+
+**特点**：
+- 分片数据存储在**内存**中（MediaStream 对象）
+- 使用 HLS 协议（m3u8 播放列表 + ts/aac 分片）
+- 支持渐进式播放（边生成边播放）
+- 流结束后可合并为完整文件
+
+**两种分片格式**：
+| 类型 | 扩展名 | MIME 类型 | 适用组件 |
+|------|--------|----------|---------|
+| 视频 | `.ts` | `video/MP2T` | Video |
+| 音频 | `.aac` | `audio/aac` | Audio |
+
+### 4.3 对比总结
+
+| 维度 | /file= | /stream/ |
+|------|--------|----------|
+| 数据来源 | 磁盘文件 | 内存中的 MediaStream 对象 |
+| 协议 | HTTP 静态文件 | HLS (m3u8 + 分片) |
+| 适用场景 | 普通媒体文件播放 | 流式输出（边生成边播放） |
+| 支持 Range | 是 | 否（由 HLS 分片机制处理） |
+| 生命周期 | 取决于 cache 清理策略 | session/run 生命周期 |
+| 组件范围 | 所有文件类组件 | StreamingOutput 组件（开启 streaming） |
+
+---
+
+## 5. 格式处理（转码）
 
 格式处理发生在两个阶段：**preprocess**（输入处理）和 **postprocess**（输出处理）。
 
-### 3.1 Video 格式处理
+### 5.1 Video 格式处理
 
 **核心文件**：[video.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/components/video.py)
 
-#### 3.1.1 Preprocess（输入 → 用户函数）
+#### 5.1.1 Preprocess（输入 → 用户函数）
 
 [video.py preprocess](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/components/video.py#L191-L251)
 
@@ -121,7 +269,7 @@ elif not self.include_audio:
 
 **返回值**：文件路径字符串（传给用户函数）
 
-#### 3.1.2 Postprocess（用户函数 → 输出）
+#### 5.1.2 Postprocess（用户函数 → 输出）
 
 [video.py postprocess](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/components/video.py#L253-L353) → `_format_video()`
 
@@ -151,11 +299,11 @@ elif not self.include_audio:
 
 **返回值**：`FileData` 对象
 
-### 3.2 Audio 格式处理
+### 5.2 Audio 格式处理
 
 **核心文件**：[audio.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/components/audio.py)
 
-#### 3.2.1 Preprocess（输入 → 用户函数）
+#### 5.2.1 Preprocess（输入 → 用户函数）
 
 [audio.py preprocess](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/components/audio.py#L228-L267)
 
@@ -182,7 +330,7 @@ return audio.frame_rate, data
 - 如果不需要转换：直接返回原路径
 - 如果需要转换：先读成 numpy，再用 `audio_to_file()` 写出指定格式
 
-#### 3.2.2 Postprocess（用户函数 → 输出）
+#### 5.2.2 Postprocess（用户函数 → 输出）
 
 [audio.py postprocess](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/components/audio.py#L269-L319)
 
@@ -190,7 +338,7 @@ return audio.frame_rate, data
 
 | 输入类型 | 处理方式 |
 |---------|---------|
-| `bytes` | 保存到缓存，自动检测格式 |
+| `bytes` | 保存到缓存，自动检测格式（wav/mp3） |
 | `(sample_rate, data)` tuple | 用 `save_audio_to_cache()` 保存为指定格式（默认 wav） |
 | `str` / `Path` 文件路径 | 如需格式转换则转换，否则直接使用 |
 | `None` | 返回 None |
@@ -204,64 +352,100 @@ return audio.frame_rate, data
 
 ---
 
-## 4. 文件缓存与 URL 生成
+## 6. Video 与 Audio 可播放性保障对比
 
-### 4.1 move_files_to_cache
+这是 Video 和 Audio 组件在设计上最重要的差异之一。
 
-**位置**：[processing_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/processing_utils.py#L431-L502)
+### 6.1 Video：主动保障浏览器可播放
 
-**调用时机**：
-- preprocess 之前（输入数据）
-- postprocess 之后（输出数据）
-- 组件初始化时（初始值）
+Video 组件有**完整的浏览器兼容性检查和自动转码机制**，确保输出视频一定能在浏览器中播放。
 
-**核心作用**：
-1. 将文件从上传目录/用户路径移动到 block cache
-2. 生成可访问的 URL（`/file=...` 或 `/stream/...`）
-3. 安全检查（SSRF 防护、路径白名单）
+**保障机制**：
+1. **格式检测**：用 `ffprobe` 检测容器格式和视频编码
+2. **可播放判定**：对照白名单（mp4+h264, webm+vp9 等）
+3. **自动转码**：不可播放则自动转成 mp4(h264)
+4. **失败回退**：转码失败则返回原文件（尽力而为）
 
-**URL 生成规则**：
+**相关代码**：
 ```python
-# 普通文件
-url = f"{API_PREFIX}/file={payload.path}"
+# processing_utils.py L1071-L1124
+def video_is_playable(video_filepath: str) -> bool:
+    # 用 ffprobe 检测容器和编码
+    probe = FFprobe(...)
+    video_codec = output["streams"][0]["codec_name"]
+    return (container, video_codec) in [
+        (".mp4", "h264"), (".mp4", "av1"),
+        (".webm", "vp9"), (".webm", "vp8"), (".webm", "av1"),
+        (".ogg", "theora"),
+    ]
 
-# 流式文件
-url = f"{API_PREFIX}/stream/" + ...
+def convert_video_to_playable_mp4(video_path: str) -> str:
+    # 自动转成 mp4（默认 h264 编码）
+    ff = FFmpeg(...)
+    ff.run()
 ```
 
-### 4.2 缓存目录
+**设计理念**：
+- 视频编码格式繁多（h264, h265, vp9, av1, theora 等），容器格式也多（mp4, mkv, avi, mov 等）
+- 浏览器支持的组合非常有限
+- 用户可能上传任意格式的视频，必须主动保障可播放性
+- 因此 Video 组件承担了"浏览器兼容性守门员"的角色
 
-| 目录 | 用途 | 生命周期 |
-|------|------|---------|
-| `uploaded_file_dir` | 上传文件暂存 | 请求期间 |
-| `GRADIO_CACHE` (block cache) | 处理后的媒体文件 | 组件生命周期 |
-| `tempfile.gettempdir()/gradio` | 临时文件 | 进程退出后清理 |
+### 6.2 Audio：按格式透传或转写
+
+Audio 组件**没有浏览器可播放性检查**，采用"按 format 参数透传/转码"的策略。
+
+**核心差异**：
+- 没有类似 `audio_is_playable()` 的检测函数
+- 没有自动转码为浏览器兼容格式的逻辑
+- 完全依赖 `format` 参数控制输出格式
+- `format=None` 时原样透传，能否播放依赖浏览器
+
+**format 参数行为**：
+
+| format 值 | 输入为文件路径 | 输入为 numpy tuple |
+|-----------|--------------|------------------|
+| `None` | 原样透传，不转换 | 默认保存为 wav |
+| `"wav"` | 转换为 wav | 保存为 wav |
+| `"mp3"` | 转换为 mp3 | 保存为 mp3 |
+
+**相关代码**：
+```python
+# audio.py postprocess L304-L316
+if self.format is not None and original_suffix != f".{self.format}":
+    # 只有 format 明确指定时才转换
+    sample_rate, data = processing_utils.audio_from_file(str(value))
+    file_path = processing_utils.save_audio_to_cache(
+        data, sample_rate, format=self.format, ...
+    )
+else:
+    # 否则直接使用原文件
+    file_path = str(value)
+```
+
+**设计理念**：
+- 音频格式相对简单，主流浏览器普遍支持 wav, mp3, ogg, flac 等
+- `format` 参数让用户明确控制输出格式
+- numpy 输入默认用 wav（无损、通用）
+- 整体更"轻量"，依赖浏览器原生能力
+
+### 6.3 对比总结表
+
+| 维度 | Video | Audio |
+|------|-------|-------|
+| 可播放性检测 | 有（`video_is_playable()` + ffprobe） | 无 |
+| 自动转码保障 | 有（不可播放则转 mp4/h264） | 无（依赖 format 参数） |
+| format 参数作用 | 输入输出格式转换 + 浏览器兼容 | 输入输出格式转换 |
+| format=None 行为 | 仍会做浏览器兼容性检查 | 原样透传（文件）/ 默认 wav（numpy） |
+| 转码工具 | ffmpy（直接调用 ffmpeg） | pydub（封装 ffmpeg） |
+| 失败处理 | 转码失败返回原文件（警告） | 依赖 pydub/ffmpeg 抛出异常 |
+| 编码考虑 | 必须考虑视频编码（h264, vp9 等） | 不单独考虑编码，由格式决定 |
 
 ---
 
-## 5. 浏览器播放
+## 7. 浏览器播放
 
-### 5.1 文件服务路由
-
-**路由**：[routes.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/routes.py#L1082-L1086)
-```
-GET /gradio_api/file={path}
-HEAD /gradio_api/file={path}
-```
-
-**处理函数**：[file_fetch()](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/route_utils.py#L1190-L1249)
-
-**安全机制**：
-- 路径白名单检查
-- 禁止目录遍历
-- SSRF 防护（外部 URL 走代理）
-- 范围请求支持（Range 头）
-
-**MIME 类型处理**：
-- 安全 MIME 类型（视频/音频/图片等）→ `inline` 内联播放
-- 其他类型 → `attachment` 附件下载
-
-### 5.2 Video 播放
+### 7.1 Video 播放
 
 **播放组件**：
 - 静态模式：[VideoPreview.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/video/shared/VideoPreview.svelte)
@@ -280,21 +464,30 @@ HEAD /gradio_api/file={path}
 - 库：`@ffmpeg/ffmpeg` + `@ffmpeg/util`
 - 加载方式：从 `/static/ffmpeg/` 加载 WASM 核心
 
-### 5.3 Audio 播放
+### 7.2 Audio 播放
 
 **播放组件**：
 - 静态模式：[StaticAudio.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/audio/static/StaticAudio.svelte)
 - 播放器：[AudioPlayer.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/audio/player/AudioPlayer.svelte)
 
-**播放方式**：HTML5 `<audio>` 标签 + 波形可视化
+**两种播放模式**：
 
-**支持格式**：浏览器原生支持的音频格式（wav, mp3, ogg, flac 等）
+| 模式 | 实现 | 适用场景 |
+|------|------|---------|
+| 波形模式 | WaveSurfer.js + 隐藏 `<audio>` | `show_recording_waveform=True`（默认） |
+| 原生模式 | 原生 `<audio>` 控件 | `show_recording_waveform=False` 或 流式 |
+
+**播放方式**：
+- 非流式：加载完整文件到 WaveSurfer.js 或 `<audio>`
+- 流式：HLS.js 播放 m3u8 流媒体
+
+**支持格式**：依赖浏览器原生支持（wav, mp3, ogg, flac, aac 等）
 
 ---
 
-## 6. 流媒体（Streaming）
+## 8. 流媒体（Streaming）
 
-### 6.1 Video 流媒体
+### 8.1 Video 流媒体
 
 **输出流媒体**：
 - 格式：`.ts` (MPEG-TS) + H.264 编码
@@ -306,7 +499,7 @@ HEAD /gradio_api/file={path}
 **流合并**：[combine_stream()](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/components/video.py#L526-L581)
 - 将多个 .ts 片段用 ffmpeg concat 合并为一个 mp4
 
-### 6.2 Audio 流媒体
+### 8.2 Audio 流媒体
 
 **输出流媒体**：
 - 格式：`.aac` (ADTS 容器)
@@ -318,55 +511,160 @@ HEAD /gradio_api/file={path}
 
 ---
 
-## 7. 边界总结
+## 9. 全流程时序：以文件上传到播放为例
 
-### 7.1 前端 ↔ 后端边界
+### 9.1 Video 输入输出完整链路
+
+```
+前端上传
+  │
+  ▼
+POST /gradio_api/upload
+  │  (multipart/form-data)
+  ▼
+upload_fn()  →  落盘到 uploaded_file_dir/{hash}/{filename}
+  │
+  ▼
+返回 FileData(path=..., orig_name=...)
+  │
+  ▼
+前端发起 predict 请求（携带 FileData）
+  │
+  ▼
+async_move_files_to_cache()  ←─── preprocess 前的安全检查
+  │  check_in_upload_folder=True
+  ▼
+Video.preprocess()
+  │  ├─ 格式转换（如 format 指定）
+  │  ├─ 翻转（webcam + mirror）
+  │  └─ 去音频（include_audio=False）
+  │
+  ▼
+用户函数（接收文件路径字符串）
+  │
+  ▼
+Video.postprocess() → _format_video()
+  │  ├─ URL 直返？
+  │  ├─ 下载 URL 到缓存
+  │  ├─ 浏览器可播放性检查（ffprobe）
+  │  ├─ 不可播放则转 mp4(h264)
+  │  ├─ 按 format 转换（如有）
+  │  └─ 水印（如有）
+  │
+  ▼
+async_move_files_to_cache() ←─── postprocess 后生成 URL
+  │  postprocess=True
+  │  生成 /file=... URL
+  ▼
+前端接收 FileData(url=...)
+  │
+  ▼
+<video src="/file=..."> 播放
+```
+
+### 9.2 Audio 输入输出完整链路
+
+```
+前端上传
+  │
+  ▼
+POST /gradio_api/upload
+  │  (multipart/form-data)
+  ▼
+upload_fn()  →  落盘到 uploaded_file_dir/{hash}/{filename}
+  │
+  ▼
+返回 FileData(path=..., orig_name=...)
+  │
+  ▼
+前端发起 predict 请求（携带 FileData）
+  │
+  ▼
+async_move_files_to_cache()  ←─── preprocess 前的安全检查
+  │  check_in_upload_folder=True
+  ▼
+Audio.preprocess()
+  │  ├─ type=numpy: pydub 读取 → (sample_rate, np.array)
+  │  └─ type=filepath: 按需转换格式 → 文件路径
+  │
+  ▼
+用户函数（接收 tuple 或文件路径）
+  │
+  ▼
+Audio.postprocess()
+  │  ├─ bytes → save_bytes_to_cache（自动检测格式）
+  │  ├─ tuple → save_audio_to_cache（format 指定或默认 wav）
+  │  ├─ 文件路径 → 按需转换格式（format 指定时）
+  │  └─ 无浏览器可播放性检查
+  │
+  ▼
+async_move_files_to_cache() ←─── postprocess 后生成 URL
+  │  postprocess=True
+  │  生成 /file=... URL
+  ▼
+前端接收 FileData(url=...)
+  │
+  ▼
+WaveSurfer.js / <audio src="/file=..."> 播放
+```
+
+---
+
+## 10. 边界总结
+
+### 10.1 前端 ↔ 后端边界
 
 | 边界 | 传输格式 | 协议 |
 |------|---------|------|
 | 上传 | multipart/form-data | HTTP POST |
 | 下载播放 | 原始媒体文件 | HTTP GET (Range 支持) |
-| 流式输出 | HLS / SSE | HTTP 长连接 |
+| 流式输出 | HLS (m3u8 + ts/aac) | HTTP 长连接 |
 
-### 7.2 落盘 ↔ 格式处理边界
+### 10.2 落盘 ↔ 格式处理边界
 
 | 阶段 | 文件位置 | 格式 | 责任方 |
 |------|---------|------|--------|
-| 上传后 | uploaded_file_dir | 原始格式 | 上传路由 |
+| 上传后 | uploaded_file_dir/{hash}/ | 原始格式 | 上传路由 |
+| move_files_to_cache 后 | block cache（同目录不同 hash 子目录） | 原始格式 | move_files_to_cache |
 | preprocess 后 | block cache | 用户指定格式 / 原始格式 | 组件 preprocess |
 | 用户函数中 | 用户代码决定 | 任意（路径或 numpy） | 用户函数 |
-| postprocess 后 | block cache | 浏览器可播放格式 | 组件 postprocess |
+| postprocess 后 | block cache | 浏览器可播放格式（Video）/ 指定格式（Audio） | 组件 postprocess |
 
-### 7.3 格式处理 ↔ 浏览器播放边界
+### 10.3 格式处理 ↔ 浏览器播放边界
 
-| 介质 | 后端保证的播放格式 | 前端播放方式 |
-|------|------------------|------------|
-| Video | mp4(h264/av1), webm(vp9/vp8/av1), ogg(theora) | HTML5 `<video>` |
-| Audio | wav, mp3 等浏览器支持的格式 | HTML5 `<audio>` |
+| 介质 | 后端保证 | 前端播放方式 |
+|------|---------|------------|
+| Video | 一定是浏览器可播放格式（mp4+h264 等组合） | HTML5 `<video>` |
+| Audio | 按 format 参数透传或转换，不保证浏览器兼容 | WaveSurfer.js / HTML5 `<audio>` |
 
-### 7.4 FFmpeg 使用位置
+### 10.4 FFmpeg 使用位置
 
 | 位置 | 用途 | 实现方式 |
 |------|------|---------|
 | 后端 Video preprocess | 格式转换、翻转、去音轨 | ffmpy 封装系统 ffmpeg |
 | 后端 Video postprocess | 浏览器兼容性转换、水印 | ffmpy 封装系统 ffmpeg |
+| 后端 Video 可播放性检测 | ffprobe 检测容器和编码 | ffmpy 封装系统 ffprobe |
 | 后端 Audio 处理 | 格式转换、读写文件 | pydub（底层 ffmpeg） |
 | 后端 Video 流式 | mp4 → ts 转换 | ffmpy 封装系统 ffmpeg |
+| 后端 Audio 流式 | 转 ADTS/AAC | pydub（底层 ffmpeg） |
 | 前端 Video | 视频裁剪 | @ffmpeg/ffmpeg (WASM) |
 
 ---
 
-## 8. 关键文件索引
+## 11. 关键文件索引
 
 | 文件 | 作用 |
 |------|------|
 | [gradio/components/video.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/components/video.py) | Video 组件后端逻辑 |
 | [gradio/components/audio.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/components/audio.py) | Audio 组件后端逻辑 |
-| [gradio/processing_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/processing_utils.py) | 媒体处理工具函数 |
+| [gradio/processing_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/processing_utils.py) | 媒体处理工具函数（转码、缓存等） |
+| [gradio/route_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/route_utils.py) | 上传函数、文件获取、MediaStream 类 |
+| [gradio/routes.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/routes.py) | 上传/文件服务/流媒体路由 |
+| [gradio/blocks.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/blocks.py) | move_resource_to_block_cache、流处理调度 |
+| [gradio/components/base.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/components/base.py) | 组件基类，初始化时 move_files_to_cache |
 | [gradio/_vendor/ffmpy/ffmpy.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/_vendor/ffmpy/ffmpy.py) | FFmpeg Python 封装 |
-| [gradio/routes.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/routes.py) | 上传/文件服务路由 |
-| [gradio/route_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/gradio/route_utils.py) | 文件获取安全检查 |
 | [js/video/shared/InteractiveVideo.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/video/shared/InteractiveVideo.svelte) | Video 前端交互组件 |
 | [js/video/shared/utils.ts](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/video/shared/utils.ts) | 前端 FFmpeg WASM 封装 |
 | [js/audio/interactive/InteractiveAudio.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/audio/interactive/InteractiveAudio.svelte) | Audio 前端交互组件 |
+| [js/audio/player/AudioPlayer.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/audio/player/AudioPlayer.svelte) | Audio 播放器（WaveSurfer.js） |
 | [js/upload/src/Upload.svelte](file:///d:/fz/0601/solo-dogfeeding/code/252-gradio/js/upload/src/Upload.svelte) | 通用上传组件 |
