@@ -1,281 +1,103 @@
-# Gradio 取消事件中断路径分析
+# Gradio 取消事件中断路径：五条路径的差异分析
 
-本文从代码实现角度，深入分析 Gradio 中取消事件触发后的完整中断路径，包括取消配置、队列任务处理和资源回收机制。
-
-## 目录
-
-1. [整体架构概览](#整体架构概览)
-2. [取消配置层](#取消配置层)
-3. [前端取消执行流](#前端取消执行流)
-4. [后端取消路由处理](#后端取消路由处理)
-5. [队列任务取消机制](#队列任务取消机制)
-6. [资源回收与清理](#资源回收与清理)
-7. [中断路径全景图](#中断路径全景图)
+取消事件在 Gradio 中有五条独立的中断路径，它们对队列事件的失效方式、取消信号的传递方式、以及资源回收的时机各不相同。本文从代码出发，逐一拆解每条路径的具体行为，并对比哪些路径让队列事件真正失效、哪些只发送取消信号。
 
 ---
 
-## 整体架构概览
+## 核心概念：队列事件"失效"的三个层次
 
-Gradio 的取消机制采用**前后端协同**的设计模式：
+在分析五条路径之前，先明确队列事件失效有三个递进的层次：
 
-- **前端**：`DependencyManager` 负责管理依赖关系，在事件触发时自动取消 `cancels` 列表中的依赖
-- **后端**：`/cancel` 路由接收取消请求，通过 `cancel_tasks()` 终止 asyncio 任务，并清理队列和迭代器
-- **队列层**：`Queue` 类维护事件生命周期，通过 `event.alive` 标志位实现协作式取消
+| 层次 | 操作 | 效果 |
+|------|------|------|
+| **L1 等待队列移除** | 从 `EventQueue.queue` 列表中删除 Event 对象 | 事件永远不会被 `get_events()` 选中执行 |
+| **L2 存活标志置假** | 将 `Event.alive` 设为 `False` | `send_message()` 直接返回不发送；`process_events()` 中 alive 检查点跳过该事件 |
+| **L3 asyncio 任务取消** | 对 task 调用 `task.cancel()` | 在下一个 await 点注入 `CancelledError`，强制中断协程执行 |
 
-取消操作的触发方式有两种：
-1. **显式调用**：用户通过 `cancels` 参数配置事件间的取消关系
-2. **隐式触发**：前端 `DependencyManager.dispatch()` 在每次事件派发时自动执行取消逻辑
-
----
-
-## 取消配置层
-
-### 1. `cancels` 参数配置
-
-在事件监听器中，通过 `cancels` 参数指定该事件触发时需要取消的其他事件：
-
-```python
-# events.py 中的 event_trigger 函数
-def event_trigger(
-    ...
-    cancels: dict[str, Any] | list[dict[str, Any]] | None = None,
-    ...
-):
-```
-
-`cancels` 接受一个或多个 `Dependency` 对象（即 `.click()` 等事件的返回值）。
-
-### 2. `set_cancel_events()` 函数
-
-核心配置函数位于 [events.py](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/events.py#L32-L82)：
-
-```python
-def set_cancel_events(
-    triggers: Sequence[EventListenerMethod],
-    cancels: None | dict[str, Any] | list[dict[str, Any]],
-):
-```
-
-**处理逻辑**：
-
-1. **分离普通取消和 Timer 取消**：
-   - 具有 `associated_timer` 属性的取消目标会被特殊处理
-   - Timer 取消通过设置 `Timer(active=False)` 实现
-
-2. **普通取消事件注册**：
-   - 调用 `get_cancelled_fn_indices()` 将 Dependency 对象转换为 fn 索引列表
-   - 调用 `root_block.set_event_trigger()` 创建一个特殊的取消函数
-   - 该函数具有以下特征：
-     - `fn=None`：无实际业务逻辑
-     - `queue=False`：不经过队列
-     - `preprocess=False`：不进行预处理
-     - `api_visibility="private"`：私有 API
-     - `is_cancel_function=True`：标记为取消函数
-     - `cancels=fn_indices_to_cancel`：携带要取消的 fn 索引列表
-
-### 3. `get_cancelled_fn_indices()` 函数
-
-位于 [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/utils.py#L1123-L1135)，负责将 Dependency 配置字典转换为对应的函数索引：
-
-```python
-def get_cancelled_fn_indices(
-    dependencies: list[dict[str, Any]],
-) -> list[int]:
-    fn_indices = []
-    for dep in dependencies:
-        root_block = get_blocks_context()
-        if root_block:
-            fn_index = next(
-                i for i, d in root_block.fns.items() if d.get_config() == dep
-            )
-            fn_indices.append(fn_index)
-    return fn_indices
-```
-
-该函数通过比较配置字典的方式查找对应的 fn 索引，这是因为在 `@gr.render()` 等动态渲染场景下，fn 索引可能会发生偏移。
-
-### 4. `BlockFunction` 中的取消配置
-
-在 [block_function.py](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/block_function.py#L43) 中，`BlockFunction` 类存储取消相关配置：
-
-```python
-class BlockFunction:
-    cancels: list[int] | None = None      # 要取消的 fn 索引列表
-    is_cancel_function: bool = False       # 是否为取消函数本身
-```
-
-`get_config()` 方法会将这些配置暴露给前端：
-
-```python
-def get_config(self):
-    return {
-        ...
-        "cancels": self.cancels,
-        "types": {
-            "generator": self.types_generator,
-            "cancel": self.is_cancel_function,
-        },
-        ...
-    }
-```
+**关键区别**：L1 和 L2 是**数据结构层面的失效**（事件从队列消失或被标记为死亡），L3 是**执行层面的中断**（运行中的代码被强制打断）。三者的组合决定了取消的实际效果。
 
 ---
 
-## 前端取消执行流
+## 路径一：用户主动取消（`cancels` 参数配置）
 
-### 1. `DependencyManager.dispatch()` 入口
+### 触发场景
 
-前端取消的入口位于 [dependency.ts](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/js/core/src/dependency.ts#L324) 的 `dispatch()` 方法：
+开发者在事件监听器中通过 `cancels` 参数声明事件间的取消关系：
+
+```python
+click_event = btn.click(long_running_fn, inputs, outputs)
+stop_btn.click(lambda: None, cancels=[click_event])
+```
+
+### 前端执行：`DependencyManager.cancel()`
+
+入口在 [dependency.ts L338](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/js/core/src/dependency.ts#L338)：
 
 ```typescript
-async dispatch(event_meta: DispatchFunction | DispatchEvent): Promise<void> {
-    // ...
-    for (let i = 0; i < (deps?.length || 0); i++) {
-        const dep = deps ? deps[i] : undefined;
-        if (dep) {
-            this.cancel(dep.cancels);  // 关键：在事件执行前先取消目标依赖
-            // ...后续事件派发逻辑
-        }
-    }
-}
+// dispatch() 中，事件执行前首先执行取消
+this.cancel(dep.cancels);
 ```
 
-**关键点**：取消动作发生在**事件派发的最开始**，确保被取消的事件在新事件开始前就被终止。
+[dependency.ts L811-L849](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/js/core/src/dependency.ts#L811-L849) 的 `cancel()` 方法执行四件事：
 
-### 2. `DependencyManager.cancel()` 方法
+1. **`submission.cancel()`**：向 `/cancel` 发送 HTTP 请求
+2. **`loading_stati.update({ status: "complete" })`**：立即更新 UI，用户感知上事件已结束
+3. **`this.submissions.delete(id)`**：从前端 submissions Map 中删除
+4. **触发 `.failure()` 和 `.then()` 链**：被取消事件的后续链式事件继续执行
 
-位于 [dependency.ts](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/js/core/src/dependency.ts#L811-L849)：
+### 后端执行：`/cancel` 路由
 
-```typescript
-async cancel(ids: number[] | undefined): Promise<void> {
-    if (!ids) return;
-
-    for (const id of ids) {
-        const submission = this.submissions.get(id);
-        if (submission) {
-            await submission.cancel();  // 调用客户端的取消方法
-            
-            // 更新加载状态为完成
-            this.loading_stati.update({
-                status: "complete",
-                fn_index: id,
-                eta: 0,
-                queue: false,
-                stream_state: null
-            });
-            this.update_loading_stati_state();
-            this.submissions.delete(id);
-            
-            // 触发 failure 和 all 链中的后续依赖
-            const { failure, all } = this.dependencies_by_fn
-                .get(id)
-                ?.get_triggers() || { failure: [], all: [] };
-            
-            failure.forEach((dep_id) => {
-                this.dispatch({ type: "fn", fn_index: dep_id, event_data: null, target_id: id });
-            });
-            all.forEach((dep_id) => {
-                this.dispatch({ type: "fn", fn_index: dep_id, event_data: null, target_id: id });
-            });
-        }
-    }
-}
-```
-
-**核心行为**：
-
-1. **调用后端取消**：`submission.cancel()` 发送 HTTP 请求到 `/cancel` 路由
-2. **状态更新**：立即将加载状态设置为 `complete`
-3. **清理 submissions**：从 submissions Map 中删除已取消的任务
-4. **链式触发**：触发被取消事件的 `.failure()` 和 `.then()`（all）链中的后续事件
-
-### 3. 客户端 `cancel()` 实现
-
-位于 `@gradio/client` 的 [submit.ts](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/client/js/src/utils/submit.ts#L110-L138)：
-
-```typescript
-async function cancel(): Promise<void> {
-    let cancel_request = { event_id, session_hash, fn_index };
-    
-    if ("event_id" in cancel_request) {
-        await fetch(`${config.root}${api_prefix}/${CANCEL_URL}`, {
-            headers: { "Content-Type": "application/json" },
-            method: "POST",
-            body: JSON.stringify(cancel_request)
-        });
-    }
-    
-    // 同时调用 /reset 端点（历史遗留，实际逻辑已移至 /cancel）
-    await fetch(`${config.root}${api_prefix}/${RESET_URL}`, { ... });
-}
-```
-
-**请求体**（`CancelBody`）包含三个关键字段：
-- `session_hash`：会话标识
-- `fn_index`：函数索引
-- `event_id`：事件唯一标识
-
----
-
-## 后端取消路由处理
-
-### 1. `/cancel` 路由
-
-位于 [routes.py](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1401-L1429)：
+[routes.py L1401-L1429](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1401-L1429) 执行五个步骤：
 
 ```python
 @router.post("/cancel")
 async def cancel_event(body: CancelBody):
-    # 步骤1：取消 asyncio 任务
+    # ① L3: 取消 asyncio 任务（仅发信号）
     await cancel_tasks({f"{body.session_hash}_{body.fn_index}"})
     
-    blocks = app.get_blocks()
+    # ② 检查会话和事件状态
+    session_open = body.session_hash in blocks._queue.pending_messages_per_session
+    event_running = body.event_id in blocks._queue.pending_event_ids_session.get(body.session_hash, {})
     
-    # 步骤2：检查会话和事件状态
-    session_open = (
-        body.session_hash in blocks._queue.pending_messages_per_session
-    )
-    event_running = (
-        body.event_id
-        in blocks._queue.pending_event_ids_session.get(body.session_hash, {})
-    )
-    
-    # 步骤3：从队列中移除
+    # ③ L1: 从等待队列移除
     await blocks._queue.remove_from_queue(body.event_id)
     
-    # 步骤4：发送完成消息（让客户端断开连接）
+    # ④ 发送完成消息让客户端正常断开
     if session_open and event_running:
-        message = ProcessCompletedMessage(
-            output={}, success=True, event_id=body.event_id
+        blocks._queue.pending_messages_per_session[body.session_hash].put_nowait(
+            ProcessCompletedMessage(output={}, success=True, event_id=body.event_id)
         )
-        blocks._queue.pending_messages_per_session[
-            body.session_hash
-        ].put_nowait(message)
     
-    # 步骤5：清理迭代器资源
+    # ⑤ 迭代器清理
     if body.event_id in app.iterators:
         async with app.lock:
-            try:
-                await safe_aclose_iterator(app.iterators[body.event_id])
-            except Exception:
-                pass
+            await safe_aclose_iterator(app.iterators[body.event_id])
             del app.iterators[body.event_id]
             app.iterators_to_reset.add(body.event_id)
-    
-    return {"success": True}
 ```
 
-**处理流程（5 个步骤）**：
+### 本路径覆盖的失效层次
 
-1. **任务取消**：通过 `cancel_tasks()` 终止对应的 asyncio 任务
-2. **状态检查**：确认会话是否打开、事件是否仍在运行
-3. **队列移除**：从等待队列中移除事件
-4. **消息通知**：向 SSE 流发送 `ProcessCompletedMessage`，使客户端正常结束
-5. **迭代器清理**：关闭并删除生成器/迭代器，防止资源泄漏
+| 层次 | 是否覆盖 | 代码位置 |
+|------|---------|---------|
+| L1 等待队列移除 | ✅ | `remove_from_queue()` L1413 |
+| L2 alive 置假 | ❌ | **不设置** `event.alive = False` |
+| L3 任务取消信号 | ✅ | `cancel_tasks()` L1403 |
 
-### 2. `cancel_tasks()` 函数
+### 关键发现：`/cancel` 不设置 `event.alive = False`
 
-位于 [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/utils.py#L1102-L1115)：
+这是最容易被忽略的细节。`/cancel` 路由中调用的是 `remove_from_queue()`，而非 `clean_events()`。两者的核心区别：
+
+- `remove_from_queue()`：仅从等待队列列表和 `event_ids_to_events` 字典中删除，**不修改 `alive` 标志**
+- `clean_events()`：既从队列删除，**又将 `alive` 设为 `False`**
+
+这意味着：如果事件已经在执行中（已从等待队列移出、进入 `active_jobs`），`remove_from_queue()` 的 L1 操作实际上无效（事件已不在等待队列中），而 L2 操作（`alive = False`）又没有执行。此时唯一生效的是 L3 的 `cancel_tasks()` 信号。
+
+**但** L3 信号对普通同步函数无效——`task.cancel()` 只在 `await` 点生效，如果 `call_process_api()` 内部正在运行一个不 yield 的同步函数，`CancelledError` 会被延迟到该函数执行完毕。
+
+### `cancel_tasks()` 的信号机制
+
+[utils.py L1102-L1115](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/utils.py#L1102-L1115)：
 
 ```python
 async def cancel_tasks(task_ids: set[str]) -> list[str]:
@@ -289,49 +111,26 @@ async def cancel_tasks(task_ids: set[str]) -> list[str]:
         if task_id in task_ids:
             matching_tasks.append(task)
             event_ids.append(event_id)
-            task.cancel()  # 发送取消信号
+            task.cancel()
     await asyncio.gather(*matching_tasks, return_exceptions=True)
     return event_ids
 ```
 
-**实现机制**：
-
-- 使用 **task 名称约定**来识别 Gradio 任务：`{session_hash}_{fn_index}<gradio-sep>{event_id}`
-- 通过 `task.cancel()` 发送 `CancelledError` 异常（协作式取消，任务需在 await 点响应）
-- `asyncio.gather(..., return_exceptions=True)` 等待所有任务完成并吸收异常
-
-### 3. `/reset` 路由（历史遗留）
-
-位于 [routes.py](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1189-L1193)：
-
-```python
-@router.post("/reset/")
-@router.post("/reset")
-async def reset_iterator(body: ResetBody):
-    # No-op, all the cancelling/reset logic handled by /cancel
-    return {"success": True}
-```
-
-该端点已退化为空操作，所有取消/重置逻辑已移至 `/cancel` 路由。保留仅是为了向后兼容。
+- 通过 task 命名约定 `{session_hash}_{fn_index}<gradio-sep>{event_id}` 定位目标任务
+- `task.cancel()` 是**纯信号**：仅在下一个 `await` 点注入 `CancelledError`
+- `asyncio.gather(..., return_exceptions=True)` 等待任务真正结束（吸收异常）
 
 ---
 
-## 队列任务取消机制
+## 路径二：等待队列移除
 
-### 1. Event 类的生命周期标志
+### 触发场景
 
-位于 [queueing.py](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L54-L91) 的 `Event` 类维护两个关键标志：
+事件已进入 `EventQueue.queue` 排队，尚未被 `get_events()` 选中执行。此时取消只需要从队列列表中移除即可。
 
-```python
-class Event:
-    alive = True      # 事件是否存活（取消时设为 False）
-    closed = False    # 流事件是否已关闭
-    signal = asyncio.Event()  # 用于流式事件的同步信号
-```
+### 执行方法：`remove_from_queue()`
 
-### 2. 从队列移除：`remove_from_queue()`
-
-位于 [queueing.py](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L470-L479)：
+[queueing.py L470-L479](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L470-L479)：
 
 ```python
 async def remove_from_queue(self, event_id: str):
@@ -346,24 +145,151 @@ async def remove_from_queue(self, event_id: str):
                 pass
 ```
 
-**适用场景**：事件仍在**等待队列**中尚未执行时，直接从队列中移除即可。
+### 本路径覆盖的失效层次
 
-### 3. 事件清理：`clean_events()`
+| 层次 | 是否覆盖 | 说明 |
+|------|---------|------|
+| L1 等待队列移除 | ✅ | 从 `EventQueue.queue` 列表中删除 |
+| L2 alive 置假 | ❌ | 不修改 `alive` |
+| L3 任务取消信号 | ❌ | 无需取消（任务尚未创建） |
 
-位于 [queueing.py](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L631-L657)：
+### 为什么不需要 L2 和 L3
+
+事件在等待队列中时尚未创建 asyncio task（task 在 `start_processing()` 中才通过 `run_coro_in_background()` 创建），所以：
+- 没有 task 可以 cancel
+- `alive` 标志只在 `process_events()` 中被检查，而该函数不会被执行到这个事件
+
+### 调用者
+
+`remove_from_queue()` 只在 `/cancel` 路由中被直接调用。`clean_events()` 内部也做了类似的队列移除操作，但走的是不同的代码路径。
+
+---
+
+## 路径三：执行中任务取消
+
+### 触发场景
+
+事件已被 `get_events()` 取出、进入 `active_jobs`、对应的 asyncio task 正在运行 `process_events()`。
+
+### `cancel_tasks()` 如何中断执行中的任务
+
+`cancel_tasks()` 对执行中任务调用 `task.cancel()`，`CancelledError` 会在以下 await 点之一被注入：
+
+**注入点 1**：[queueing.py L867](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L867)
+```python
+response = await route_utils.call_process_api(...)
+```
+这是首次调用用户函数的 await 点。如果用户函数是同步函数且正在 CPU 上执行，`CancelledError` 会**延迟**到函数执行完毕后的下一个 await 点。
+
+**注入点 2**：[queueing.py L927](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L927)
+```python
+awake_events, closed_events = await Queue.wait_for_batch(awake_events, ...)
+```
+流式事件在等待新数据时的 await 点。
+
+**注入点 3**：[queueing.py L957](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L957)
+```python
+response = await route_utils.call_process_api(...)
+```
+生成器/流式事件的后续调用。
+
+### CancelledError 的传播路径
+
+```
+task.cancel()
+    │
+    ▼ (在 await 点注入 CancelledError)
+    │
+process_events() 内部
+    │
+    ├─► 内层 except Exception (L882/L969) 捕获
+    │       └─► 发送错误消息、设置 response = None
+    │
+    └─► 外层 except Exception (L1043) 捕获
+            └─► traceback.print_exc()
+    
+    finally (L1046):
+        ├─► event_queue.current_concurrency -= 1  ─── 释放并发槽位
+        ├─► active_jobs[index] = None             ─── 释放工作线程
+        ├─► await reset_iterators(event._id)      ─── 迭代器重置
+        └─► event_analytics 状态标记
+```
+
+**注意**：在 Python 3.9+ 中 `CancelledError` 是 `BaseException` 而非 `Exception`，此时 `except Exception` 不会捕获它，`CancelledError` 会直接穿透到 `finally` 块。无论哪种情况，`finally` 块**始终执行**，确保资源回收。
+
+### `alive` 检查点：协作式退出的补充机制
+
+除了 `CancelledError` 强制中断外，`process_events()` 还在两个位置检查 `alive` 标志：
+
+**检查点 1**：[queueing.py L794-L806](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L794-L806)
+```python
+for event in events:
+    if event.alive:
+        self.send_message(event, ProcessStartsMessage(...))
+        awake_events.append(event)
+if not awake_events:
+    return
+```
+
+**检查点 2**：[queueing.py L921-L923](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L921-L923)
+```python
+awake_events = [event for event in awake_events if event.alive]
+if not awake_events:
+    return
+```
+
+但如前所述，`/cancel` 路径**不设置 `alive = False`**，所以这两个检查点在用户主动取消场景下**不会触发**。执行中任务的中断完全依赖 `cancel_tasks()` 的 `CancelledError`。
+
+### 本路径覆盖的失效层次
+
+| 层次 | 是否覆盖 | 说明 |
+|------|---------|------|
+| L1 等待队列移除 | ❌（无效） | 事件已不在等待队列中 |
+| L2 alive 置假 | ❌ | `/cancel` 不调用 `clean_events()` |
+| L3 任务取消信号 | ✅ | `cancel_tasks()` 发出 `CancelledError` |
+
+### 限制：同步函数无法立即中断
+
+如果用户函数是一个长时间运行的同步函数（如 `time.sleep(60)`），`CancelledError` 只能等到该函数执行完毕、控制权回到事件循环后才能生效。这是 Python 协作式多任务的根本限制，不是 Gradio 的设计缺陷。
+
+---
+
+## 路径四：客户端断开清理
+
+### 触发场景
+
+浏览器标签页关闭、网络断开等导致 SSE 连接中断。
+
+### SSE 流检测断开
+
+[routes.py L1493-L1497](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1493-L1497)：
+
+```python
+async def sse_stream(request: fastapi.Request):
+    # ...
+    while True:
+        if await request.is_disconnected():
+            await blocks._queue.clean_events(session_hash=session_hash)
+            heartbeat_task.cancel()
+            return
+```
+
+### `clean_events()` 的完整行为
+
+[queueing.py L631-L657](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L631-L657)：
 
 ```python
 async def clean_events(
     self, *, session_hash: str | None = None, event_id: str | None = None
 ) -> None:
-    # 标记活跃任务中的事件为不存活
+    # ① L2: 将 active_jobs 中匹配的事件标记为死亡
     for job_set in self.active_jobs:
         if job_set:
             for job in job_set:
                 if job.session_hash == session_hash or job._id == event_id:
                     job.alive = False
 
-    # 从等待队列中移除匹配的事件
+    # ② L1: 从所有等待队列中移除匹配的事件
     async with self.delete_lock:
         events_to_remove: list[Event] = []
         for event_queue in self.event_queue_per_concurrency_id.values():
@@ -375,7 +301,7 @@ async def clean_events(
             self.event_queue_per_concurrency_id[event.concurrency_id].queue.remove(event)
             self.event_ids_to_events.pop(event._id, None)
 
-        # 清理 pending_event_ids_session
+        # ③ 清理 pending_event_ids_session
         if session_hash and session_hash in self.pending_event_ids_session:
             removed_ids = {e._id for e in events_to_remove}
             self.pending_event_ids_session[session_hash] -= removed_ids
@@ -383,41 +309,195 @@ async def clean_events(
                 self.pending_event_ids_session.pop(session_hash, None)
 ```
 
-**双维度清理**：
-- 支持按 `session_hash`（会话级别，如客户端断开连接）
-- 支持按 `event_id`（单个事件级别）
+### 本路径覆盖的失效层次
 
-### 4. 执行中的协作式取消：`process_events()`
+| 层次 | 是否覆盖 | 说明 |
+|------|---------|------|
+| L1 等待队列移除 | ✅ | 清除该会话所有等待中的事件 |
+| L2 alive 置假 | ✅ | 标记所有执行中的事件为死亡 |
+| L3 任务取消信号 | ❌ | **不调用 `cancel_tasks()`** |
 
-位于 [queueing.py](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L787-L1081) 的 `process_events()` 方法在多个检查点验证 `event.alive`：
+### 关键差异：不发送取消信号，也不发送完成消息
 
-**检查点 1**：处理开始时（仅处理存活事件）
+客户端断开路径与用户主动取消路径有三个重要差异：
+
+**差异 1：不调用 `cancel_tasks()`**
+
+`clean_events()` 将 `alive` 设为 `False`，但不向 asyncio task 发送 `CancelledError`。执行中的任务会继续运行，直到：
+
+- 遇到 `process_events()` 内的 `alive` 检查点（生成器循环中 L921），主动退出
+- 用户函数自然执行完毕
+
+此时 `send_message()` 被 `alive` 标志截断：
+
+[queueing.py L240-L249](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L240-L249)：
 ```python
-for event in events:
-    if event.alive:
-        self.send_message(event, ProcessStartsMessage(...))
-        awake_events.append(event)
-if not awake_events:
-    return  # 所有事件都已取消，直接返回
+def send_message(self, event, event_message):
+    if not event.alive:
+        return                    # alive=False 时直接返回，不发送任何消息
+    event_message.event_id = event._id
+    messages = self.pending_messages_per_session[event.session_hash]
+    messages.put_nowait(event_message)
 ```
 
-**检查点 2**：生成循环中（每次迭代前检查）
+**差异 2：不发送 `ProcessCompletedMessage`**
+
+`/cancel` 路由会向 SSE 流写入一个 `ProcessCompletedMessage`，让客户端优雅地关闭连接。客户端断开时 SSE 流已经断开，无需也无法发送完成消息。
+
+**差异 3：不清理迭代器**
+
+`clean_events()` 不清理 `app.iterators`。迭代器的清理由 `process_events()` 的 `finally` 块负责——当任务最终结束（自然完成或通过 alive 检查点退出）时，`finally` 块中的 `reset_iterators()` 会清理迭代器。
+
+### CancelledError 路径中的二次清理
+
+[routes.py L1560-L1568](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1560-L1568)：
+
 ```python
-while response and response.get("is_generating", False):
-    # ...发送生成消息...
-    
-    awake_events = [event for event in awake_events if event.alive]
-    if not awake_events:
-        return  # 全部取消，退出循环
+except BaseException as e:
+    # ...
+    if isinstance(e, asyncio.CancelledError):
+        del blocks._queue.pending_messages_per_session[session_hash]
+        await blocks._queue.clean_events(session_hash=session_hash)
 ```
 
-**重要限制**：对于非生成器函数（普通同步函数），一旦开始执行就**无法中断**，只能等待其执行完毕。这是 Python 协作式多任务的本质限制。
+当 SSE 流本身被取消（如服务器关闭时），会再次调用 `clean_events()`，并删除整个会话的消息队列。
 
-### 5. 流式事件的取消
+### 会话级 vs 事件级清理
 
-对于 `connection="stream"` 的流式事件，取消通过 `signal` Event 和 `closed` 标志协作实现：
+`clean_events()` 支持两种粒度：
+- `session_hash`：清理该会话的**所有**事件（客户端断开场景）
+- `event_id`：清理**单个**事件（但目前没有代码使用 `event_id` 参数调用 `clean_events()`）
 
-位于 [routes.py](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1096-L1102)：
+---
+
+## 路径五：迭代器释放
+
+### 两种迭代器清理时机
+
+迭代器释放不是一条独立的"取消路径"，而是取消发生后的**资源回收步骤**。它有两个触发时机：
+
+### 时机 1：`/cancel` 路由中的立即清理
+
+[routes.py L1421-L1428](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1421-L1428)：
+
+```python
+if body.event_id in app.iterators:
+    async with app.lock:
+        try:
+            await safe_aclose_iterator(app.iterators[body.event_id])
+        except Exception:
+            pass
+        del app.iterators[body.event_id]
+        app.iterators_to_reset.add(body.event_id)
+```
+
+这是**即时清理**：取消请求到达后立即关闭迭代器。对于生成器函数，这意味着生成器的 `aclose()` 方法被调用，生成器内的 `finally` 块得以执行。
+
+### 时机 2：`process_events()` finally 块中的兜底清理
+
+[queueing.py L1067-L1072](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L1067-L1072)：
+
+```python
+finally:
+    for event in events:
+        await self.reset_iterators(event._id)
+```
+
+[queueing.py L1082-L1097](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L1082-L1097)：
+
+```python
+async def reset_iterators(self, event_id: str):
+    app = self.server_app
+    if event_id not in app.iterators:
+        return                    # 如果 /cancel 已清理过，直接返回
+    async with app.lock:
+        try:
+            await safe_aclose_iterator(app.iterators[event_id])
+        except Exception:
+            pass
+        del app.iterators[event_id]
+        app.iterators_to_reset.add(event_id)
+```
+
+这是**兜底清理**：无论任务是成功完成、被取消、还是异常退出，`finally` 块都会执行。如果 `/cancel` 已经清理了迭代器，`reset_iterators()` 发现 `event_id not in app.iterators` 就会直接返回。
+
+### 两阶段清理的必要性
+
+| 场景 | 时机1（/cancel立即清理） | 时机2（finally兜底清理） |
+|------|------------------------|------------------------|
+| 用户主动取消 + 生成器正在 yield | ✅ 立即关闭生成器 | ✅ 兜底确认（已清理则跳过） |
+| 用户主动取消 + 普通函数执行中 | ❌ 无迭代器可清理 | ✅ 函数结束后清理 |
+| 客户端断开 | ❌ 不清理迭代器 | ✅ 任务结束后清理 |
+| 任务正常完成 | ❌ 无需取消 | ✅ 清理迭代器 |
+
+**用户主动取消时立即清理迭代器**的原因：生成器函数可能正在 `yield` 中等待，`safe_aclose_iterator()` 调用生成器的 `aclose()`，触发生成器内部的 `finally` 块，使其能够释放内部资源（如数据库连接、文件句柄等）。
+
+---
+
+## 五条路径对比总表
+
+| 维度 | 路径一：用户主动取消 | 路径二：等待队列移除 | 路径三：执行中任务取消 | 路径四：客户端断开 | 路径五：迭代器释放 |
+|------|-------------------|-------------------|-------------------|----------------|----------------|
+| **触发方式** | `cancels` 参数 | 事件在等待队列中 | 事件在 `active_jobs` 中 | SSE 连接断开 | 取消/完成后的资源回收 |
+| **L1 队列移除** | ✅ `remove_from_queue()` | ✅ 队列列表删除 | ❌（已不在队列） | ✅ `clean_events()` 内部 | — |
+| **L2 alive 置假** | ❌ | ❌（无需） | ❌ | ✅ `clean_events()` 内部 | — |
+| **L3 取消信号** | ✅ `cancel_tasks()` | ❌（无 task） | ✅ `cancel_tasks()` | ❌ | — |
+| **发送完成消息** | ✅ `ProcessCompletedMessage` | — | — | ❌ | — |
+| **迭代器清理** | ✅ 立即清理 | — | — | ❌（由 finally 兜底） | ✅ 两阶段 |
+| **对同步函数** | 延迟生效 | N/A | 延迟生效 | 延迟生效 | N/A |
+| **对生成器函数** | 立即中断 | N/A | 在 yield 点中断 | 在 yield 点中断 | 立即关闭生成器 |
+
+---
+
+## 哪些路径让队列事件失效，哪些只发信号
+
+### 让队列事件失效的路径（数据结构层面移除或标记死亡）
+
+**`remove_from_queue()`**（路径一、二的底层操作）：
+- 从 `EventQueue.queue` 列表中删除 Event 对象
+- 从 `event_ids_to_events` 字典中删除映射
+- **效果**：事件从队列数据结构中彻底消失，`get_events()` 永远不会选中它
+
+**`clean_events()`**（路径四的底层操作）：
+- 包含 `remove_from_queue()` 的全部效果
+- **额外**将 `active_jobs` 中匹配事件的 `alive` 设为 `False`
+- **额外**清理 `pending_event_ids_session`
+- **效果**：事件不仅从数据结构中消失，执行中的事件也被标记为"死亡"，`send_message()` 和 `alive` 检查点都会跳过它
+
+### 只发取消信号的路径（不修改队列数据结构）
+
+**`cancel_tasks()`**（路径一、三的信号操作）：
+- 遍历所有 asyncio task，按名称匹配目标
+- 调用 `task.cancel()` 注入 `CancelledError`
+- **不修改** `EventQueue.queue`、`event_ids_to_events`、`Event.alive` 中的任何一个
+- **效果**：仅在 asyncio 协程的 await 点生效，如果任务不在 await 点则无效
+
+### 信号与失效的组合关系
+
+```
+路径一（用户主动取消）= cancel_tasks()（纯信号）+ remove_from_queue()（L1失效）
+                          │                        │
+                          │                        └─ 事件在等待队列：有效移除
+                          │                        └─ 事件在执行中：无效（已不在队列）
+                          │
+                          └─ 事件在执行中：CancelledError 注入
+                          └─ 事件在等待中：无 task 可取消，信号无目标
+
+路径四（客户端断开）= clean_events()（L1+L2失效，无信号）
+                          │
+                          ├─ 事件在等待队列：有效移除
+                          ├─ 事件在执行中：alive=False，send_message() 被截断
+                          └─ 无 CancelledError，同步函数继续运行直到自然结束
+```
+
+---
+
+## 流式事件的特殊取消路径
+
+流式事件（`connection="stream"`）有一条额外的取消路径，不经过 `/cancel` 路由：
+
+[routes.py L1096-L1102](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1096-L1102)：
+
 ```python
 @router.post("/stream/{event_id}/close")
 async def _(event_id: str):
@@ -428,185 +508,77 @@ async def _(event_id: str):
     return {"msg": "success"}
 ```
 
+### 本路径覆盖的失效层次
+
+| 层次 | 是否覆盖 | 说明 |
+|------|---------|------|
+| L1 等待队列移除 | ❌ | 不修改队列 |
+| L2 alive 置假 | ❌ | 不修改 alive |
+| L3 任务取消信号 | ❌ | 不调用 task.cancel() |
+
+这条路径**不使队列事件失效，也不发送取消信号**。它通过设置 `event.closed = True` 和 `event.signal.set()` 让流式事件的 `wait_for_batch()` 超时返回，使 `process_events()` 在下一次循环判断 `event.is_finished` 为 `True` 而正常结束。
+
+这是唯一一条**不中断、不失效，只引导事件自然结束**的路径。
+
 ---
 
-## 资源回收与清理
+## `send_message()` 的 alive 守卫
 
-### 1. 迭代器重置：`reset_iterators()`
+所有路径中，`send_message()` 是消息到达客户端的必经之路。它有一个关键的 `alive` 守卫：
 
-位于 [queueing.py](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L1082-L1097)：
+[queueing.py L240-L249](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L240-L249)：
 
 ```python
-async def reset_iterators(self, event_id: str):
-    app = self.server_app
-    if event_id not in app.iterators:
+def send_message(self, event, event_message):
+    if not event.alive:
         return
-    async with app.lock:
-        try:
-            await safe_aclose_iterator(app.iterators[event_id])
-        except Exception:
-            pass
-        del app.iterators[event_id]
-        app.iterators_to_reset.add(event_id)
+    # ...
 ```
 
-该方法在 `process_events()` 的 `finally` 块中**始终被调用**：
+这意味着：
+- **路径一**（用户取消）没有设置 `alive = False`，但通过 `cancel_tasks()` 使任务在 await 点中断，`process_events()` 不会再调用 `send_message()`
+- **路径四**（客户端断开）设置了 `alive = False`，即使任务仍在运行，所有 `send_message()` 调用都会被截断——这是"静默杀死"执行中任务的方式，任务继续运行但输出被丢弃
+
+---
+
+## `process_events()` finally 块：所有路径的统一终点
+
+无论通过哪条路径取消，只要 `process_events()` 的 task 最终结束（无论是被 CancelledError 中断、alive 检查点退出、还是自然完成），`finally` 块都会执行统一的资源回收：
+
+[queueing.py L1046-L1080](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L1046-L1080)：
 
 ```python
 finally:
-    # ...
+    # 释放并发槽位
+    event_queue.current_concurrency -= 1
+    # 清除启动时间记录
+    start_times = event_queue.start_times_per_fn[fn]
+    if begin_time in start_times:
+        start_times.remove(begin_time)
+    # 释放工作线程
+    self.active_jobs[self.active_jobs.index(events)] = None
+    # 迭代器重置（兜底清理）
     for event in events:
-        # Always reset the state of the iterator
-        # If the job finished successfully, this has no effect
-        # If the job is cancelled, this will enable future runs to start "from scratch"
         await self.reset_iterators(event._id)
+        # 分析标记
+        if event in awake_events:
+            self.event_analytics[event._id]["status"] = "success" if success else "failed"
+        else:
+            self.event_analytics[event._id]["status"] = "cancelled"
 ```
 
-**设计意图**：确保无论任务成功完成还是被取消，迭代器状态都能被正确重置，使后续运行可以"从头开始"。
-
-### 2. `safe_aclose_iterator()` 安全关闭
-
-位于 [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/utils.py) 的安全迭代器关闭工具：
-
-```python
-async def safe_aclose_iterator(iterator):
-    try:
-        if hasattr(iterator, 'aclose'):
-            await iterator.aclose()
-    except Exception:
-        pass  # 静默处理关闭时的异常
-```
-
-### 3. 客户端断开时的资源清理
-
-当客户端断开 SSE 连接时，在 [routes.py](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1494-L1497) 中：
-
-```python
-if await request.is_disconnected():
-    await blocks._queue.clean_events(session_hash=session_hash)
-    heartbeat_task.cancel()
-    return
-```
-
-整个会话的所有事件都会被清理。
-
-### 4. 分析数据标记
-
-在 `process_events()` 的末尾，根据事件最终状态标记分析数据：
-
-```python
-if event in awake_events:
-    self.event_analytics[event._id]["status"] = (
-        "success" if success else "failed"
-    )
-else:
-    self.event_analytics[event._id]["status"] = "cancelled"
-```
+这保证了无论取消路径如何，并发控制（`current_concurrency`）、工作线程（`active_jobs`）和迭代器资源都能被正确回收。
 
 ---
 
-## 中断路径全景图
+## 总结：理解取消路径的核心框架
 
-### 完整取消调用链
+1. **失效 vs 信号是两个独立维度**：`clean_events()` 使事件失效（L1+L2），`cancel_tasks()` 发送取消信号（L3），两者可以组合但不是必须的。
 
-```
-前端事件触发
-    │
-    ▼
-DependencyManager.dispatch()
-    │
-    ├─► this.cancel(dep.cancels)   ──── 先执行取消
-    │       │
-    │       ├─► submission.cancel()
-    │       │       │
-    │       │       └─► POST /cancel (HTTP请求)
-    │       │
-    │       ├─► loading_stati.update("complete")  ── 立即更新UI
-    │       │
-    │       └─► 触发 .failure() / .then() 链
-    │
-    └─► 执行当前事件（正常流程）
-```
+2. **用户主动取消 = 信号 + 部分失效**：`/cancel` 路由组合了 `cancel_tasks()`（信号）和 `remove_from_queue()`（L1），但遗漏了 `alive = False`（L2），对执行中事件的中断完全依赖 CancelledError。
 
-### 后端取消处理链
+3. **客户端断开 = 完全失效但无信号**：`clean_events()` 覆盖了 L1+L2，但不发送 CancelledError。执行中的任务继续运行直到自然结束，只是输出被 `alive` 守卫截断。
 
-```
-/cancel 路由
-    │
-    ├─► cancel_tasks()
-    │       │
-    │       ├─► 遍历所有 asyncio 任务
-    │       ├─► 按名称匹配 {session_hash}_{fn_index}
-    │       └─► task.cancel() + asyncio.gather()
-    │
-    ├─► Queue.remove_from_queue()
-    │       └─► 从等待队列中删除事件
-    │
-    ├─► 发送 ProcessCompletedMessage
-    │       └─► 放入 pending_messages_per_session
-    │
-    └─► 迭代器清理
-            ├─► safe_aclose_iterator()
-            ├─► del app.iterators[event_id]
-            └─► app.iterators_to_reset.add()
-```
+4. **迭代器释放是所有路径的最终保障**：`process_events()` 的 `finally` 块确保无论何种取消方式，迭代器都会被清理。`/cancel` 的立即清理只是优化了生成器函数的响应速度。
 
-### 队列内取消路径
-
-```
-事件状态: 等待中
-    │
-    └─► remove_from_queue() / clean_events()
-           └─► 直接从队列列表中移除
-
-事件状态: 执行中
-    │
-    ├─► cancel_tasks() ──► asyncio 任务取消（仅在await点生效）
-    │
-    └─► event.alive = False
-           │
-           ├─► 生成器循环：每次迭代前检查 alive
-           └─► 普通函数：无法中断，需等待执行完毕
-```
-
-### 关键数据结构关系
-
-```
-BlockFunction (配置层)
-    ├─ cancels: list[int]          # 要取消的 fn 索引
-    └─ is_cancel_function: bool    # 是否为取消函数
-
-Event (运行时)
-    ├─ _id: str                    # 事件唯一ID
-    ├─ alive: bool                 # 存活标志
-    ├─ closed: bool                # 流关闭标志
-    └─ signal: asyncio.Event       # 流同步信号
-
-Queue (管理层)
-    ├─ event_ids_to_events: dict   # event_id → Event
-    ├─ event_queue_per_concurrency_id: dict  # 各并发队列
-    ├─ pending_messages_per_session: LRUCache # SSE 消息队列
-    └─ pending_event_ids_session: dict       # 会话待处理事件
-
-App (全局)
-    ├─ iterators: dict             # event_id → AsyncIterator
-    └─ iterators_to_reset: set     # 需要重置的事件集合
-```
-
----
-
-## 设计要点总结
-
-1. **协作式取消**：依赖 Python asyncio 的协作式取消机制，任务只能在 await 点响应取消，同步函数一旦开始无法中断。
-
-2. **双重取消路径**：
-   - **快速路径**：前端立即更新 UI 状态，用户感知上"已取消"
-   - **后端路径**：实际终止任务、清理资源，可能有延迟
-
-3. **配置驱动**：通过 `cancels` 参数声明式配置事件间的取消关系，前端自动执行。
-
-4. **粒度灵活**：支持按 `session_hash`（会话级）和 `event_id`（事件级）两种粒度取消。
-
-5. **资源安全**：`finally` 块确保迭代器等资源始终被清理，防止泄漏。
-
-6. **向后兼容**：`/reset` 路由保留为空操作，确保旧客户端仍能正常工作。
+5. **同步函数是所有路径的盲区**：无论哪条路径，都无法立即中断正在 CPU 上执行的同步函数。唯一的区别是路径一通过 CancelledError 延迟中断，路径四通过 alive 截断输出但任务继续运行。
