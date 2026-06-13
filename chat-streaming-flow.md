@@ -79,11 +79,16 @@ async def _stream_fn(self, message, history, *args):
 
 **关键点（核心机制）：**
 - `history` 参数是 `chatbot_state`（提交前已有的对话历史，**不含**当前用户消息）
-- 第 68 行：`history = self._append_message_to_history(message, history, "user")` —— 在此处将用户消息追加到 history，形成**固定基准 history_base**
+- 第 961 行：`history = self._append_message_to_history(message, history, "user")` —— 在此处将用户消息追加到 history，形成**固定基准 history_base**
 - 后续**所有** yield 都使用同一个 `history_base` 作为起点（而非在上一轮 yield 的 `history_` 基础上继续追加）
-- `_append_message_to_history` 内部做 `copy.deepcopy(history)` 然后 `extend`，因此每次 yield 产生的是一个**全新的 history 列表，但消息条数完全相同**
+- `_append_message_to_history` 内部做 `copy.deepcopy(history) + extend(message_dicts)`，因此每次 yield 产生的是一个**全新的 history 列表**
+- **重要**：`_message_as_message_dict`（[chat_interface.py:886-922](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/chat_interface.py#L886-L922)）**不做任何 thinking tags 拆分**，只做类型转换。因此在 `_stream_fn` 层面，所有 yield 产生的 history 列表**长度完全相同**（条数恒定）
 - 变化的只有最后一条 assistant 消息的 `content` 字段：随着用户生成器每次 yield 累积的文本越来越长
-- 因此：每次增量返回**不是新增消息，而是替换最后一条助手消息的内容**（通过构造一个全新的 history 列表来实现）
+- **区分两个层面**：
+  - **_stream_fn 层（Python list）**：每次 yield 的 history 条数不变，是对最后一条消息 content 的"逻辑替换"
+  - **Chatbot 展示层（postprocess 后）**：如果配置了 `reasoning_tags`，`Chatbot.postprocess` 会把最后一条 assistant 消息拆成多条（thinking 段 + 正文段），导致**前端收到的 ChatbotDataMessages.root 条数发生变化**（详见 §7.7）
+
+因此：在 `_stream_fn` 层，每次增量返回**不是新增消息，而是替换最后一条助手消息的内容**（通过构造全新的 history 列表实现）；但在 postprocess 后的展示层，最后一条可能被拆成多条，使得前端消息数增多。
 
 ### 2.2 事件注册链 — _setup_events
 
@@ -493,22 +498,24 @@ $: {
 {/each}
 ```
 
-**为什么前端会显示"连续增长的单条回复气泡"而不是每次新增气泡？** 这里有四层协作机制：
+**为什么前端会显示"连续增长的单条回复气泡"而不是每次新增气泡？** 这里有五层协作机制：
 
-#### 层 1：后端保证 —— history 长度不变
+#### 层 1：后端保证 — _stream_fn 的 history_ 长度不变
 
-由 `_stream_fn` 的逻辑（第 2.1 节分析）可知，所有 yield 产生的 history 列表长度**完全相同**。例如一个典型的流式对话：
+由 `_stream_fn` 的逻辑（第 2.1 节分析）可知，所有 yield 产生的 `history_` 列表长度**完全相同**。例如一个典型的流式对话：
 
-| 阶段 | history 长度 | 最后一条消息内容 |
-|------|-------------|-----------------|
-| 用户提交 | 3（历史对话 1、历史对话 2、用户刚发的） | 用户消息："你好" |
-| 第 1 次 yield | 4 | assistant: "我" |
-| 第 2 次 yield | 4 | assistant: "我是" |
-| 第 3 次 yield | 4 | assistant: "我是一个" |
-| ... | 4 | ... |
-| 最终 yield | 4 | assistant: "我是一个 AI 助手" |
+| 阶段 | _stream_fn yield 的 history_ 长度 | 最后一条消息内容 |
+|------|-------------------------------|-----------------|
+| 用户提交 | 5（历史对话 4 条 + 用户刚发的 1 条） | 用户消息："你好" |
+| 第 1 次 yield | 6（= 5 + 1 条 assistant） | assistant: "我" |
+| 第 2 次 yield | 6（不变） | assistant: "我是" |
+| 第 3 次 yield | 6（不变） | assistant: "我是一个" |
+| ... | 6（不变） | ... |
+| 最终 yield | 6（不变） | assistant: "我是一个 AI 助手" |
 
-因此 `value.length`（经过 `group_messages` 处理后 `groupedMessages.length`）在整个流式过程中**保持恒定**。
+因此 `_stream_fn` 层（Python list）的 `value.length` 在整个流式过程中**保持恒定**。
+
+> **重要补充（reasoning_tags）**：如果配置了 `reasoning_tags`，`Chatbot.postprocess` 会在**后端 postprocess 阶段**把最后一条 assistant 消息拆成 2 条（thinking 段 + 正文段），导致前端收到的 `ChatbotDataMessages.root` 长度从 6 变为 7。但由于第 3 层 `group_messages` 的 role 合并，气泡数量仍然不变。
 
 #### 层 2：Svelte `#each` —— 索引作为隐式 key
 
@@ -518,7 +525,9 @@ $: {
 - 如果长度从 N 变为 N+1：保留前 N 个组件，**新建**第 N+1 个 `<Message>`
 - 如果长度从 N 变为 N-1：销毁最后一个组件
 
-由于在流式过程中长度恒等，Svelte **不会销毁或新建任何 `<Message>` 组件**，只是将更新后的 `messages`（即 `groupedMessages[i]`）作为新 prop 传入已有的组件实例。这意味着：所有已渲染的气泡 DOM 节点**在原地被更新，完全不会被重建**。
+由于 `group_messages`（层 3）保证了**气泡组数量在流式过程中恒等**（即使 `value.root` 长度因为 thinking 拆分从 6 变 7，气泡组数仍然不变），所以 Svelte **不会销毁或新建任何 `<Message>` 组件**，只是将更新后的 `messages`（即 `groupedMessages[i]`）作为新 prop 传入已有的组件实例。这意味着：所有已渲染的气泡 DOM 节点**在原地被更新，完全不会被重建**。
+
+> **reasoning_tags 的关键补充**：当 `ChatbotDataMessages.root` 因为 thinking 拆分从 6 条消息变为 7 条消息（2 条 assistant 连续）时，如果按 `value.root` 直接 `#each`，会触发 N → N+1 从而新建组件。但**此处实际用的是 `groupedMessages` 而不是 `value`**——`group_messages` 会把新增的那条 assistant 消息合并到同一气泡组，所以 `groupedMessages.length` 依然保持不变，仍然是同样数量的气泡。
 
 #### 层 3：group_messages —— role 一致则同一气泡
 
@@ -538,17 +547,48 @@ for (const message of messages) {
 }
 ```
 
-由于每次的最后一条消息 role 都是 `"assistant"`（并且前面有一条 `"user"` 作为切换边界），因此 `groupedMessages` 中的最后一组始终是**同一个索引位置上的同一个气泡**——只有它内部包含的 `messages` 数组中那条消息的 `content` 变得更长。
+**在 reasoning_tags 拆分场景下**，`value` 数组的变化：
+
+```
+第 1 次 yield（拆分后）:
+  [user_msg, {role:"assistant", metadata:{status:"pending"}}, {role:"assistant", content:""}]
+  → 两条 assistant 连续，被合并到同一个气泡组
+  → groupedMessages 中的最后一组：长度 2 的数组 [pending_msg, empty_content_msg]
+
+第 2 次 yield（正文开始）:
+  [user_msg, {role:"assistant", metadata:{status:"done"}}, {role:"assistant", content:"我是"}]
+  → 仍然是两条 assistant 连续，同一气泡组
+  → groupedMessages 最后一组：[done_msg, content_msg("我是")]
+```
+
+由于每次的最后一条消息 role 都是 `"assistant"`（并且前面有一条 `"user"` 作为切换边界），因此 `groupedMessages` 中的最后一组始终是**同一个索引位置上的同一个气泡**——变化的只是气泡组内部 messages 数组的**长度**（从 1 变 2 时因为拆分，然后保持 2）和**内容**（content 字符串增长）。
 
 #### 层 4：Message / MessageContent —— 子组件响应式更新
 
 文件：[Message.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/Message.svelte#L1-L100)
 
-当 `<Message>` 组件收到新的 `messages` prop 时，Svelte 的响应式系统会对比 prop 变化：
-- `messages` 数组的长度不变（仍然只有 1 条 assistant 文本消息，除非 reasoning_tags 拆分了 thinking 消息）
-- `messages[0].content.text` 的字符串变得更长
+当 `<Message>` 组件收到新的 `messages` prop 时，Svelte 的响应式系统会对比 prop 变化。分两种情况：
 
-`<MessageContent>` 内部使用 Markdown 渲染器等，会根据新的 text prop 增量更新 DOM 中的文本节点。最终用户看到的效果就是：气泡大小不断增大，文字像"打字机"一样一个个（或一段段）显示出来。
+**无 reasoning_tags 时**：
+- `messages` 数组长度始终为 1（一条 assistant 文本消息）
+- `messages[0].content[0].text` 的字符串变得更长
+
+**配置 reasoning_tags 后**：
+- 第一次拆分前：`messages.length = 1`（一条包含原始 `<thinking>标签` 文本的消息）
+- 拆分完成后：`messages.length = 2`（[thinking_msg, content_msg]），随后稳定为 2
+- `messages[0].metadata.status` 从 `"pending"` → `"done"`（触发 Pending 动画消失）
+- `messages[1].content[0].text` 的字符串变得更长
+
+`<MessageContent>` 内部使用 Markdown 渲染器等，会根据新的 text prop 增量更新 DOM 中的文本节点。最终用户看到的效果就是：气泡大小不断增大，文字像"打字机"一样一个个（或一段段）显示出来，同时可折叠的思考过程手风琴也会随 status 变化而显示/隐藏 spinner。
+
+#### 层 5：Pending.svelte 思考状态动画的条件触发
+
+文件：[Pending.svelte](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/Pending.svelte#L1-L137)
+
+`Pending.svelte` 气泡内出现的**条件**是消息自身的 `message.metadata.status === "pending"`（注意：不是全局的 loading_status），因此：
+
+- 思考未闭合时（`<thinking>内容未闭合`）：拆出的 thinking 消息 metadata.status = "pending"，Pending.svelte 渲染脉动圆点
+- 思考闭合后（`</thinking>` 出现）：拆出的 thinking 消息 metadata.status = "done"，Pending.svelte 消失，手风琴默认折叠
 
 #### 自动滚动配合
 
@@ -827,19 +867,102 @@ history_ = deepcopy(history) + [ {assistant:"我是AI助手"} ]
 | 前端怎么知道在原地更新而不是新建气泡？ | Svelte 的 `{#each ..., i}` 用**索引 i** 作为 identity key，当数组长度 N → N 时，Svelte 复用已有组件并更新 props，不会创建/销毁 DOM |
 | 用户视觉感知 | 单个气泡里的文字持续增长（打字机效果） |
 
-#### 特殊情况：`reasoning_tags` 思考消息拆分
+#### 特殊情况：`reasoning_tags` 思考消息拆分——两层结构的差异
 
-如果配置了 `reasoning_tags=[("<thinking>", "</thinking>")]`，后端 `_extract_thinking_blocks`（[chatbot.py:641-700](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/components/chatbot.py#L641-L700)）会将单次回复拆分成**多条消息**：
+配置 `reasoning_tags=[("<thinking>", "</thinking>")]` 时，需要**严格区分两个不同的数据层面**，之前文档中"history 长度从 6 变 7"的表述**是不精确的**——需要明确是哪一层的"长度"。
 
+**层面 1：`_stream_fn` 内部的 history_（Python list 层面）**
+```python
+# _stream_fn 第 980-981 行
+history_ = self._append_message_to_history(response, history, "assistant")
 ```
-第 1 次 yield（AI 输出 "<thinking>分析中</thinking>我"）
-→ 被拆为：
-  1. {role:assistant, content:"分析中", metadata:{title:"Reasoning", status:"pending"}}
-  2. {role:assistant, content:"我"}
-→ 此时 history 长度 = 6 + 1 = 7（因为 thinking 是额外的一条）
+这里调用的是 `_message_as_message_dict`（[chat_interface.py:886-922](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/gradio/chat_interface.py#L886-L922)），它**不做任何 thinking tags 拆分**，只做类型转换。因此：
+
+| yield 阶段 | response 内容（用户生成器产出的原始文本） | history_ 长度 |
+|-----------|---------------------------------------|--------------|
+| 第 1 次 yield（思考中，标签未闭合） | `"<thinking>正在分析用户问题"` | **6（不变）** |
+| 第 2 次 yield（思考闭合，正文开始） | `"<thinking>正在分析用户问题</thinking>我"` | **6（不变）** |
+| 第 3 次 yield（正文继续） | `"<thinking>...</thinking>我是"` | **6（不变）** |
+| ... | ... | **6（永远不变）** |
+| 最终 yield | `"<thinking>...</thinking>我是AI助手"` | **6** |
+
+**在 `_stream_fn` 层，history 长度永远是 6。** thinking 标签的存在不影响 list 的元素个数，只影响最后一个元素的字符串内容。
+
+**层面 2：Chatbot.postprocess 后的展示值（ChatbotDataMessages.root）**
+
+当 `process_api` 执行 `postprocess_data` → `Chatbot.postprocess` → `_extract_thinking_blocks` 时，才发生拆分（详见 §7.7）。此时：
+
+| yield 阶段 | postprocess 后 root 长度 | 具体消息结构 |
+|-----------|-------------------------|---------|
+| 第 1 次 yield（标签未闭合） | **7**（多了 1 条） | [历史4条, user, **{thinking 段 pending, 空正文段}**] ← 被拆成 2 条消息 |
+| 第 2 次 yield（标签闭合） | **7**（仍拆分 2 条） | [历史4条, user, **{thinking 段 done, 正文"我"}**] |
+| 第 3 次 yield（正文增长） | **7**（仍拆分 2 条） | [历史4条, user, **{thinking 段 done, 正文"我是"}**] |
+| ... | ... | **7（稳定）** |
+
+**注意**：thinking 拆分只针对**最后一条 assistant 消息**（即当前流式回复）。之前 history 中已有的消息（如果是上一轮对话拆分后的 thinking 消息）在 postprocess 中**不会被重新拆分**——因为它们的 content 已经是纯文本，不包含 `<thinking>` 标签。
+
+#### 跨轮次：拆分后的展示值如何回写到下一次对话的 history 输入
+
+当前流式事件完全完成（ProcessCompletedMessage）后，触发 `synchronize_chat_state_kwargs`（详见 §7.8）：
+
+```python
+synchronize_chat_state_kwargs = {
+    "fn": lambda x: (x, x),
+    "inputs": [self.chatbot],        # 这里的 chatbot 已经是 postprocess 后的拆分值（ChatbotDataMessages）
+    "outputs": [self.chatbot_state, self.chatbot_value],
+    "queue": False,
+}
 ```
 
-随着流式输出，thinking 消息可能先处于 `status="pending"`（显示 spinner），当标签闭合后变为 `status="done"`（折叠收起）。此时 history 的消息结构会**短暂增长**（因为思考内容尚未闭合时被视为 pending 段，闭合后拆分为独立的 thinking 消息）。
+数据流（从 chatbot 展示值 → chatbot_state 持久化）：
+```
+Chatbot 组件 value（前端展示的拆分后消息列表，7 条，含 thinking 消息）
+  │  前端 DependencyManager.handle_data → update_state_cb
+  ▼
+  作为输入传给后端 lambda x: (x, x)
+  │  Blocks.process_api → preprocess_data
+  ▼
+  Chatbot.preprocess(ChatbotDataMessages)  [chatbot.py:442-464]
+    → 对每条 message 做 message.model_dump() → list[NormalizedMessageDict]
+    → 返回 [历史4条, user_msg,
+            {role:"assistant", metadata:{title:"Reasoning", status:"done"}},  ← 拆分出来的 thinking
+            {role:"assistant", content:"我是AI助手"}]                        ← 拆分出来的正文
+    → 共 7 条
+  │
+  ▼
+  保存到 chatbot_state（State 组件）
+  │
+  ▼
+  下一次用户发送消息时，_stream_fn 的 history 参数 = [历史4条, user, thinking, 正文]
+                                              ↑ 共 7 条，包含拆分后的 thinking
+```
+
+因此：**下一轮对话的 `_stream_fn` 会看到上一轮对话拆分后的 thinking 消息**（它们是普通的 NormalizedMessageDict，role 都是 assistant，thinking 那条带 metadata.status）。但由于这些消息中不再包含 `<thinking>` 标签，在这一轮 postprocess 中**不会被再次拆分**——它们会作为普通消息通过。这也是为什么连续多轮对话不会出现重复拆分的原因。
+
+#### 前端展示：拆分后会新增气泡吗？
+
+**不会新增独立气泡**，因为 `group_messages`（[utils.ts:260-295](file:///d:/fz/0601/solo-dogfeeding/code/241-gradio/js/chatbot/shared/utils.ts#L260-L295)）按连续 `role` 合并：
+
+```typescript
+// 拆分后
+[
+  {role:"user", ...},
+  {role:"assistant", content: "...", metadata:{title:"Reasoning"}},  // 拆分出的 thinking
+  {role:"assistant", content: "我是AI助手"},                          // 拆分出的正文
+]
+```
+
+这两条 assistant 消息** role 相同且连续**，会被 `group_messages` 合并到同一个数组中，对应**同一个 `<Message>` 气泡组件**。Message 组件内部通过遍历 `messages` prop 渲染手风琴（thinking 段带折叠 UI）和正文段落，因此视觉上仍然是一个气泡，只是内容包含了可折叠的思考过程。
+
+#### 关键结论（修正之前的矛盾表述）
+
+| 问题 | 正确答案（之前若有错误标注） |
+|------|---------------------------|
+| **history 长度在流式过程中是否变化？** | `_stream_fn` 层：**永远不变**（始终 6 条）。<br/>Chatbot 展示层（postprocess 后）：如果拆出 thinking 消息，会从 6 条变为 7 条（或更多，如果多次出现 thinking 标签对） |
+| 拆分发生在对话历史阶段还是渲染前整理阶段？ | **渲染前整理阶段**（Chatbot.postprocess）。对话历史阶段（`_append_message_to_history` / `_stream_fn` 构造 history_ 时）完全不做拆分。之前§7.6 中"此时 history 长度 = 6 + 1 = 7"的表述**不正确**——如果 history 指的是 _stream_fn 的 Python list，长度始终是 6；如果指展示层的 ChatbotDataMessages.root，才会是 7 |
+| 拆分是否会影响当前轮次 `_stream_fn` 的 history_base？ | **不影响**。因为拆分发生在 yield 之后的 postprocess，而 `_stream_fn` 使用的是自己内部保存的 history_base（生成器栈帧中的局部变量），与 postprocess 输出完全隔离 |
+| 拆分是否会影响下一轮对话的 history 输入？ | **影响**。因为 `synchronize_chat_state_kwargs` 把 chatbot 的 postprocess 后的值（含拆分后的 thinking 消息）通过 `State` 写回了 `chatbot_state`。下一轮 `_stream_fn` 会拿到拆分后的 7 条 history，但这些已拆分的消息不会再被拆分（因为文本中已没有标签） |
+| 拆分后前端会新增气泡吗？ | **不会**。`group_messages` 会将 thinking 消息与正文消息（role 相同且连续）合并到同一气泡中，以手风琴+正文的形式显示 |
 
 ### 7.7 思考内容拆分的准确阶段：后端 postprocess，非前端渲染
 
