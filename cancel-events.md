@@ -906,6 +906,235 @@ sse_stream() 循环消费 pending_messages_per_session[session_hash].get()
 
 ---
 
+## 补充：心跳断开时的会话清理流程
+
+除了客户端通过 SSE 流检测断开之外，Gradio 还有一条独立的心跳机制用于会话清理路径——`/heartbeat/{session_hash}` 长连接。当浏览器标签页关闭或网络中断时，心跳连接同样会触发 CancelledError，进而执行一套更完整的会话清理流程。
+
+### 心跳路由入口：[/heartbeat/{session_hash}](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1195-L1264)
+
+### 心跳连接的生命周期
+
+```
+正常心跳循环（routes.py L1207-L1220）
+  │
+  ├─ yield "data: ALIVE\n\n"               ← 定期发送心跳包
+  ├─ asyncio.sleep(heartbeat_rate)         ← 等待下一次心跳
+  └─ 同时等待 stop_stream_task             ← 监听服务器关闭信号
+       │
+       └─ 若服务器关闭 → 主动 raise CancelledError
+```
+
+当客户端断开连接时，`iterator()` 生成器被垃圾回收或 `yield` 操作失败，`asyncio.CancelledError` 被抛出，进入 `except` 块执行清理流程：
+
+### 完整清理步骤（[routes.py L1221-L1264](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1221-L1264)）
+
+```
+① stop_stream_task.cancel()  (L1222-L1223)
+    └─ 停止监听服务器关闭信号
+    │
+    ▼
+② 执行 unload 事件（L1234-L1249）
+    ├─ 遍历 app.get_blocks().fns.items()，筛选出 targets == "unload" 的函数
+    │    └─ 即开发者通过 gr.Interface(unload_fn=...) 注册的会话卸载函数
+    └─ 用 background_tasks.add_task() 在后台执行每个 unload 函数
+    │
+    ▼
+③ 标记会话数据为关闭状态（L1251-L1252）
+    └─ app.state_holder.session_data[session_hash].is_closed = True
+        └─ 注释说明：标记状态将在一小时后被删除
+    │
+    ▼
+④ 清空会话缓存（L1253）
+    └─ caching.clear_session_caches(session_hash)
+        └─ 遍历 _per_session_stores，对每个 store.clear_session(session_hash)
+    │
+    ▼
+⑤ 唤醒所有待处理事件（L1254-L1263）
+    ├─ 遍历 pending_event_ids_session[session_hash] 中所有待处理 event_id
+    ├─ event.run_time = math.inf   ← 设运行时间为无穷大
+    └─ event.signal.set()          ← 唤醒正在 wait_for_batch 的协程
+```
+
+### 各步骤的详细说明
+
+#### 步骤 ②：执行 unload 事件
+
+[routes.py L1234-L1249](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1234-L1249)
+
+`unload_fn_indices` 的筛选逻辑：
+
+```python
+unload_fn_indices = [
+    i
+    for i, dep in app.get_blocks().fns.items()
+    if any(t for t in dep.targets if t[1] == "unload")
+]
+```
+
+- 这是开发者通过 `gr.Interface(unload_fn=...)` 或 `block.unload(fn)` 注册的会话卸载钩子
+- 使用 `background_tasks.add_task()` 在后台执行，不阻塞心跳路由立即返回
+- **关键**：心跳连接本身已经被 CancelledError 打断，但 unload 函数会被放入 FastAPI 的 BackgroundTasks 异步执行
+
+#### 步骤 ③：关闭会话状态
+
+[routes.py L1251-L1252](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1251-L1252)
+
+```python
+if session_hash in app.state_holder.session_data:
+    app.state_holder.session_data[session_hash].is_closed = True
+```
+
+- 这只是**标记**为关闭，而非立即删除
+- 注释说明"这会标记状态在一小时后被删除"——具体的过期清理由另一个定时任务负责
+- 在状态被真正删除前，`session_data` 对象仍然存在，只是 `is_closed` 标志位为 True
+
+#### 步骤 ④：清空会话缓存
+
+[routes.py L1253](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1253) → [caching.py L339-L341](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/caching.py#L339-L341)
+
+```python
+def clear_session_caches(session_hash: str | None) -> None:
+    for store in list(_per_session_stores):
+        store.clear_session(session_hash)
+```
+
+- `_per_session_stores` 是所有使用 `@gr.cache()` 装饰器创建的缓存存储集合
+- 遍历所有缓存存储，移除该 session_hash 的缓存条目
+- 这是**立即生效**的操作，与状态标记不同
+
+#### 步骤 ⑤：唤醒所有待处理事件
+
+[routes.py L1254-L1263](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/routes.py#L1254-L1263)
+
+```python
+for event_id in app.get_blocks()._queue.pending_event_ids_session.get(session_hash, []):
+    event = app.get_blocks()._queue.event_ids_to_events[event_id]
+    event.run_time = math.inf
+    event.signal.set()
+```
+
+这是最值得注意的一步：
+
+- **所有待处理事件**（不仅仅是取消或执行中的）都被设置了 `run_time = math.inf` 和 `event.signal.set()`
+- 设置 `run_time = math.inf` 的目的是让该事件在 `process_events()` 的 `wait_for_batch()` 中立即超时
+- `event.signal.set()` 唤醒任何正在 `await event.signal.wait()` 的协程
+- 配合起来的效果：所有该会话的事件都会立即被 `process_events()` 在下一次循环检查 `event.is_finished` 判断为 `True`，从而正常退出
+- 这是一条**不发送取消信号，不删除事件，也不修改 `alive` 标志**的**软终止**路径
+
+### 心跳断开 vs SSE 断开的对比
+
+| 维度 | SSE 断开 | 心跳断开 |
+|------|---------|---------|
+| 触发点 | `request.is_disconnected()` 检测 | 心跳长连接 CancelledError |
+| 清理 unload 事件 | ❌ 不执行 | ✅ 后台执行所有 unload 函数 |
+| 会话状态 | ❌ 不标记 | ✅ `is_closed = True` |
+| 会话缓存 | ❌ 不清空 | ✅ `clear_session_caches()` |
+| 唤醒事件 | ❌ 不唤醒 | ✅ 所有待处理事件全部被 signal.set() |
+| `clean_events()` | ✅ 调用 | ❌ 不调用 |
+| `alive=False` | ✅ 标记执行中事件 | ❌ 不修改 alive |
+| `CancelledError` 发送 | ❌ 不发送 | ❌ 不发送（通过 `run_time=math.inf` 软终止） |
+
+> **关键点**：心跳断开和 SSE 断开是两条**独立且互补**的路径。
+> - SSE 断开通过 `clean_events()` 标记 `alive=False` 并从队列中删除事件
+> - 心跳断开通过 unload、缓存清理、run_time=math.inf 让事件自然退出
+> - 实际浏览器关闭标签页时，两条路径都会被触发（SSE 和 心跳是两个独立的长连接）
+
+---
+
+## 补充：任务命名限制与批处理取消失效
+
+`cancel_tasks()` 的核心机制是通过 asyncio task 的**名称**来匹配目标任务。但这套命名规则有一个关键限制：**批处理（batch=True）的任务永远不会被取消**。
+
+### 任务命名规则
+
+#### 命名设置函数：[set_task_name()](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/utils.py#L1118-L1120)
+
+```python
+def set_task_name(task, session_hash: str, fn_index: int, event_id: str, batch: bool):
+    if not batch:
+        task.set_name(f"{session_hash}_{fn_index}<gradio-sep>{event_id}")
+```
+
+调用位置：[queueing.py L548-L553](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L548-L553)
+
+```python
+set_task_name(
+    process_event_task,
+    events[0].session_hash,
+    events[0].fn._id,
+    events[0]._id,
+    batch,  # ← 关键参数
+)
+```
+
+#### 命名匹配规则：[cancel_tasks()](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/utils.py#L1102-L1115)
+
+```python
+async def cancel_tasks(task_ids: set[str]) -> list[str]:
+    tasks = [(task, task.get_name()) for task in asyncio.all_tasks()]
+    event_ids: list[str] = []
+    for task, name in tasks:
+        if "<gradio-sep>" not in name:
+            continue          # ← 关键过滤条件
+        task_id, event_id = name.split("<gradio-sep>")
+        if task_id in task_ids:
+            matching_tasks.append(task)
+            event_ids.append(event_id)
+            task.cancel()
+```
+
+### 批处理任务名不匹配的根本原因
+
+当 `batch=True` 时：
+
+1. `set_task_name()` 的 `if not batch:` 条件为 `False`
+2. `task.set_name()` **不会被调用**
+3. task 保持 asyncio 默认的任务名（通常类似 `"Task-123"`）
+4. `cancel_tasks()` 检查 `"<gradio-sep>" not in name` → `True`
+5. `continue` 跳过，任务不会被匹配和取消
+
+### 为什么批处理不设置任务名的深层原因
+
+查看调用点 [queueing.py L548-L553](file:///d:/fz/0601/solo-dogfeeding/code/260-gradio/gradio/queueing.py#L548-L553)：
+
+```python
+set_task_name(
+    process_event_task,
+    events[0].session_hash,   # ← 注意：只用了 events[0]
+    events[0].fn._id,      #    只用了第一个事件的信息
+    events[0]._id,           #    只用了第一个事件的 ID
+    batch,
+)
+```
+
+批处理时，一个 task 处理的是**一批 events 列表中的多个事件**（`process_events(events, batch, ...)`）。如果设置任务名，只能用 `events[0]` 的信息，但这个名字无法代表整批事件。
+
+- 若用 `events[0]` 的 `session_hash_fn_index` 作为 task_id，那么：
+  - 其他会话的同一批事件会被错误匹配
+  - 取消时只能匹配到第一个事件的信息
+  - 无法区分同批的其他事件
+
+这是一个设计权衡：批处理任务共享同一个协程，无法用单一事件的信息来命名，所以干脆**不设置**名称。
+
+### 批处理取消失效的影响
+
+| 场景 | 是否能取消 | 原因 |
+|------|-----------|------|
+| 普通非批处理任务 | ✅ 可取消 | 有 `<gradio-sep>` 分隔符，可匹配 |
+| 批处理任务 | ❌ 不可取消 | 无自定义名称，`cancel_tasks()` 跳过 |
+
+**影响范围**：
+- 批处理中的事件，当用户点击取消按钮（`cancels` 参数）时，`/cancel` 路由仍然会调用 `cancel_tasks()`，但**找不到匹配的任务**
+- 此时 `/cancel` 的 L1（队列移除）仍然生效——如果事件还在等待队列中，会被移除
+- 如果事件已经在执行中（已进入 `process_events()` 的批处理），则**无法取消**
+- `event.alive` 标志位依然不会被设置（和普通取消一样，`/cancel` 不调用 `clean_events()`）
+- 事件会继续执行到完成，**不会被 `alive` 标志截断**（因为 `alive` 仍为 True）
+- 最终 `process_events()` 的 `finally` 块会正常释放资源
+
+> **设计取舍**：这是已知的限制。批处理的取消是 Gradio 目前没有完美的解决方案——因为多个事件共享一个协程，取消其中一个必然影响整批。不设置任务名至少避免了错误地取消其他会话的任务。
+
+---
+
 ## 总结：理解取消路径的核心框架
 
 1. **失效 vs 信号是两个独立维度**：`clean_events()` 使事件失效（L1+L2），`cancel_tasks()` 发送取消信号（L3），两者可以组合但不是必须的。
