@@ -1124,3 +1124,495 @@ validator_fn 执行 call_process_api()
 | 输出文件迁移(post) | postprocess 后 | 更晚则 URL 未生成，前端无法访问文件 | 更早则文件路径可能不存在 |
 | 输出状态同步 | postprocess 后 | 前端/deep link 需要及时反映输出 | 更早则还没有 postprocess 值可写 |
 | 最终文件迁移 | 所有转换完成后 | 更早则遗漏非 postprocess 路径产生的文件 | — |
+
+---
+
+## 十一、普通值同步与 State 过期计时的本质区别
+
+状态同步在代码中看似只有 `_update_value_in_config` 和 `_update_config` 两种方法调用，但背后实际存在 **两套完全不同的存储模型**，它们的写入路径、存储位置、生命周期和读取方式都截然不同。
+
+### 11.1 两套存储模型
+
+#### 模型 A：普通组件（非 Stateful）—— 写 blocks_config.blocks
+
+```
+SessionState.__setitem__(key, value)     ← state_holder.py#L92-L107
+    │
+    ├─ isinstance(block, State) == False:
+    │   self.blocks_config.blocks[key] = value       ← 替换组件实例！
+    │   self.config_values[key] = config_for_block(key, [], block)
+    │
+    └─ 含义:
+        • value 是一个 Block 对象（组件实例）
+        • 替换 blocks_config 中的组件实例
+        • 然后从新实例重新生成 config_values 条目
+```
+
+关键点：对于普通组件，`state[key] = value` 存储的是 **组件实例本身**，而不是组件的值。这是因为普通组件的值（如文本框内容）保存在组件实例的 `.value` 属性上，前端 config 通过 `config_for_block()` 从实例中提取。
+
+#### 模型 B：State 组件 —— 写 state_data + _state_ttl
+
+```
+SessionState.__setitem__(key, value)     ← state_holder.py#L92-L107
+    │
+    ├─ isinstance(block, State) == True:
+    │   self._state_ttl[key] = (block.time_to_live, datetime.datetime.now())  ← 启动 TTL 计时
+    │   self.state_data[key] = value       ← 存储任意 Python 对象
+    │   self.config_values[key] = config_for_block(key, [], block)
+    │
+    └─ 含义:
+        • value 是用户函数返回的任意 Python 对象（字典、列表、自定义类等）
+        • 存储在独立的 state_data 字典中
+        • 同时在 _state_ttl 中记录 (TTL秒数, 创建时间)
+```
+
+### 11.2 两套存储模型的读取路径对比
+
+#### 普通组件的读取
+
+```
+SessionState.__getitem__(key)    ← state_holder.py#L83-L90
+    │
+    ├─ block.stateful == False:
+    │   return block              ← 直接返回组件实例
+    │
+    └─ 使用场景:
+        • preprocess_data: block = state[block._id]  → 得到最新组件实例
+        • postprocess_data: block = state[block._id] → 得到已更新的实例
+        • gr.update() 路径: kwargs = state[block._id].constructor_args.copy()
+```
+
+#### State 组件的读取
+
+```
+SessionState.__getitem__(key)    ← state_holder.py#L83-L90
+    │
+    ├─ block.stateful == True:
+    │   if key not in self.state_data:
+    │       self.state_data[key] = deepcopy(getattr(block, "value", None))  ← 懒初始化
+    │   return self.state_data[key]  ← 返回用户存储的 Python 对象
+    │
+    └─ 使用场景:
+        • preprocess_data: processed_input.append(state[block._id])  → 传给用户函数
+        • 不会向前端返回（postprocess_data 中 output.append(None)）
+```
+
+### 11.3 State TTL 过期机制的完整生命周期
+
+State 组件有一个普通组件完全没有的特性：**自动过期清理**。整个生命周期如下：
+
+```
+① 创建阶段：首次 __setitem__
+    state[block._id] = value
+    → _state_ttl[block._id] = (time_to_live, datetime.datetime.now())
+      例如: _state_ttl[42] = (3600, datetime(2025, 6, 13, 10, 0, 0))
+
+② 读取阶段：__getitem__
+    → 仅返回 state_data[block._id]，不检查是否过期
+    → 即使已过期，仍然返回旧值！
+    → 【注意】过期检查不在读取时执行
+
+③ 更新阶段：再次 __setitem__
+    state[block._id] = new_value
+    → _state_ttl[block._id] = (time_to_live, datetime.datetime.now())
+    → TTL 重新计时！创建时间被刷新为当前时间
+    → 【关键】每次 postprocess_data 写入 State 值都会重置 TTL
+
+④ 过期检查阶段：state_components 属性（迭代器）
+    位置: state_holder.py#L138-L161
+
+    @property
+    def state_components(self):
+        for _id in self.state_data:
+            block = self.blocks_config.blocks[_id]
+            if isinstance(block, State) and _id in self._state_ttl:
+                time_to_live, created_at = self._state_ttl[_id]
+                if self.is_closed:                    # ← 会话关闭时缩短 TTL
+                    time_to_live = self.STATE_TTL_WHEN_CLOSED  # 默认 3600s(1小时)
+                expired = (datetime.datetime.now() - created_at).total_seconds() > time_to_live
+                yield (block, value, expired)
+
+⑤ 清理阶段：delete_all_expired_state() / delete_state()
+    位置: state_holder.py#L45-L61
+
+    • 由定时任务或新请求触发
+    • 遍历 state_components，对 expired=True 的调用 block.delete_callback(value)
+    • 然后从 state_data 中删除该 key
+    • delete_callback 由用户定义：gr.State(delete_callback=lambda v: v.close())
+```
+
+### 11.4 普通 `_update_value_in_config` 与 State 写入的时序差异
+
+这个差异是理解整个状态同步流程的关键：
+
+#### 场景 1：普通组件输出后处理
+
+```
+postprocess_data() 中，非 Stateful 组件:
+    │
+    ├─ block_fn.postprocess=True:
+    │   prediction_value = block.postprocess(prediction_value)  ← 转换值
+    │   prediction_value_serialized = prediction_value.model_dump()  ← 序列化
+    │   prediction_value_serialized = async_move_files_to_cache(...)  ← 迁移文件
+    │   state[block._id] = block              ← 替换组件实例（含新 .value）
+    │   state._update_value_in_config(block._id, prediction_value_serialized)
+    │     → config_values[key]["props"]["value"] = prediction_value_serialized
+    │     → 仅更新 config 中的 value 字段
+    │
+    └─ block_fn.postprocess=False:
+        state[block._id] = block
+        state._update_value_in_config(block._id, prediction_value)
+          → 使用原始值（未 postprocess）
+```
+
+**注意**：`state[block._id] = block` 写入的是组件实例，而 `_update_value_in_config` 写入的是序列化后的值。两步操作写入不同的数据结构，但都在同一个流程中完成。
+
+#### 场景 2：State 组件输出后处理
+
+```
+postprocess_data() 中，Stateful 组件:
+    │
+    ├─ if is_prop_update(prediction_value):
+    │   # gr.update(value=...) 对 State 组件
+    │   state[block._id] = prediction_value["value"]    ← 只取 value 字段
+    │
+    └─ else:
+    │   state[block._id] = prediction_value             ← 直接存原始值
+    │
+    └─ output.append(None)    ← 前端不收到 State 的值
+
+【关键差异】：
+    • State 不调用 _update_value_in_config()，因为没有前端 config 需要更新
+    • State 不调用 block.postprocess()（直接透传原值）
+    • State 的 __setitem__ 会自动设置 _state_ttl，重置过期计时
+    • State 不需要 async_move_files_to_cache（State 值不含文件）
+```
+
+### 11.5 普通值同步 vs State 过期计时：核心差异表
+
+| 维度 | 普通组件值同步 | State 过期计时 |
+|------|---------------|---------------|
+| 存储位置 | `blocks_config.blocks[_id]`（组件实例） | `state_data[_id]`（任意 Python 对象） |
+| Config 更新 | `_update_value_in_config` 写入 `config_values[_id]["props"]["value"]` | 不更新 config（State 不渲染到前端） |
+| 前端可见性 | 值通过 SSE/HTTP 返回给前端 | `output.append(None)`，前端不可见 |
+| TTL 机制 | 无 | `_state_ttl[_id] = (ttl, created_at)`，超时自动清理 |
+| 过期重置 | 不适用 | 每次 `__setitem__` 刷新 `created_at` |
+| postprocess | 调用 `block.postprocess()` | 不调用，直接透传 |
+| 文件迁移 | 需要 `async_move_files_to_cache` | 不需要（值不含文件） |
+| 初始化 | `__getitem__` 直接返回组件实例 | `__getitem__` 懒初始化：deepcopy(block.value) |
+| 更新 config_for_block | 每次 `__setitem__` 都重建 | 每次 `__setitem__` 都重建 |
+| Delete callback | 无 | 用户定义的 `delete_callback` 在过期时执行 |
+| 会话关闭 | 组件实例随 SessionState 一起释放 | `is_closed=True` 时 TTL 缩短为 1 小时 |
+
+### 11.6 `_update_value_in_config` 内部的边界条件
+
+位置：[state_holder.py#L115-L122](file:///d:/fz/0601/solo-dogfeeding/code/240-gradio/gradio/state_holder.py#L115-L122)
+
+```python
+def _update_value_in_config(self, key: int, value: Any):
+    if key not in self.config_values:
+        # 如果 config 中还没有该组件条目，先创建
+        self.config_values[key] = self.blocks_config.config_for_block(
+            key, [], self.blocks_config.blocks[key]
+        )
+    if "props" in self.config_values[key]:
+        # 只更新 props.value，不影响其他属性
+        self.config_values[key]["props"]["value"] = value
+    # 【注意】如果 config_values[key] 中没有 "props" 键，
+    # value 就不会被写入！这是静默失败的！
+```
+
+**容易遗漏的错误点 #13**：如果 `config_for_block()` 生成的配置中没有 `"props"` 键（某些特殊组件或 BlockContext 可能出现这种情况），`_update_value_in_config` 会 **静默跳过**，不会报错也不会写入值。前端将看不到任何更新。
+
+### 11.7 State 过期检查不在读取路径上的设计考量
+
+```
+为什么不在这里检查过期？            实际在哪里检查？
+                                  
+SessionState.__getitem__()        state_components 属性（迭代器）
+    → 直接返回 state_data[key]        → 计算 expired 标记
+    → 不过滤过期值                    → 由 delete_all_expired_state() 清理
+    → 即使已过期也不报错              → 由定时任务/请求触发
+                                  
+原因：                              
+1. 读取时检查会增加延迟             清理时机：
+2. 过期是"软状态"——值仍有意义         • StateHolder.delete_all_expired_state()
+3. 用户可能希望读取后重新激活         • queueing.py 中事件处理后触发
+4. 避免在热路径上加锁               • routes.py 中会话关闭后触发
+```
+
+**容易遗漏的错误点 #14**：State 值过期后并不会立即消失——在 `delete_all_expired_state()` 被调用之前，用户函数仍然能读到过期的值。如果用户函数依赖 State 值的"新鲜度"，必须自行检查时间戳，不能依赖 Gradio 的 TTL 机制保证实时性。
+
+---
+
+## 十二、后处理阶段的提示信息能否成功传递到界面
+
+### 12.1 LocalContext 的精确注入时机
+
+要判断后处理阶段的提示信息能否到达前端，必须先弄清 `LocalContext` 各变量的精确生命周期：
+
+```
+call_function()          ← blocks.py#L1582
+    │
+    ├─ fn = get_function_with_locals(fn, blocks, event_id, ...)
+    │   │
+    │   └─ before_fn():   ← fn 被调用前执行
+    │       LocalContext.blocks.set(blocks)           ← ✅ 设置
+    │       LocalContext.in_event_listener.set(True)   ← ✅ 设置
+    │       LocalContext.event_id.set(event_id)        ← ✅ 设置
+    │       LocalContext.request.set(request)          ← ✅ 设置
+    │       LocalContext.blocks_config.set(...)         ← ✅ 设置
+    │
+    ├─ fn(*processed_input)  ← 用户函数执行
+    │   │                        此时所有 LocalContext 均可用
+    │   │                        gr.Info/Warning/Error 均能正常工作
+    │   │
+    │   └─ after_fn():   ← fn 执行完毕后执行（无论是否异常）
+    │       LocalContext.in_event_listener.set(False)   ← ❌ 清除
+    │       LocalContext.request.set(None)              ← ❌ 清除
+    │       LocalContext.blocks_config.set(None)        ← ❌ 清除
+    │       # 【注意】以下两项没有被清除：
+    │       #   LocalContext.blocks       → 仍然有值！
+    │       #   LocalContext.event_id     → 仍然有值！
+    │
+    └─ return {prediction, duration, ...}
+
+process_api() 继续:
+    │
+    └─ postprocess_data()   ← blocks.py#L1943
+        │
+        ├─ block.postprocess(prediction_value)
+        │   ↑ 这里调用组件的 postprocess 方法
+        │   ↑ 此时的 LocalContext 状态：
+        │     blocks       = 有值（未清除）
+        │     event_id     = 有值（未清除）
+        │     in_event_listener = False  ← 已清除！
+        │     request      = None       ← 已清除！
+        │     blocks_config = None      ← 已清除！
+        │
+        ├─ async_move_files_to_cache(...)
+        └─ state._update_value_in_config(...)
+```
+
+### 12.2 后处理阶段调用 gr.Info/Warning 的可行性分析
+
+根据 12.1 的上下文快照，分析三种提示机制在 postprocess 中的行为：
+
+#### gr.Info / gr.Warning 在 postprocess 中
+
+```
+组件的 postprocess() 中调用 gr.Warning("注意"):
+    │
+    ▼
+helpers.py log_message():
+    blocks = LocalContext.blocks.get(None)    → 有值（未清除）✅
+    event_id = LocalContext.event_id.get(None) → 有值（未清除）✅
+    │
+    ├─ blocks is not None and event_id is not None
+    │   → 进入正常路径
+    │   → blocks._queue.log_message(event_id, ...)
+    │   → 发送 LogMessage SSE
+    │   → 前端收到黄色/灰色弹窗 ✅ 成功！
+    │
+    └─ 【但实际上有隐藏问题】：
+        此时 call_function 已经返回，after_fn 已执行
+        但 SSE 连接仍然活跃（postprocess_data 还在执行）
+        → LogMessage 可以通过 SSE 发送
+        → 但 LogMessage 的 event_id 对应的是当前事件
+        → 前端会将此消息关联到当前事件的处理结果中
+```
+
+**结论**：`gr.Info`/`gr.Warning` 在组件的 `postprocess()` 方法中调用 **技术上可以成功发送到前端**，因为 `LocalContext.blocks` 和 `LocalContext.event_id` 没有被 `after_fn` 清除。
+
+**但这绝不意味着推荐这种做法**，原因如下：
+
+1. **语义错位**：postprocess 的职责是数据转换，不应产生 UI 副作用
+2. **时序不确定**：如果有多个输出组件，消息的发送顺序取决于组件处理顺序
+3. **生成器场景混乱**：生成器每次 yield 后都会触发 postprocess，每次都会重复调用
+4. **不可测试**：组件的 postprocess 在单元测试中不应依赖 SSE 基础设施
+
+#### gr.Error 在 postprocess 中
+
+```
+组件的 postprocess() 中 raise gr.Error("后处理错误"):
+    │
+    ▼
+postprocess_data() 的 try/except:
+    except Error:
+        raise   # ← 直接上抛，不被包装为 ComponentProcessingError
+    │
+    ▼
+process_api() → call_process_api() → 队列层/路由层
+    │
+    ▼
+error_payload(err, show_error)
+    → isinstance(error, AppError) == True
+    → 提取 message/duration/visible/title
+    → SSE: event: error, data: {error: "后处理错误", ...}
+    → 前端: 红色 Modal ✅ 成功！
+```
+
+**结论**：`raise gr.Error()` 在 postprocess 中 **可以成功到达前端**，且会中断当前所有后续组件的 postprocess。
+
+#### 普通异常在 postprocess 中
+
+```
+组件的 postprocess() 中 raise ValueError("类型错误"):
+    │
+    ▼
+postprocess_data() 的 try/except:
+    except Exception as err:
+        raise ComponentProcessingError(
+            _format_processing_error(block_fn, i, block, ...)
+        ) from err
+    │
+    ▼
+process_api() → call_process_api() → 队列层/路由层
+    │
+    ▼
+error_payload(err, show_error)
+    → isinstance(err, AppError) == False
+    → show_error 取决于 blocks.show_error（默认 False）
+    → 若 show_error=False: {error: None} → 前端只显示 "Error"
+    → 若 show_error=True: {error: "Could not postprocess output component at index 0..."}
+    │
+    ▼
+前端: 灰色错误文本（技术性信息）❌ 用户体验差
+```
+
+### 12.3 后处理阶段提示信息传递的完整决策表
+
+| 提示方式 | 在 postprocess 中调用 | 能否到达前端 | 副作用 | 推荐度 |
+|----------|----------------------|-------------|--------|--------|
+| `gr.Info("msg")` | `postprocess()` 内调用 | ✅ 可以 | 不中断，数据流继续 | ❌ 不推荐 |
+| `gr.Warning("msg")` | `postprocess()` 内调用 | ✅ 可以 | 不中断，数据流继续 | ❌ 不推荐 |
+| `gr.Success("msg")` | `postprocess()` 内调用 | ✅ 可以 | 不中断，数据流继续 | ❌ 不推荐 |
+| `raise gr.Error("msg")` | `postprocess()` 内 raise | ✅ 可以 | 中断，后续组件不处理 | ⚠️ 谨慎使用 |
+| `raise ValueError("msg")` | `postprocess()` 内 raise | ⚠️ 部分 | 中断，显示技术性错误 | ❌ 不推荐 |
+| `gr.Info/Warning` | `preprocess()` 内调用 | ❌ 降级 | 退化为 print/warnings.warn | ❌ 不可用 |
+
+### 12.4 preprocess 阶段 vs postprocess 阶段的上下文差异
+
+```
+                    preprocess 阶段                postprocess 阶段
+                    ───────────────                ────────────────
+LocalContext:
+  blocks            ❌ 未设置                      ✅ 有值（after_fn 未清除）
+  event_id          ❌ 未设置                      ✅ 有值（after_fn 未清除）
+  in_event_listener ❌ 未设置                      ❌ False（after_fn 已清除）
+  request           ❌ 未设置                      ❌ None（after_fn 已清除）
+  blocks_config     ❌ 未设置                      ❌ None（after_fn 已清除）
+
+gr.Info/Warning:
+  能否到前端        ❌ 退化为 print/warn            ✅ 可以前端弹窗
+                     （无 SSE 连接）                （SSE 连接仍活跃）
+
+gr.Error:
+  raise 传播路径    ✅ 穿透 ComponentProcessingError  ✅ 穿透 ComponentProcessingError
+  前端效果          红色 Modal                      红色 Modal
+
+原因分析:
+  call_function() 在 preprocess 之后、postprocess 之前执行
+  → before_fn 设置 LocalContext
+  → after_fn 部分清除 LocalContext
+  → preprocess 在 call_function 之前 → 上下文未设置
+  → postprocess 在 call_function 之后 → 上下文部分残留
+```
+
+### 12.5 为什么 preprocess 阶段不能发送 gr.Info/Warning
+
+这是代码中 **最容易被误解** 的设计点。根本原因是 `LocalContext` 的注入时机：
+
+```
+process_api() 的执行顺序:
+    │
+    ├─ ① preprocess_data()       ← 此阶段 LocalContext 完全未设置
+    │   │                            因为 get_function_with_locals 还没被调用
+    │   └─ block.preprocess(...)     → gr.Warning("...") → log_message()
+    │                                    → blocks=None → print() 退化为控制台输出
+    │
+    ├─ ② call_function()          ← 此阶段 LocalContext 被注入
+    │   │                             get_function_with_locals 的 before_fn 设置上下文
+    │   └─ fn(*processed_input)      → gr.Warning("...") → log_message()
+    │                                    → blocks 有值 → Queue.log_message() → SSE ✅
+    │
+    └─ ③ postprocess_data()       ← 此阶段 LocalContext 部分残留
+        │                             before_fn 设置的 blocks/event_id 未被清除
+        └─ block.postprocess(...)     → gr.Warning("...") → log_message()
+                                         → blocks 有值 → Queue.log_message() → SSE ✅
+```
+
+**LocalContext 注入锚定在 `call_function` 而非 `process_api`**，这是一个有意的设计决策：
+
+1. `call_function` 是唯一 **必定执行用户代码** 的阶段
+2. `preprocess`/`postprocess` 是框架内部的数据转换，不应产生 UI 副作用
+3. 如果在 `process_api` 入口处注入，所有阶段的上下文都会一致，但违反了关注点分离原则
+
+### 12.6 正确的提示信息使用方式
+
+```
+✅ 正确：在用户函数中发送提示
+def my_fn(x):
+    gr.Info("开始计算")        ← 有 LocalContext，SSE 正常发送
+    result = expensive(x)
+    gr.Warning("结果可能不精确") ← 有 LocalContext，SSE 正常发送
+    if result < 0:
+        raise gr.Error("负数")  ← 走异常通道，前端红色 Modal
+    return result
+
+❌ 错误：在 preprocess 中发送提示
+class MyComponent(Component):
+    def preprocess(self, payload):
+        gr.Info("收到输入")    ← 无 LocalContext，退化为 print()
+        return payload
+
+⚠️ 技术上可行但不推荐：在 postprocess 中发送提示
+class MyComponent(Component):
+    def postprocess(self, value):
+        gr.Warning("输出已转换")  ← 有残留 LocalContext，SSE 能发送
+        return value
+    # 问题：每次生成器 yield 都会重复触发此 Warning
+
+✅ 正确：在 postprocess 中抛出 gr.Error 中断流程
+class MyComponent(Component):
+    def postprocess(self, value):
+        if value is None:
+            raise gr.Error("输出为空，请检查输入")  ← 穿透包装，前端红色 Modal
+        return value
+```
+
+### 12.7 LocalContext 生命周期中 after_fn 未清除项的隐患
+
+[utils.py#L1087-L1092](file:///d:/fz/0601/solo-dogfeeding/code/240-gradio/gradio/utils.py#L1087-L1092) 中 `after_fn` 只清除了部分上下文变量：
+
+```python
+def after_fn():
+    LocalContext.in_event_listener.set(False)   # 清除
+    LocalContext.request.set(None)              # 清除
+    LocalContext.blocks_config.set(None)        # 清除
+    # 未清除：
+    #   LocalContext.blocks       ← 残留
+    #   LocalContext.event_id     ← 残留
+```
+
+这导致两个隐患：
+
+**隐患 1：跨请求上下文泄漏**
+
+```
+请求 A: call_function() → before_fn(blocks_A, event_A)
+    → fn() 执行
+    → after_fn()  # blocks_A 和 event_A 未清除
+
+请求 B: call_function() → before_fn(blocks_B, event_B)
+    → fn() 执行
+    → after_fn()  # blocks_B 和 event_B 未清除
+```
+
+由于 `ContextVar` 是协程局部的，在异步框架中不同请求运行在不同协程中，实际上不会发生跨请求泄漏。但如果有人在同步环境中使用 Gradio，就需要注意这个问题。
+
+**隐患 2：postprocess 中 gr.Warning/Info 的"假阳性"**
+
+postprocess 中调用 `gr.Warning` 能成功发送 SSE 消息，这依赖 `after_fn` 未清除 `blocks` 和 `event_id`。如果未来版本修改 `after_fn` 清除这些变量，postprocess 中的提示调用会 **静默退化为 print**，不会有任何报错。这种隐式依赖是脆弱的。
+
+**容易遗漏的错误点 #15**：`after_fn` 不清除 `blocks` 和 `event_id` 是有意为之还是遗漏，代码中无注释说明。如果依赖这个行为，应在代码中添加显式注释，否则未来维护者可能"修复"这个"遗漏"而导致 postprocess 中的提示功能失效。
