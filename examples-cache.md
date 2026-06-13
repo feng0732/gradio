@@ -536,77 +536,445 @@ dataset.click
 
 ---
 
-## 13. 旧缓存复用条件与手动重置时机
 
-### 13.1 旧缓存复用的判断逻辑
+---
 
-**位置：** [helpers.py:520-523](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L520-L523)
+## 13. 两条路径总览：已有全量缓存时点击的判定
+
+本章重点回答的场景：你上次用 Eager 模式跑完全部 examples，生成了完整的 `log.csv` 和 `indices.csv`。这次启动（无论 Eager 还是 Lazy 模式），用户点击了某个 example，代码怎么走？什么时候命中缓存？什么时候重新执行追加？两条路径的分叉点到底在哪里？
+
+**总入口**：[load_from_cache(example_id)](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L582-L619)
+
+```
+用户点击 example #K
+     │
+     ▼
+dataset.click 事件链
+     ├─ load_example_input(K)   ← 填输入，和缓存无关
+     └─ .then → load_example_output(K)
+                     │
+                     ▼
+             load_from_cache(K)
+                     │
+                     ├─ 第 1 个分叉点
+                     │    cached_index = _get_cached_index_if_cached(K)
+                     │           │
+                     │     ┌─────┴─────┐
+                     │     int 命中     None 未命中
+                     │     │             │
+                     │     ▼             ▼
+                     │  【路径 A】   【路径 B】
+                     │   读旧缓存    重新执行+追加写入
+                     │
+                     └─ 汇合：反序列化每个输出组件 → 返回给前端
+```
+
+**分叉函数：`_get_cached_index_if_cached(K)`** ([helpers.py:488-495](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L488-L495))
+
+```python
+def _get_cached_index_if_cached(self, example_index) -> int | None:
+    if Path(self.cached_indices_file).exists():
+        with open(self.cached_indices_file) as f:
+            cached_indices = [int(line.strip()) for line in f]
+        if example_index in cached_indices:
+            cached_index = cached_indices.index(example_index)  # 首次匹配的位置
+            return cached_index
+    return None
+```
+
+🔑 **核心判断依据只有一条：K 是否存在于 `indices.csv` 的值列表中。** `log.csv` 有没有数据完全不参与这次判断。
+
+---
+
+## 14. 路径 A：命中（indices.csv 找到了 K）
+
+### 14.1 逐步代码执行
+
+**前置场景**：之前 Eager 缓存过 5 个 examples，indices.csv 内容是 `[0, 1, 2, 3, 4]`，log.csv 有 1 行表头 + 5 行数据。用户点击 example #2。
+
+**步骤 1：_get_cached_index_if_cached(2) 查询**
+
+```
+检查 indices.csv 是否存在？→ 是 ✅
+读取全部行 → cached_indices = [0, 1, 2, 3, 4]
+判断 2 in [0,1,2,3,4]？→ 是 ✅
+返回 cached_indices.index(2) → 返回 **2**（它在列表中的第 3 个位置，下标 2）
+```
+
+🔑 **关键细节 1：`list.index()` 返回的是「第一次出现的下标位置」，不是值本身。** 对于 Eager 顺序写入的 indices.csv，位置和值刚好相等（0,1,2,3,4 → 下标 0,1,2,3,4），所以你感觉不到差别。但 Lazy 乱序点击的场景（如 indices=[5,2,7]），点击 #2 时返回的是 1（位置），这时差别就出来了。
+
+**步骤 2：跳过未命中分支，直接读 log.csv** ([helpers.py:593-598](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L593-L598))
+
+```python
+# cached_index = 2，不是 None，所以这整个 if 块被跳过：
+# if cached_index is None:
+#     synchronize_async(cache, K)    ← 不会执行！
+
+with open(self.cached_file, encoding="utf-8") as cache:
+    examples = list(csv.reader(cache))  # 读整个 log.csv
+
+# examples = [表头, 0号输出, 1号输出, 2号输出, 3号输出, 4号输出]
+#             [0行     1行    2行    3行    4行    5行]
+
+if cached_index + 1 >= len(examples):
+    raise IndexError(...)   # 边界校验：防止 indices 行数和 log 不一致
+
+example_row = examples[cached_index + 1]   # 2 + 1 = examples[3] = 2号输出
+```
+
+🔑 **关键细节 2：为什么要 `+1`？** `indices.csv` 的第 0 行对应 `log.csv` 的第 1 行（跳过表头），所以 `indices[i]` ↔ `log[i+1]` 严格对齐。
+
+**步骤 3：逐组件反序列化** ([helpers.py:600-619](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L600-L619))
+
+对 example_row 的每一列和每个输出组件配对：
+1. 先用 `ast.literal_eval(value)` 尝试解析成 Python 对象（dict / list）
+2. 再用 `utils.is_prop_update()` 判断这是不是 `gr.update(...)` 格式的 dict
+   - 是 → 直接作为前端更新数据用
+   - 不是 → 抛 TypeError，走 except 兜底
+3. 兜底：调用 `component.read_from_flag(value_string)`，用组件自定义的反序列化方法把字符串还原成可用值（例如 File 组件还原文件路径为 FileData dict）
+
+**步骤 4：返回给前端渲染**
+
+整个路径 A **不调用用户函数，不重新计算，只做 2 次磁盘读 + 字符串反序列化**。
+
+---
+
+### 14.2 命中路径的冲突场景（看起来该更新，实际没更新）
+
+这就是「旧缓存打架」的核心来源：命中判断只看 example 的**索引编号**，不检查 example 的**实际输入内容**，也不检查**函数逻辑**是否变化。
+
+#### 冲突场景 A1：修改了 example#2 的输入内容，但索引仍是 2
+
+```
+第一次启动： examples = [输入0, 输入1, 输入2, 输入3]
+              Eager 缓存 → indices=[0,1,2,3]，log.csv 有输入2的旧输出
+
+你修改代码：examples = [输入0, 输入1, 新输入2, 输入3]
+              ← 只改了 example 2 的输入值，索引还是 2！
+
+第二次启动（Eager 模式）：log.csv 存在 + example_id=None → 打印 "Using cache from..." → 跳过，不重新缓存
+
+用户在界面上看到 example 列表第 3 项显示的是「新输入2」
+点击它 → _get_cached_index_if_cached(2) → indices 中有 2 → 返回 cached_index=2 → 读 log.csv 第 3 行 = **旧输入2的旧输出**
+
+结果：前端显示新输入2，但输出是旧输入2的结果 ❌❌❌
+```
+
+#### 冲突场景 A2：删除了 example#1，导致后续全部错位
+
+```
+原来：examples = [A, B, C, D, E]    索引 0 1 2 3 4
+缓存：indices=[0,1,2,3,4]
+log.csv：[表头, A输出, B输出, C输出, D输出, E输出]
+
+修改后：examples = [A, C, D, E]    索引 0 1 2 3
+                               ↑ C现在的索引是1，原来的索引是2
+
+Eager 启动：走 "Using cache from..."，不重新缓存
+
+点击界面第 2 项（显示 C，索引 1）：
+  _get_cached_index_if_cached(1) → 找到 → cached_index = 1
+  读 log.csv 第 2 行 = **原来 B 的输出** ❌
+
+点击界面第 3 项（显示 D，索引 2）：
+  读 log.csv 第 3 行 = **原来 C 的输出** ❌
+全部错位！
+```
+
+#### 冲突场景 A3：indices.csv 出现重复索引（同一个 example 被追加多次）
+
+```
+indices.csv = [0, 1, 2, 3, 4, 2, 2]  ← #2 被追加了 3 次
+
+点 example #2：
+  cached_indices.index(2) = **2**（第一次出现的位置）
+  读 log.csv 第 3 行 = 最早缓存的那个 #2 的输出
+```
+
+因为 `list.index()` 只找首次匹配，后续追加的重复行永远读不到，变成「孤儿数据」占磁盘空间。
+
+#### 冲突场景 A4：indices.csv 被删了，但 log.csv 还在
+
+```
+你手动删了 indices.csv，保留了 log.csv（里面有完整 5 行数据）
+
+点 example #2：
+  Path(indices.csv).exists()? → False ❌
+  → 直接返回 None！
+  → 走【路径 B】重新执行 #2，追加到 log.csv 和 indices.csv 末尾
+
+结果：log.csv 变成 [表头, 旧0, 旧1, 旧2, 旧3, 旧4, 新2]，共 7 行
+      indices.csv = [2]（只记录了新追加的这个）
+      下次点 #0 → indices 中没有 0 → 又走路径 B 再追加 → 更多重复
+```
+
+🔑 **只要 indices.csv 不在，哪怕 log.csv 里面全有，也等于没缓存过**。`indices.csv` 是唯一的「命中真相来源」。
+
+---
+
+## 15. 路径 B：未命中（indices.csv 查不到 K）— 重新执行 + 追加写入
+
+### 15.1 未命中的触发场景
+
+`_get_cached_index_if_cached(K)` 返回 `None` 有两种情况：
+1. `indices.csv` 文件根本不存在（如第一次启动、手动删除了）
+2. `indices.csv` 存在，但 K 不在值列表里（Eager 缓存了 0-4，但你点击了新增的 #5，或 indices 被删得只剩部分）
+
+### 15.2 逐步代码执行
+
+**前置场景**：Eager 缓存过 0-4，indices=[0,1,2,3,4]。你在 examples 列表末尾新增了一个 example，现在点击 #5。
+
+**步骤 1：进入未命中分支，同步阻塞调用 cache(5)** ([helpers.py:588-591](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L588-L591))
+
+```python
+if cached_index is None:
+    # synchronize_async = 在同步环境里跑异步，阻塞等待完成
+    client_utils.synchronize_async(self.cache, example_id=5)
+    # ↑ 这里会卡到 cache(5) 全部写完才继续
+
+    # 刚追加的一定在最后一行，直接用行数算，不再查 indices
+    with open(self.cached_indices_file) as f:
+        cached_index = len(f.readlines()) - 1
+```
+
+🔑 **为什么不再次调用 `_get_cached_index_if_cached(5)`？** 因为 `synchronize_async` 是同步阻塞的，返回时 5 必然已经被写入 indices.csv 的最后一行。用 `len(lines)-1` 比再遍历一次列表 O(n) 更快。但这隐含假设：**没有并发点击**，没人在你 cache(5) 的同时往 indices.csv 写别的行。
+
+**步骤 2：进入 cache(example_id=5) 的关键分叉判断** ([helpers.py:520-524](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L520-L524))
 
 ```python
 if Path(self.cached_file).exists() and example_id is None:
-    print(f"Using cache from '{utils.abspath(self.cached_folder)}' directory. "
-          "If method or examples have changed since last caching, delete this folder to clear cache.\n")
-    return  # 直接返回，不重新缓存
+    # ⚠️  注意这里是 AND 连接的两个条件：
+    #   ① log.csv 存在  AND  ② 是全量缓存调用（example_id=None）
+    print("Using cache from...")   # 打印提示
+    return                         # 直接返回，不做任何事
+else:
+    # ← cache(5) 走这里！因为 example_id=5 ≠ None
+    print("Caching examples at: ...")
 ```
 
-**复用条件（必须同时满足）：**
-1. `log.csv` 文件存在（`Path(self.cached_file).exists()`）
-2. `example_id is None`（表示是**全量缓存**调用，不是单个懒缓存调用）
+🔑 **路径 B 的第一个关键：`example_id is not None` 时，即使 log.csv 已经有 100 行全量数据，也一定会进入 `else` 分支执行缓存逻辑。** 不会打印 "Using cache from..."，不会复用旧的全量缓存。因为传了具体的 example_id 就说明是「我要缓存特定这一个」，而不是「我要缓存全部看看有没有旧的」。
 
-**这意味着：**
-| 场景 | 是否复用旧缓存 | 说明 |
-|------|---------------|------|
-| Eager 模式启动，且已有 log.csv | ✅ 是 | 直接跳过，不重新运行 |
-| Eager 模式启动，无 log.csv | ❌ 否 | 全部重新运行 |
-| Lazy 模式，首次点击 example 3 | ❌ 否 | 即使有全量 log.csv，也会**追加**一行新的（example_id=3 不为 None） |
-| Lazy 模式，已有 indices.csv 包含该索引 | ✅ 是 | 直接从 log.csv 读 |
+**进入 else 分支，但遍历 for 循环时只处理 5 号，其他全部 continue 跳过。**
 
-**⚠️ 重要提示：** Gradio 不会检查缓存内容是否过期。如果你的函数逻辑、模型权重或示例数据变了，但 log.csv 还在，Eager 模式会继续使用旧缓存，不会自动重新生成。
+**步骤 3：重置 CSVLogger 的 first_time 标志** ([flagging.py:232-239](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/flagging.py#L232-L239))
+
+```python
+self.cache_logger.setup(self.outputs, self.cached_folder)
+# → self.first_time = True   ← 每次调用 setup 都重置！
+```
+
+后果：后续第一个 `flag()` 调用时会再次走 `_create_dataset_file()` 检查。
+
+**步骤 4：_create_dataset_file() — 追加安全的保证** ([flagging.py:241-291](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/flagging.py#L241-L291))
+
+```python
+def _create_dataset_file(self, additional_headers=None):
+    ...
+    if self.dataset_file_name:
+        # cache_logger 构造时传了 dataset_file_name="log.csv"
+        # 所以路径是固定的，不做自动编号
+        self.dataset_filepath = self.flagging_dir / "log.csv"
+
+    # 只有文件完全不存在时才用 "w" 模式写表头
+    if not Path(self.dataset_filepath).exists():
+        with open(self.dataset_filepath, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(headers)
+```
+
+🔑 **路径 B 的第二个关键：文件已存在 → 不覆盖，不写表头，什么都不做。** 只有不存在时才新建写表头。因为我们用的是固定文件名 `log.csv`，不会像普通 FlaggingCallback 那样自动递增 `dataset1.csv`、`dataset2.csv`。所以追加是安全的，不会破坏已有内容。
+
+⚠️ **但这也带来隐患：** 如果你修改了输出组件的数量/类型，表头会发生变化，但 `_create_dataset_file()` 看到 log.csv 存在就直接复用，**不检查表头是否还一致**。旧表头 + 新数据格式混在同一个 CSV 里，后续读取会解析失败。
+
+**步骤 5：创建临时假事件 + 只处理第 5 号 example** ([helpers.py:532-549](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L532-L549))
+
+```python
+# 创建一个临时的 load 事件，复用 Blocks 完整的 preprocess → call_fn → postprocess 管线
+_, fn_index = self.root_block.default_config.set_event_trigger([EventListenerMethod(...)], ...)
+
+for i, example in enumerate(self.non_none_examples):
+    if example_id is not None and i != example_id:
+        continue   # 0,1,2,3,4,6,... 全部跳过
+    ↓
+    i=5 时才真正执行
+```
+
+🔑 虽然遍历整个 examples 列表（可能 100 个），但只有目标索引会被处理，其他都是空转 continue。
+
+**步骤 6：process_api 真正调用用户函数** ([helpers.py:556-572](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L556-L572))
+
+```python
+prediction = await self.root_block.process_api(
+    block_fn=self.root_block.default_config.fns[fn_index],
+    inputs=processed_input,
+    request=None,
+    in_event_listener=self.cache_examples != "lazy",
+    #                                    ↑ Eager=True   Lazy=False
+)
+output = prediction["data"]
+
+# 如果是生成器函数，合并所有 yield 为最终文件
+if generated_values:
+    output = await merge_generated_values_into_output(...)
+```
+
+这里是路径 B 唯一一次真正调用用户函数 / 模型推理的地方。和路径 A 不同，路径 B 有完整的计算开销。
+
+**步骤 7：追加写入两个文件** ([helpers.py:575-577](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L575-L577))
+
+```python
+# 写 log.csv — 内部 open("a") 追加
+self.cache_logger.flag(output)
+
+# 写 indices.csv — open("a") 追加
+with open(self.cached_indices_file, "a") as f:
+    f.write(f"{example_id or i}
+")  # 写入 "5
+"
+```
+
+两个文件都用 `"a"`（append）模式，**不会覆盖任何已有内容**。写 log.csv 时 CSVLogger 内部还有一把 `Lock()` 锁做线程安全保护（虽然 indices.csv 的写入没锁）。
+
+**步骤 8：清理临时假事件**
+
+```python
+self.root_block.default_config.fns.pop(fn_index)
+```
+
+**步骤 9：返回 load_from_cache，走与路径 A 汇合的反序列化逻辑**。
 
 ---
 
-### 13.2 何时需要手动重置缓存
+### 15.3 路径 B 的边界场景
 
-**需要手动重置的场景：**
+#### 场景 B1：末尾新增 example（最常见，无冲突）
 
-| 场景 | 重置方法 |
-|------|---------|
-| 函数逻辑修改了 | 删除 `.gradio/cached_examples/{dataset_id}/` 目录 |
-| 模型权重更新了 | 同上 |
-| 示例输入数据变了 | 同上 |
-| 输出组件类型/数量变了 | 同上（表头不匹配会报错） |
-| preprocess/postprocess 参数改了 | 同上 |
-| 想强制重新生成缓存 | 启动前设 `GRADIO_RESET_EXAMPLES_CACHE=True` |
+```
+原：examples = [0,1,2,3,4]  已缓存
+新：examples = [0,1,2,3,4,5]  新增第 6 个
+Eager 启动：走 "Using cache..." 跳过，不缓存 #5
 
-**重置方式对比：**
+点击 #5：
+  _get_cached_index_if_cached(5) → 5 not in [0,1,2,3,4] → None
+  → cache(5) → 追加
+  indices = [0,1,2,3,4,5]
+  log.csv 末尾追加 #5 输出
+  ✅ 无冲突，完全正确
+```
 
-| 方式 | 作用时机 | 影响范围 |
-|------|---------|---------|
-| `GRADIO_RESET_EXAMPLES_CACHE=True` | Examples 构造时 | 所有 Examples 组件的缓存目录（只要存在就删） |
-| 手动删除单个 `{dataset_id}` 目录 | 任何时候 | 只影响特定 Examples 组件 |
-| 删除整个 `.gradio/cached_examples/` | 任何时候 | 所有 Examples 组件的所有缓存 |
+#### 场景 B2：indices.csv 被全部删除，log.csv 保留
+
+```
+log.csv = [表头, 旧0, 旧1, 旧2, 旧3, 旧4]  5行数据完好
+indices.csv = 不存在
+
+点击 #0：
+  _get_cached_index_if_cached(0) → indices 不存在 → None
+  → cache(0)：
+      log.csv 存在 + example_id=0 ≠ None → 进入 else
+      flag() → _create_dataset_file → log.csv 存在，不覆盖
+      open("a") 追加一行 #0 的新输出
+      indices.csv 追加 "0"
+
+结果：
+  log.csv = [表头, 旧0, 旧1, 旧2, 旧3, 旧4, 新0]   ← 旧数据还在，新的追加了
+  indices.csv = [0]   ← 只知道新 #0 的位置
+
+下次再点 #0 → indices 有 0 → cached_index = 0
+  → 读 examples[0+1] = examples[1] = 旧0 ！
+
+🔑 严重 Bug：indices.csv 里的 0 是刚才新追加的，对应 log.csv 的第 7 行（examples[6]），
+但 cached_index=0 读的是 examples[1] = 旧0！
+索引位置和 log 行号完全错位。
+```
+
+正确的做法：要清空缓存就把整个 `{cached_folder}` 目录删掉，不要只删 indices.csv。
+
+#### 场景 B3：输出组件列数发生变化后追加
+
+```
+原来 outputs = [TextBox(label="out1"), TextBox(label="out2")]
+log.csv 表头 = "out1, out2, timestamp"
+
+你修改代码，outputs 改成了 [Image(label="img"), Label(label="cls")]
+log.csv 旧表头还是 "out1, out2, timestamp"
+
+cache(5) 时：
+  _create_dataset_file() 看到 log.csv 存在 → 直接复用，不检查表头！
+  flag() 追加写的是 Image 和 Label 的序列化字符串
+
+读取时：
+  新表头的列数/顺序和旧的完全不同
+  zip(outputs, example_row, strict=False) → 静默对不齐
+  Image.read_from_flag("TextBox 的字符串内容") → 大概率抛异常或显示错误
+```
+
+#### 场景 B4：example_id 超出 examples 列表范围
+
+```python
+for i, example in enumerate(self.non_none_examples):
+    if example_id is not None and i != example_id:
+        continue
+    # i == K 时才执行这里
+```
+
+如果 examples 只有 5 个（0-4），但 somehow 触发了 cache(100)，整个 for 循环全部 continue，没有任何数据被处理 → log.csv 和 indices.csv 都不追加。
+
+回到 load_from_cache：
+- `with open(indices) as f: cached_index = len(lines) - 1`
+- → len(lines) 还是原来的 5，cached_index = 4
+- → 读 log.csv 第 5 行 = 原来 #4 的输出，完全错误
+- 更糟：如果 indices.csv 之前不存在，现在还是空的，len(lines)-1 = -1 → 负数下标
+
+#### 场景 B5：同一个 example_id 被两次追加
+
+```
+indices.csv 原来 [0,1,2,3,4]
+用户手动删除了 indices.csv 中 value=2 的那一行（不是删文件，是编辑文件删了一行）
+现在 indices = [0,1,3,4]
+
+点击 #2：
+  2 not in [0,1,3,4] → None
+  → cache(2)：flag() 追加 log.csv，open("a") 追加 indices.csv 写 "2"
+  indices = [0,1,3,4,2]
+
+下次再点 #2 →
+  cached_indices = [0,1,3,4,2]
+  2 在列表中 → cached_indices.index(2) = 4（第一次出现的位置是下标 4）
+  读 log.csv 第 4+1=5 行 = 旧 #4 的输出 ❌❌❌
+```
+
+index() 找的是「位置」不是「值对应的位置正确性」。虽然 indices[4] = 2（值是对的），但 cached_index = 4 对应的是 log.csv 的第 5 行，而新追加的 #2 输出实际在 log.csv 第 7 行（原6行+1行新的=7行），位置完全不对。
+
+**结论**：永远不要手动编辑 indices.csv，要么全删目录，要么不动。
+
+#### 场景 B6：并发点击（多人同时点不同 example）
+
+```
+用户 A 点 #5，用户 B 同时点 #6（都未命中）
+
+时序：
+  t1: A → cache(5) ... 正在执行 process_api，还没写文件
+  t2: B → cache(6) ... 也在执行
+  t3: A 写完 indices.csv → 变成 [0,1,2,3,4,5]
+  t4: B 写完 indices.csv → 变成 [0,1,2,3,4,5,6]
+  t5: A 回到 load_from_cache → len(lines)-1 = 7-1=6，读的是 #6 的位置 ❌
+  t6: B 回到 load_from_cache → len(lines)-1 = 7-1=6，这次读对了（但其实不一定谁先写）
+```
+
+写入顺序和 len(lines)-1 读取的组合是非确定性的，可能 A 读了 B 的结果，也可能相反。**并发场景下路径 B 的 `len(lines)-1` 假设不成立。**
+
+不过实际发生概率不高，因为 example 缓存通常是单用户开发阶段使用。
 
 ---
 
-### 13.3 缓存失效机制的缺失
-
-当前实现**没有**以下机制：
-- ❌ 没有缓存时间戳检查（不会自动过期）
-- ❌ 没有内容 hash 校验（不会检测函数/数据变化）
-- ❌ 没有版本号机制（不会检测代码版本变化）
-- ❌ 没有增量更新（要么全用旧的，要么全重新生成）
-
-这是因为 Examples 缓存本质是**简单的磁盘持久化**，不是 `@gr.cache` 那样的内容感知缓存系统。
-
----
-
-## 14. 懒缓存单独路径的设计原因
+## 16. 懒缓存单独路径的设计原因
 
 Lazy 模式不是简单的「启动时不跑，点击时再跑」，它在多个关键点都有特殊处理，有其深层的技术原因。
 
 ---
 
-### 14.1 原因一：启动时机不同 — `_start_caching` 的类型判断
+### 16.1 原因一：启动时机不同 — `_start_caching` 的类型判断
 
 **位置：** [helpers.py:497-510](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L497-L510)
 
@@ -626,7 +994,7 @@ async def _start_caching(self):
 
 ---
 
-### 14.2 原因二：组件初始化问题 — Issue #12564
+### 16.2 原因二：组件初始化问题 — Issue #12564
 
 **位置：** [helpers.py:556-565](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L556-L565)
 
@@ -686,7 +1054,7 @@ def updateable(fn):
 
 ---
 
-### 14.3 原因三：预加载（preload）不支持 Lazy
+### 16.3 原因三：预加载（preload）不支持 Lazy
 
 **位置：** [helpers.py:392-395](file:///d:/fz/0601/solo-dogfeeding/code/245-gradio/gradio/helpers.py#L392-L395)
 
@@ -701,7 +1069,7 @@ Lazy 模式不支持 preload，因为 preload 是页面加载时自动填充输�
 
 ---
 
-### 14.4 原因四：缓存文件的读写逻辑不同
+### 16.4 原因四：缓存文件的读写逻辑不同
 
 | 方面 | Eager 模式 | Lazy 模式 |
 |------|-----------|-----------|
@@ -723,7 +1091,7 @@ Lazy 模式不支持 preload，因为 preload 是页面加载时自动填充输�
 
 ---
 
-### 14.5 原因五：`self.cache_examples` 类型变化带来的分支
+### 16.5 原因五：`self.cache_examples` 类型变化带来的分支
 
 `self.cache_examples` 从 `bool` 变成字符串 `"lazy"` 是一个巧妙的设计：
 
@@ -747,7 +1115,7 @@ if self.cache_examples == "lazy":  # 只有 Lazy
 
 ---
 
-### 14.6 为什么不统一路径？
+### 16.6 为什么不统一路径？
 
 理论上可以把 Eager 模式实现为「启动时遍历所有 example_id，逐个调用懒缓存逻辑」，但当前分开实现有以下考量：
 
