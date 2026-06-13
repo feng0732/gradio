@@ -6,19 +6,37 @@
 
 ```
 gradio/
-├── routes.py              # OpenAPI 路由与 Schema 输出
-├── blocks.py              # API 信息组装核心逻辑
-├── data_classes.py        # 数据结构定义
+├── routes.py                    # OpenAPI 路由与 Schema 输出
+├── blocks.py                    # API 信息组装核心逻辑
+├── data_classes.py              # 数据结构定义
 ├── components/
-│   ├── base.py            # 组件基类 api_info 默认实现
-│   ├── textbox.py         # 简单类型组件示例
-│   ├── number.py          # 条件类型组件示例
-│   ├── dropdown.py        # 枚举类型组件示例
-│   ├── image.py           # data_model 驱动组件示例
-│   ├── file.py            # data_model 驱动组件示例
-│   └── paramviewer.py     # 任意类型组件示例
-├── external.py            # 从 OpenAPI 加载 Gradio 应用
-└── external_utils.py      # OpenAPI 到 Gradio 组件映射工具
+│   ├── base.py                  # 组件基类 api_info 默认实现
+│   ├── textbox.py               # 简单类型组件示例
+│   ├── number.py                # 条件类型组件示例
+│   ├── dropdown.py              # 枚举类型组件示例
+│   ├── image.py                 # data_model 驱动组件示例
+│   ├── file.py                  # data_model 驱动组件示例
+│   └── paramviewer.py           # 任意类型组件示例
+├── external.py                  # 从 OpenAPI 加载 Gradio 应用
+└── external_utils.py            # OpenAPI 到 Gradio 组件映射工具
+
+client/
+├── python/
+│   └── gradio_client/
+│       ├── utils.py             # json_schema_to_python_type 类型转换
+│       └── data_classes.py      # ParameterInfo 等数据结构
+└── js/
+    └── src/
+        ├── helpers/
+        │   └── api_info.ts      # transform_api_info, get_type, get_description
+        └── utils/
+            └── view_api.ts      # 前端 API 视图入口
+
+js/
+└── core/
+    └── src/
+        └── api_docs/
+            └── ApiDocs.svelte   # View API 页面组件
 ```
 
 ---
@@ -151,6 +169,34 @@ class APIInfo(TypedDict):
 - `"public"`: 出现在所有 API 信息中
 - `"undocumented"`: 仅在 `all_endpoints=True` 时出现
 - `"private"`: 永远不出现在 API 信息中
+
+### 2.5 输入/输出 Schema 差异化
+
+在组装 API 信息时，输入参数和输出返回值使用不同的 api_info 来源：
+
+**输入参数** 使用 `api_info_as_input`：
+```python
+info = component.get("api_info_as_input", component.get("api_info"))
+```
+
+**输出返回值** 使用 `api_info_as_output`：
+```python
+info = component.get("api_info_as_output", component["api_info"])
+```
+
+这意味着如果组件重写了 `api_info_as_input()` 或 `api_info_as_output()`，参数和返回值的 Schema 可能不同，从而导致最终显示的类型不同。
+
+**典型例子：Image 组件的输出**（image.py 第 227-232 行）：
+```python
+def api_info_as_output(self) -> dict[str, Any]:
+    if self.streaming == "base64":
+        schema = Base64ImageData.model_json_schema()
+        schema.pop("description", None)
+        return schema
+    return self.api_info()
+```
+
+当 `streaming == "base64"` 时，输出类型是 base64 编码的图片数据，而输入类型可能是文件路径或上传的文件。
 
 ---
 
@@ -361,9 +407,189 @@ OpenAPI Schema 的生成入口在 [routes.py](file:///d:/fz/0601/solo-dogfeeding
 
 ---
 
-## 六、前端视图：view_api 客户端
+## 六、前端类型转换：从 Schema 到 JS 签名
 
-### 6.1 客户端实现
+### 6.1 转换入口：transform_api_info
+
+前端类型转换的核心函数是 `transform_api_info()`，定义在 [client/js/src/helpers/api_info.ts](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/client/js/src/helpers/api_info.ts) 第 86-176 行。
+
+**函数签名：**
+```typescript
+function transform_api_info(
+    api_info: ApiInfo<ApiData>,
+    config: Config,
+    api_map: Record<string, number>
+): ApiInfo<JsApiData>
+```
+
+**转换流程：**
+1. 遍历 `named_endpoints` 和 `unnamed_endpoints`
+2. 对每个端点，查找对应的 dependency 索引和类型信息
+3. 处理 state 组件（隐藏参数，插入到参数列表中）
+4. 对每个参数和返回值调用 `transform_type()` 进行类型转换
+5. 添加 endpoint 类型信息（generator、cancel）
+
+### 6.2 类型转换核心：get_type 函数
+
+`get_type()` 函数（api_info.ts 第 178-217 行）是 JS 类型生成的核心，根据四个维度计算最终类型：
+
+```typescript
+function get_type(
+    type: { type: any; description: string },
+    component: string,
+    serializer: string,
+    signature_type: "return" | "parameter"
+): string | undefined
+```
+
+**判断优先级（从高到低）：**
+
+1. **Api 组件**：直接返回 `type.type`
+2. **基本类型**（switch 语句）：
+   - `"string"` → `"string"`
+   - `"boolean"` → `"boolean"`
+   - `"number"` → `"number"`
+3. **serializer 分支**：
+   - `"JSONSerializable"` → `"any"`
+   - `"StringSerializable"` → `"any"`
+   - `"ListStringSerializable"` → `"string[]"`
+4. **Image 组件**（特殊硬编码）：
+   - 参数类型 → `"Blob | File | Buffer"`
+   - 返回类型 → `"string"`
+5. **FileSerializable**：
+   - 数组 + 参数 → `"(Blob | File | Buffer)[]"`
+   - 数组 + 返回 → `"{ name: string; data: string; size?: number; is_file?: boolean; orig_name?: string}[]"`
+   - 单值 + 参数 → `"Blob | File | Buffer"`
+   - 单值 + 返回 → `"{ name: string; data: string; size?: number; is_file?: boolean; orig_name?: string}"`
+6. **GallerySerializable**：
+   - 参数 → `"[(Blob | File | Buffer), (string | null)][]"`
+   - 返回 → `"[{ name: string; data: string; size?: number; is_file?: boolean; orig_name?: string}, (string | null))][]"`
+
+### 6.3 描述转换：get_description 函数
+
+`get_description()` 函数（api_info.ts 第 219-231 行）处理类型描述文本：
+
+| serializer | 描述文本 |
+|-----------|---------|
+| `GallerySerializable` | "array of [file, label] tuples" |
+| `ListStringSerializable` | "array of strings" |
+| `FileSerializable` | "array of files or single file" |
+| 其他 | 使用 `type.description` |
+
+### 6.4 serializer 字段说明
+
+**注意：** `serializer` 字段在当前版本的 Python 后端代码中没有显式生成，它是早期版本 Gradio 中的概念（见 `test_data/blocks_configs.py`）。当前版本的前端代码仍然保留对 serializer 的处理逻辑，主要用于向后兼容和特殊组件类型判断。
+
+在当前版本中，类型判断主要依赖：
+- `type.type`：JSON Schema 中的类型字段
+- `component`：组件类型名称（如 "Image", "Textbox"）
+- `signature_type`：是参数还是返回值
+
+### 6.5 参数与返回值类型差异
+
+**核心原因：** `get_type()` 函数的第四个参数 `signature_type` 区分了 `"parameter"` 和 `"return"`，导致同一组件在输入和输出时显示不同的 JS 类型。
+
+**典型差异示例：**
+
+| 组件 | 参数类型（parameter） | 返回类型（return） | 原因 |
+|------|---------------------|-------------------|------|
+| Image | `Blob \| File \| Buffer` | `string` | 输入时上传文件对象，输出时返回文件路径/URL |
+| File（单文件） | `Blob \| File \| Buffer` | `{ name: string; data: string; ... }` | 输入上传，输出返回文件数据对象 |
+| File（多文件） | `(Blob \| File \| Buffer)[]` | `{ name: string; data: string; ... }[]` | 同上，数组形式 |
+| Gallery | `[(Blob \| File \| Buffer), (string \| null)][]` | `[{ name: string; ... }, (string \| null))][]` | 画廊是文件+标签元组数组 |
+
+**代码实现（api_info.ts 第 201-216 行）：**
+```typescript
+} else if (component === "Image") {
+    return signature_type === "parameter" ? "Blob | File | Buffer" : "string";
+} else if (serializer === "FileSerializable") {
+    if (type?.type === "array") {
+        return signature_type === "parameter"
+            ? "(Blob | File | Buffer)[]"
+            : `{ name: string; data: string; size?: number; is_file?: boolean; orig_name?: string}[]`;
+    }
+    return signature_type === "parameter"
+        ? "Blob | File | Buffer"
+        : `{ name: string; data: string; size?: number; is_file?: boolean; orig_name?: string}`;
+}
+```
+
+### 6.6 前端页面展示逻辑
+
+View API 页面使用两套数据源分别展示 Python 和 JavaScript 类型：
+
+**ParametersSnippet.svelte**（参数展示）：
+- Python 模式：`python_type.type`（后端 `json_schema_to_python_type()` 生成）
+- JavaScript 模式：`js_returns[i].type`（前端 `get_type()` 生成）
+- 额外显示：参数名、是否必填、默认值
+
+**ResponseSnippet.svelte**（返回值展示）：
+- Python 模式：`python_type.type`
+- JavaScript 模式：`js_returns[i].type`
+- 多返回值时显示索引 `[i]`
+
+**关键代码（ParametersSnippet.svelte 第 34-38 行）：**
+```svelte
+{#if current_language === "python"}
+    {python_type.type}
+{:else if current_language === "bash"}
+    {python_type.type}
+{:else}
+    {js_returns[i].type || "any"}
+{/if}
+```
+
+---
+
+## 七、后端 Python 类型转换
+
+### 7.1 json_schema_to_python_type 函数
+
+Python 客户端中的类型转换由 [client/python/gradio_client/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/client/python/gradio_client/utils.py) 中的 `json_schema_to_python_type()` 函数（第 923-1003 行）实现。
+
+**函数签名：**
+```python
+def json_schema_to_python_type(schema: Any) -> str:
+```
+
+### 7.2 类型映射规则
+
+| JSON Schema 类型 | Python 类型 | 说明 |
+|------------------|------------|------|
+| `{}` | `Any` | 空 schema |
+| `{"type": "null"}` | `None` | 空值 |
+| `{"type": "string"}` | `str` | 字符串 |
+| `{"type": "integer"}` | `int` | 整数 |
+| `{"type": "number"}` | `float` | 数字 |
+| `{"type": "boolean"}` | `bool` | 布尔 |
+| `{"type": "array", "items": {...}}` | `list[...]` | 数组 |
+| `{"type": "array", "prefixItems": [...]}` | `tuple[...]` | 元组 |
+| `{"type": "object", "properties": {...}}` | `dict(...)` | 对象（带属性描述） |
+| `{"enum": [...]}` | `Literal[...]` | 枚举 |
+| `{"const": ...}` | `Literal[...]` | 常量 |
+| `{"oneOf": [...]}` | `... | ...` | 联合类型 |
+| `{"anyOf": [...]}` | `... | ...` | 联合类型 |
+| `{"allOf": [...]}` | `All[...]` | 组合类型 |
+| 文件类型（特殊识别） | `filepath` | 文件路径 |
+
+### 7.3 文件类型特殊识别
+
+`_is_file_schema()` 函数用于识别文件类型的 JSON Schema。如果 schema 符合 FileData 的结构（有 path、url、size、orig_name 等字段，且 meta 中包含 `_type: "gradio.FileData"`），则类型显示为 `filepath`。
+
+**测试验证（test_api_info.py 第 244-249 行）：**
+```python
+def test_file_data_is_filepath():
+    assert json_schema_to_python_type(FileData.model_json_schema()) == "filepath"
+
+def test_image_data_is_filepath():
+    assert json_schema_to_python_type(ImageData.model_json_schema()) == "filepath"
+```
+
+---
+
+## 八、前端视图：view_api 客户端
+
+### 8.1 客户端实现
 
 [client/js/src/utils/view_api.ts](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/client/js/src/utils/view_api.ts) 实现了前端的 API 视图获取逻辑。
 
@@ -373,64 +599,139 @@ OpenAPI Schema 的生成入口在 [routes.py](file:///d:/fz/0601/solo-dogfeeding
 3. 调用 `transform_api_info()` 转换为前端可用格式
 4. 兼容 `/predict` 命名端点和索引端点
 
-### 6.2 服务端注入
+### 8.2 服务端注入
 
 在 [routes.py](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/gradio/routes.py) 的 `main()` 函数（第 605 行起）中，通过模板变量 `gradio_api_info` 将 API 信息注入到 HTML 页面中。
 
 ---
 
-## 七、类型映射完整链路图
+## 九、类型映射完整链路图
+
+### 9.1 整体架构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    组件层 (Component)                        │
-│  ┌─────────────┐  ┌─────────────┐  ┌──────────────────────┐ │
-│  │  Textbox    │  │   Number    │  │ Image / File         │ │
-│  │ .api_info() │  │ .api_info() │  │ .data_model          │ │
-│  │ {type:str}  │  │ {type:num}  │  │  → model_json_schema()│ │
-│  └──────┬──────┘  └──────┬──────┘  └──────────┬───────────┘ │
-└─────────┼────────────────┼────────────────────┼─────────────┘
-          │                │                    │
-          ▼                ▼                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  配置层 (blocks config)                      │
-│  components: [                                              │
-│    {api_info, api_info_as_input, api_info_as_output, ...}   │
-│  ]                                                          │
-└─────────────────────────────┬───────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│               API 信息层 (get_api_info)                      │
-│  named_endpoints: {                                         │
-│    "/predict": {                                            │
-│      parameters: [{type, python_type, component, ...}],     │
-│      returns: [{type, python_type, component, ...}]         │
-│    }                                                        │
-│  }                                                          │
-└─────────────────────────────┬───────────────────────────────┘
-                              │
-          ┌───────────────────┴───────────────────┐
-          │                                       │
-          ▼                                       ▼
-┌──────────────────────┐             ┌──────────────────────────┐
-│  /gradio_api/info    │             │ /gradio_api/openapi.json │
-│  (Gradio API 格式)   │             │ (OpenAPI 3.0.2 格式)     │
-└──────────────────────┘             └──────────────────────────┘
-          │                                       ▲
-          │                                       │
-          ▼                                       │
-┌──────────────────────┐             ┌──────────────────────────┐
-│  前端 View API 页面  │             │  load_openapi() 反向生成 │
-│  (view_api.ts)       │             │  Gradio 应用             │
-└──────────────────────┘             └──────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                       组件层 (Component)                              │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────────┐ │
+│  │  Textbox    │  │   Number    │  │ Image / File / Gallery      │ │
+│  │ .api_info() │  │ .api_info() │  │ .data_model / .api_info()   │ │
+│  │ {type:str}  │  │ {type:num}  │  │  → model_json_schema()      │ │
+│  └──────┬──────┘  └──────┬──────┘  └────────────┬────────────────┘ │
+└─────────┼────────────────┼───────────────────────┼──────────────────┘
+          │                │                       │
+          ▼                ▼                       ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     配置层 (blocks config)                            │
+│  components: [                                                        │
+│    {type, props, api_info, api_info_as_input, api_info_as_output}    │
+│  ]                                                                    │
+│  dependencies: [                                                      │
+│    {id, inputs, outputs, api_name, api_visibility, ...}              │
+│  ]                                                                    │
+└─────────────────────────────────┬───────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                  API 信息组装层 (get_api_info)                        │
+│  1. 遍历 dependencies，按 api_visibility 过滤                         │
+│  2. 从 config 中查找输入/输出组件的 api_info                          │
+│  3. 从函数签名获取 parameter_name / 默认值                             │
+│  4. 调用 json_schema_to_python_type() 生成 python_type                │
+│  5. 组装 ParameterInfo / APIReturnInfo                                │
+│                                                                       │
+│  输出: {named_endpoints, unnamed_endpoints}                          │
+│    - type: JSON Schema                                                │
+│    - python_type: Python 类型字符串                                   │
+│    - component: 组件名                                                │
+└─────────────────────────────────┬───────────────────────────────────┘
+                                  │
+           ┌──────────────────────┴──────────────────────┐
+           │                                             │
+           ▼                                             ▼
+┌──────────────────────────┐                ┌──────────────────────────────┐
+│  /gradio_api/info        │                │ /gradio_api/openapi.json     │
+│  (Gradio 原生格式)       │                │ (OpenAPI 3.0.2 格式)         │
+│  - type (JSON Schema)    │                │  - paths                     │
+│  - python_type           │                │  - components.schemas        │
+│  - component             │                │  - file 类型先上传           │
+└────────────┬─────────────┘                └──────────────┬───────────────┘
+             │                                             │
+             ▼                                             ▼
+┌──────────────────────────┐                ┌──────────────────────────────┐
+│  前端 transform_api_info │                │  load_openapi() 反向生成     │
+│  → get_type()            │                │  Gradio 应用                 │
+│  → get_description()     │                │                               │
+│  输出 JsApiData:         │                │                               │
+│  - type: JS 类型字符串   │                │                               │
+│  - description: 描述     │                │                               │
+└────────────┬─────────────┘                └──────────────────────────────┘
+             │
+             ▼
+┌──────────────────────────┐
+│  View API 页面展示       │
+│  (ApiDocs.svelte)        │
+│  - Python 类型           │
+│  - JavaScript 类型       │
+│  - 参数/返回值分开显示    │
+└──────────────────────────┘
+```
+
+### 9.2 类型判断优先级（前端 get_type）
+
+```
+输入: type (JSON Schema) + component + serializer + signature_type
+              │
+              ▼
+    ┌─────────────────────────┐
+    │ component === "Api" ?   │── 是 ──→ 返回 type.type
+    └─────────────┬───────────┘
+                  │ 否
+                  ▼
+    ┌─────────────────────────┐
+    │ 基本类型 switch?         │── string  → "string"
+    │                         │── boolean → "boolean"
+    │                         │── number  → "number"
+    └─────────────┬───────────┘
+                  │ 未匹配
+                  ▼
+    ┌─────────────────────────┐
+    │ serializer 分支?         │
+    │  - JSONSerializable     │──→ "any"
+    │  - StringSerializable   │──→ "any"
+    │  - ListStringSerializable │→ "string[]"
+    └─────────────┬───────────┘
+                  │ 未匹配
+                  ▼
+    ┌─────────────────────────┐
+    │ component === "Image"?  │
+    │  - parameter            │──→ "Blob | File | Buffer"
+    │  - return               │──→ "string"
+    └─────────────┬───────────┘
+                  │ 否
+                  ▼
+    ┌─────────────────────────┐
+    │ serializer ===          │
+    │ "FileSerializable"?     │
+    │  - 数组 + parameter     │──→ "(Blob | File | Buffer)[]"
+    │  - 数组 + return        │──→ FileData[] 对象
+    │  - 单值 + parameter     │──→ "Blob | File | Buffer"
+    │  - 单值 + return        │──→ FileData 对象
+    └─────────────┬───────────┘
+                  │ 否
+                  ▼
+    ┌─────────────────────────┐
+    │ serializer ===          │
+    │ "GallerySerializable"?  │
+    │  - parameter            │──→ [Blob, string][]
+    │  - return               │──→ [FileData, string][]
+    └─────────────────────────┘
 ```
 
 ---
 
-## 八、关键数据结构总结
+## 十、关键数据结构总结
 
-### 8.1 组件 api_info 输出格式
+### 10.1 组件 api_info 输出格式
 
 **简单类型：**
 ```python
@@ -474,7 +775,7 @@ OpenAPI Schema 的生成入口在 [routes.py](file:///d:/fz/0601/solo-dogfeeding
 {"type": {}, "description": "any valid json"}
 ```
 
-### 8.2 API 端点信息结构
+### 10.2 API 端点信息结构
 
 ```python
 {
@@ -512,7 +813,7 @@ OpenAPI Schema 的生成入口在 [routes.py](file:///d:/fz/0601/solo-dogfeeding
 
 ---
 
-## 九、关键文件速查
+## 十一、关键文件速查
 
 | 文件 | 关键内容 |
 |------|----------|
@@ -522,4 +823,7 @@ OpenAPI Schema 的生成入口在 [routes.py](file:///d:/fz/0601/solo-dogfeeding
 | [components/base.py](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/gradio/components/base.py) | `api_info()` 默认实现、data_model 转换逻辑 |
 | [external.py](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/gradio/external.py) | `load_openapi()` 从 OpenAPI 生成 Gradio 应用 |
 | [external_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/gradio/external_utils.py) | `component_from_parameter_schema()`、`component_from_request_body_schema()` |
-| [view_api.ts](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/client/js/src/utils/view_api.ts) | 前端 API 信息获取与转换 |
+| [client/python/gradio_client/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/client/python/gradio_client/utils.py) | `json_schema_to_python_type()`、Python 类型转换 |
+| [client/js/src/helpers/api_info.ts](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/client/js/src/helpers/api_info.ts) | `transform_api_info()`、`get_type()`、`get_description()` |
+| [client/js/src/utils/view_api.ts](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/client/js/src/utils/view_api.ts) | 前端 API 信息获取与转换入口 |
+| [js/core/src/api_docs/ApiDocs.svelte](file:///d:/fz/0601/solo-dogfeeding/code/249-gradio/js/core/src/api_docs/ApiDocs.svelte) | View API 页面组件 |
