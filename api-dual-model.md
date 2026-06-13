@@ -170,7 +170,9 @@ TabbedInterface([interface_instance, blocks_instance], ["Tab A", "Tab B"])
 
 ### 5.4 根本原因
 
-边界不清的本质是 **Interface 没有独立的状态模型**。它的 `input_components`、`output_components`、`fn` 等属性仅在构造阶段用于生成 Blocks 配置，构造完成后通过 `self.config = self.get_config_file()` 固化为 JSON 配置。运行时行为完全由 `Blocks` + `BlocksConfig` + `BlockFunction` 决定，Interface 自身的属性不再被引用。
+边界不清的本质是 **Interface 没有独立的运行时状态模型**。它的 `input_components`、`output_components`、`fn` 等属性仅在构造阶段用于生成 `BlocksConfig` 配置。构造完成后，所有运行时信息都已注入到 `BlockFunction` 对象（持有 `fn` 引用、`inputs`/`outputs` 组件引用）和 `self.default_config`（持有 blocks 和 fns 字典）中。Interface 自身的属性在运行时不再被访问——请求处理完全由 `Blocks` 实例的方法 + `BlocksConfig` 字典 + `BlockFunction` 对象驱动。
+
+> 注意：这并不意味着 Interface 的属性被销毁，只是它们在运行时事件处理中不再发挥作用。如果 Interface 被嵌入父 Blocks，它的 `default_config` 仍保留所有引用，但会被原地修改（如 `BlockFunction._id` 加偏移），最终运行时请求永远路由到父 Blocks。
 
 ---
 
@@ -564,21 +566,80 @@ class FlagMethod:
 
 而 `FlagMethod` 实例又作为 `fn` 参数传给了 `BlockFunction`。所以 `flagging_callback` 的生命周期由 `BlockFunction.fn` → `FlagMethod` → `flagging_callback` 这条引用链保证，与 Interface 自身无关。
 
-### 9.4 嵌入后的 Interface 属性彻底失效
+### 9.4 嵌入后的 Interface：不是空壳，而是"保留引用但运行时失效"
 
-当 Interface 被 `.render()` 嵌入父 Blocks 后，情况更进一步：
+当 Interface 被 `.render()` 嵌入父 Blocks 后，需要清晰区分两种不同的状态——**"保留引用"和"运行时不再参与"并不矛盾**，它们描述的是不同层面的事实：
 
-- **组件引用可能指向过时的列表**：`self.input_components` 仍是构造时的组件对象列表，但这些组件的 `_id` 已经在父的 `blocks` 字典中被注册。Interface 自身持有的 `default_config.blocks` 和 `default_config.fns` 已被合并到父中，Interface 的 `BlocksConfig` 实质上变为空壳。
+**9.4.1 child.default_config 仍保留引用的具体表现**
 
-- **事件函数被复制引用而非搬走**：`Blocks.render()` 的 `root_context.fns[dependency._id] = dependency` 只是将 `BlockFunction` 对象的**引用复制**到父的 `fns` 字典。子的 `default_config.fns` 字典中虽然仍保留对同一对象的引用，但由于 `dependency._id` 被**原地修改**（加了偏移），导致子的 fns 字典的 key（旧 `_id`）与 value 的 `_id`（新 `_id`）不一致。例如子的 `fns[0]` 指向的对象的 `_id` 可能已经是 3，无法再通过 `fns[0]` 正确索引。
+`Blocks.render()` 的合并操作全部是**引用复制**，没有任何一步会清空或删除 child 的 `default_config`：
 
-- **子的 blocks 字典同样保留引用**：`root_context.blocks.update(self.blocks)` 也是引用复制，子的 `default_config.blocks` 字典仍然包含所有组件的引用。但组件的 `page` 属性被重写为根页面，且运行时只通过根的 blocks 字典访问组件。
+1. **blocks 字典**：`root_context.blocks.update(self.blocks)`（[blocks.py#L1474](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1474)）将 child 中所有组件的引用复制到父的 blocks 字典，但**child 的 `default_config.blocks` 字典本身不变**。它仍然包含所有组件对象的完整引用。
 
-- **唯一例外：`self.config`**：Interface 在 `__init__` 末尾通过 `self.config = self.get_config_file()` 保存了一份 JSON 配置。但如果 Interface 作为子组件嵌入父 Blocks，这份配置不会被使用——父 Blocks 会在自己的 `__exit__` 中重新调用 `self.get_config_file()` 生成包含所有子组件的全局配置。
+   不过，子组件的 `page` 属性会被**原地修改**（[blocks.py#L1472-L1473](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1472-L1473)）：
+   ```python
+   for block in self.blocks.values():
+       block.page = Context.root_block.current_page
+   ```
+   由于组件对象是共享的，这个修改在 child 和父的 blocks 字典中都可见。
 
-### 9.5 总结：一套配置的本质
+2. **fns 字典**：`root_context.fns[dependency._id] = dependency`（[blocks.py#L1508](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1508)）将 `BlockFunction` 对象的引用复制到父的 fns 字典，但**child 的 `default_config.fns` 字典本身也不变**，仍然包含所有 `BlockFunction` 对象的引用。
 
-所谓"一套运行时配置"的本质是：**整个 Gradio 应用在运行时只有一个 `BlocksConfig` 实例处于活跃状态**，即最外层根 Blocks 的 `default_config`。所有子 Blocks/Interface 的组件和事件函数在 `.render()` 时被合并到这个唯一的配置中，子的 `BlocksConfig` 从此不再参与运行时逻辑。
+   但 `dependency._id += dependency_offset`（[blocks.py#L1483](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1483)）是**原地修改对象属性**，导致 child 的 fns 字典出现**key 与 value 不一致**：
+   - 合并前：`child.fns = {0: BlockFunction(_id=0), 1: BlockFunction(_id=1)}`
+   - 合并后：`child.fns = {0: BlockFunction(_id=3), 1: BlockFunction(_id=4)}`
+   - `child.fns[0]._id` 已经是 3，但字典 key 还是 0
+
+3. **配置未被清空**：`self.default_config` 对象本身从未被重新赋值或清空。child 的 `default_config.blocks` 和 `default_config.fns` 一直保持非空状态。
+
+> **为什么不清空？** Gradio 没有任何机制主动清空 child 的 default_config。因为 Python 的垃圾回收会在 child 实例不再被引用时自动回收这些对象。保留引用还允许通过 `child.blocks`、`child.fns` 等接口以编程方式访问子应用的内部结构（虽然通常不推荐）。
+
+**9.4.2 运行时为何只有根 BlocksConfig 被读取**
+
+尽管 child 的 default_config 保留了完整引用，但运行时永远只会访问根 Blocks 的 `default_config`，原因有三：
+
+1. **路由绑定层面**：`demo.launch()` 启动时，FastAPI 路由（`/call`、`/predict` 等）绑定到根 Blocks 实例的方法（`call_api`、`process_api`、`call_function` 等）。请求到达时，这些方法中的 `self` **永远是根 Blocks 实例**。
+
+2. **属性访问层面**：这些方法内部通过 `self.fns[fn_index]` 和 `self.blocks[_id]` 访问数据。而 `self.fns` 和 `self.blocks` 是 property（[blocks.py#L1187-L1196](file:///d:/fz/0601/solo-dogfeeding/code/238-gradio/gradio/blocks.py#L1187-L1196)），返回 `self.default_config.fns` 和 `self.default_config.blocks`——即根 Blocks 自己的 `default_config`。
+
+3. **前端配置层面**：前端收到的 `config` JSON 是 `root_block.get_config_file()` 序列化的结果，其中的 `dependencies` 数组的 `id` 是根 fns 字典偏移后的 `fn_index`（3, 4, 5...）。前端发起请求时携带的就是这些偏移后的 `fn_index`，只能在根的 fns 字典中找到对应 `BlockFunction`。
+
+**9.4.3 避免混淆的正确表述**
+
+| 错误表述 | 正确表述 | 原因 |
+|---------|---------|------|
+| "变为空壳" | "保留引用但运行时失效" | child.default_config 字典非空，只是不会被运行时访问 |
+| "被清空" | "被共享引用" | 组件和 BlockFunction 对象同时被子和父引用 |
+| "内容被搬走" | "内容被引用复制" | 对象没有被"搬走"，只是多了一个引用 |
+| "配置无效" | "配置在运行时上下文中无效" | child.default_config 本身有效，但运行时请求永远不会路由到它 |
+
+**9.4.4 `self.input_components` 等属性的状态**
+
+`self.input_components`、`self.output_components` 等 Interface 自身的属性仍然保存着组件对象的引用，这些对象与父 blocks 字典中的对象是**同一个实例**。但由于运行时不通过 Interface 访问这些属性，它们在嵌入后实质上成为"死引用"——虽然存在但不会被使用。
+
+唯一仍可能被访问的是 `self.config`——Interface 在 `__init__` 末尾保存的 JSON 配置快照。但这份配置是嵌入前的局部视图，不包含合并后的全局信息，在嵌入场景下不会被使用。
+
+### 9.4.5 child.default_config 的生命周期
+
+| 阶段 | child.default_config 状态 |
+|------|---------------------------|
+| 构造完成 | 包含完整的 blocks 和 fns，key 与 value 一致 |
+| render() 合并中 | dependency._id 被原地修改，key 与 value 开始不一致 |
+| 合并完成 | blocks 和 fns 字典仍完整保留引用，但 fns 的 key 与 value._id 不一致 |
+| 运行时 | 保留所有引用，但永远不会被运行时路由访问 |
+| child 实例被回收 | 所有引用随实例一起被 GC |
+
+### 9.5 总结：一套运行时配置的本质
+
+所谓"一套运行时配置"的本质是：**整个 Gradio 应用在运行时只有一个 `BlocksConfig` 实例处于**活跃访问状态**——即最外层根 Blocks 的 `default_config`。
+
+这并不意味着子的 `BlocksConfig` 被销毁或清空，而是指：
+
+1. **运行时请求路由到根**：所有前端请求和后端处理始终通过根 Blocks 的 `self.fns` 和 `self.blocks` property 访问数据，这些 property 返回根的 `default_config`。
+
+2. **子配置不参与运行时调度**：尽管子的 `BlocksConfig` 仍保留完整引用，但 FastAPI 路由不绑定到它，前端请求不携带它的 fn_index，所以它不会被运行时逻辑访问。
+
+3. **对象共享但职责转移**：组件和 `BlockFunction` 对象同时被子和父的配置共享引用，但它们的运行时上下文（page、_id 偏移等）被修改为适配父的上下文。
 
 ```
 构造阶段:
@@ -591,11 +652,11 @@ class FlagMethod:
 嵌入阶段 (interface.render() 被调用):
   Blocks.render()
     → root_context = 父 BlocksConfig
-    → root_context.blocks.update(self.blocks)          ← 合并组件
-    → dependency._id += offset; root_context.fns[...]   ← 合并函数
+    → root_context.blocks.update(self.blocks)          ← 引用复制，对象共享
+    → dependency._id += offset; root_context.fns[...]   ← 原地修改，子配置保留引用但 key 失效
     → render_context.children.extend(self.children)     ← 合并布局
 
 运行阶段:
-  只有 root_block.default_config 中的 blocks 和 fns 被使用
-  Interface 自身的 default_config 和属性全部不参与
+  → 只有 root_block.default_config 中的 blocks 和 fns 被活跃访问
+  → Interface 自身的 default_config 保留所有引用但不参与运行时
 ```
