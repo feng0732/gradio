@@ -635,30 +635,57 @@ this.register_component(
 | SimpleImage | [simpleimage/Index.svelte#L48-L50](js/simpleimage/Index.svelte#L48-L50)、[#L76-L78](js/simpleimage/Index.svelte#L76-L78) |
 | SimpleDropdown | [simpledropdown/Index.svelte#L40-L47](js/simpledropdown/Index.svelte#L40-L47) |
 | Video | [video/Index.svelte#L97-L99](js/video/Index.svelte#L97-L99)、[#L144-L146](js/video/Index.svelte#L144-L146) |
-| Sidebar | [sidebar/Index.svelte#L15](js/sidebar/Index.svelte#L15) |
 
-### 路径 B：容器组件（Row、Column、BaseColumn、Group）和 Chatbot 复合组件自行渲染
+### 路径 B：容器组件——逐个对照代码判断是否直接展示进度状态
 
-以 **Row** 为例：
+容器组件是否展示进度状态**没有统一模式**，必须逐个组件看其 Index.svelte 是否渲染 `<StatusTracker>`。下表为对照代码的结论：
 
-[row/Index.svelte#L59-L70](js/row/Index.svelte#L59-L70)：
+| 组件 | 是否直接展示 StatusTracker | 证据 |
+|---|---|---|
+| **Column（列布局）** | ✅ **直接展示** | [column/Index.svelte#L16](js/column/Index.svelte#L16) 用 `{...gradio.shared}` 把全部 shared_props（含 `loading_status`）展开传给 `<BaseColumn>`；BaseColumn 在 [column/BaseColumn.svelte#L32-L43](js/column/BaseColumn.svelte#L32-L43) 读取 props 中的 `loading_status.show_progress` 并渲染 `<StatusTracker>` |
+| **Row（行布局）** | ✅ **直接展示** | [row/Index.svelte#L59-L70](js/row/Index.svelte#L59-L70) 直接读 `gradio.shared.loading_status`，满足条件时渲染 `<StatusTracker>`，并把 `pending` 转成 `generating` |
+| **TabItem（标签页项）** | ❌ **不直接展示** | [tabitem/Index.svelte#L15-L28](js/tabitem/Index.svelte#L15-L28) 渲染内部 TabItem；[tabitem/shared/TabItem.svelte#L57-L59](js/tabitem/shared/TabItem.svelte#L57-L59) 渲染 `<BaseColumn scale={...}>`，**只传了 scale，没有把 loading_status 传下去**。即使 TabItem 自身作为 output 接到了 loading_status，内部也不会显示进度条 |
+| **Tabs（外层标签页容器）** | ❌ **不直接展示** | [tabs/Index.svelte](js/tabs/Index.svelte) 全文无 `StatusTracker` 引用 |
+| **Group（分组容器）** | ❌ **不直接展示** | [group/Index.svelte](js/group/Index.svelte) 全文无 `StatusTracker` 引用，仅渲染 `<div class="gr-group">` + `<slot />` |
+| **Accordion（折叠面板）** | ✅ **直接展示** | [accordion/Index.svelte#L41-L47](js/accordion/Index.svelte#L41-L47) 直接读 `gradio.shared.loading_status` 渲染 `<StatusTracker>`；此外在其 `set_data` 中会强制把状态置为 `"complete"`（[accordion/Index.svelte#L24](js/accordion/Index.svelte#L24)） |
+| **Sidebar（侧边栏）** | ✅ **直接展示** | [sidebar/Index.svelte#L12-L16](js/sidebar/Index.svelte#L12-L16) **无条件**渲染 `<StatusTracker {...gradio.shared.loading_status} />`（包裹在外层 `<Sidebar>` 元素之外） |
+
+下面分别展开 Column、Row、Accordion、Sidebar 四种会展示的路径。
+
+**Column（通过 BaseColumn 间接展示）**：
+
+[column/Index.svelte#L16-L18](js/column/Index.svelte#L16-L18)：
 ```svelte
-{#if gradio.shared.loading_status && gradio.shared.loading_status.show_progress && gradio}
+<BaseColumn {...gradio.shared}>
+    <slot />
+</BaseColumn>
+```
+`{...gradio.shared}` 展开包含了 `loading_status`、`autoscroll`、`i18n`、`elem_id`、`variant` 等全部共享属性。BaseColumn 在 [column/BaseColumn.svelte#L32-L43](js/column/BaseColumn.svelte#L32-L43) 消费：
+```svelte
+{#if loading_status && loading_status.show_progress}
     <StatusTracker
-        autoscroll={gradio.shared.autoscroll}
-        i18n={gradio.i18n}
-        {...gradio.shared.loading_status}
-        <!-- ✅ 关键语义转换：pending → generating -->
-        status={gradio.shared.loading_status
-            ? gradio.shared.loading_status.status == "pending"
+        autoscroll={props.autoscroll}
+        i18n={props.i18n}
+        {...loading_status}
+        status={loading_status
+            ? loading_status.status == "pending"
                 ? "generating"
-                : gradio.shared.loading_status.status
+                : loading_status.status
             : null}
     />
 {/if}
 ```
 
-**BaseColumn / Column / Group 同样的模式**（用于 Group/Column/Row 等嵌套内部含有子组件的容器）：[column/BaseColumn.svelte#L32-L45](js/column/BaseColumn.svelte#L32-L45)。注意：BaseColumn 是 Column、Tab、Group、Row 等容器组件的内部基类，不是 ChatInterface 的进度来源。
+**Row（自身直接展示）**：
+
+[row/Index.svelte#L59-L70](js/row/Index.svelte#L59-L70) — 与上面 BaseColumn 的逻辑一致，只是 Row 自己直接读 `gradio.shared.loading_status`，不经过中间层。
+
+**BaseColumn 的使用范围**：BaseColumn 在仓库中被 4 个组件引入使用，但**只有 Column 给它传了 loading_status**：
+- Column ✅：`<BaseColumn {...gradio.shared}>`（传了 loading_status）
+- TabItem ❌：`<BaseColumn scale={...}>`（只传了 scale）
+- Accordion ❌：`<BaseColumn>`（空参数，仅作为 slot 的布局容器）— Accordion 自己的 Index.svelte 独立渲染 StatusTracker
+- Sidebar ❌：`<BaseColumn>`（空参数，仅作为 slot 的布局容器）— Sidebar 自己的 Index.svelte 独立渲染 StatusTracker
+- Login.svelte ❌：内部使用但与用户可见的进度无关
 
 ### 路径 C：Chatbot / ChatInterface 复合组件的状态来源
 
@@ -844,11 +871,19 @@ Gradio 类 constructor / $effect [utils.svelte.ts#L380-L462]
 │     <StatusTracker {...gradio.shared.loading_status}/>             │
 │  {/if}  [textbox/Index.svelte#L62-L71]                             │
 │                                                                     │
-│ 路径 B 容器组件（Row/Column/BaseColumn/Group）：                     │
-│  {#if gradio.shared.loading_status?.show_progress}                 │
-│     <StatusTracker                                                 │
-│       status={status=="pending" ? "generating" : status} />        │
-│                           [row/Index.svelte#L59-L70]               │
+│ 路径 B 容器组件（非全部，仅 Row/Column/Accordion/Sidebar 展示）：  │
+│  ✅ Column：`<BaseColumn {...gradio.shared}>` 透传 loading_status   │
+│       → BaseColumn 渲染 StatusTracker                               │
+│       [column/Index.svelte#L16] + [column/BaseColumn.svelte#L32-L43]│
+│  ✅ Row：自身读 gradio.shared.loading_status 渲染 StatusTracker     │
+│       并做 pending→generating 转换 [row/Index.svelte#L59-L70]       │
+│  ✅ Accordion：自身渲染 StatusTracker                               │
+│       [accordion/Index.svelte#L41-L47]                              │
+│  ✅ Sidebar：无条件渲染 StatusTracker                               │
+│       [sidebar/Index.svelte#L12-L16]                                │
+│  ❌ TabItem：只给 BaseColumn 传 scale，不传 loading_status          │
+│       [tabitem/shared/TabItem.svelte#L57-L59]                       │
+│  ❌ Tabs / Group：无 StatusTracker 引用                             │
 │                                                                     │
 │ 路径 C Chatbot / ChatInterface：                                    │
 │  ChatInterface（Blocks 子类）把 submit_wrapped 的 outputs 指向       │
@@ -880,7 +915,7 @@ StatusTracker 最终渲染 [statustracker/static/index.svelte]
 | **会话隔离** | `pending_messages_per_session` 使用 `LRUCache[str, AsyncQueue[EventMessage]]`（容量 2000）按浏览器会话分组，SSE 端点仅推送该会话消息，旧会话自动被 LRU 淘汰 | [queueing.py#L126-L128](gradio/queueing.py#L126-L128)、[#L383-L384](gradio/queueing.py#L383-L384) |
 | **fn_index → component_id 映射** | `LoadingStatus` 将后端 `fn_index` 维度转换为前端 `component_id` 维度，支持一个函数映射到多个输入/输出组件 | [state.svelte.ts#L18-L92](js/statustracker/static/state.svelte.ts#L18-L92) |
 | **瞬时属性分离** | `loading_status` 被排除在 `#pending_updates` 缓存之外，防止组件延迟挂载时过期 pending 覆盖已完成状态 | [init.svelte.ts#L477-L490](js/core/src/init.svelte.ts#L477-L490) |
-| **状态语义转换** | 后端 `"pending"` 在前端渲染层转换为 `"generating"`，更符合用户"正在处理"的认知 | [row/Index.svelte#L64-L68](js/row/Index.svelte#L64-L68)、[column/BaseColumn.svelte#L35-L42](js/column/BaseColumn.svelte#L35-L42) |
+| **状态语义转换** | 后端 `"pending"` 在 Row、Column（通过 BaseColumn）前端渲染层转换为 `"generating"`，更符合用户"正在处理"的认知；Accordion、Sidebar、叶子组件不做此转换直接透传 | [row/Index.svelte#L64-L68](js/row/Index.svelte#L64-L68)、[column/BaseColumn.svelte#L37-L40](js/column/BaseColumn.svelte#L37-L40) |
 | **响应式同步** | 组件 `shared_props` 的变化通过 `$effect` 立即同步到 `gradio.shared`，无需手动订阅 | [utils.svelte.ts#L437-L462](js/utils/src/utils.svelte.ts#L437-L462) |
 | **双路径状态更新** | 组件未挂载时就地修改 tree node 的 `shared_props`；已挂载时通过注册的 `_set_data` 回调直接更新组件内部状态 | [init.svelte.ts#L457-L503](js/core/src/init.svelte.ts#L457-L503) |
 | **直接读取模式** | 所有组件（叶子/容器/Chatbot）统一从 `gradio.shared.loading_status` 读取并自行决定是否渲染 `<StatusTracker>`，无额外数据流；Chatbot 额外派生 `pending_message`/`generating` 传给内部气泡子组件 | 见 [textbox/Index.svelte#L62-L71](js/textbox/Index.svelte#L62-L71)、[chatbot/Index.svelte#L49-L98](js/chatbot/Index.svelte#L49-L98) 等多处 |
